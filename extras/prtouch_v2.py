@@ -10,9 +10,16 @@
 # correct_bed_mesh_data and their gcode entry points (CHECK_BED_MESH, ACCURATE_HOME_Z,
 # PRTOUCH_READY) - confirmed dead code in real production, BLTouch owns homing/bed-mesh
 # (ANALYSIS.md sec 7). Also not porting env_self_check/SELF_CHECK_PRTOUCH (only ever called from
-# the dead run_G28_Z path, ANALYSIS.md sec 7/8) or the debug/diagnostic command set (TEST_PRTH,
-# TRIG_TEST, TRIG_BED_TEST, READ_PRES, DEAL_AVGS, TEST_SWAP) - cheap to add later for bring-up,
-# not blocking the real feature.
+# the dead run_G28_Z path, ANALYSIS.md sec 7/8) or most of the debug/diagnostic command set
+# (TEST_PRTH, TRIG_TEST, TRIG_BED_TEST, TEST_SWAP) - cheap to add later for bring-up, not
+# blocking the real feature.
+#
+# READ_PRES (2026-08-05, first real hardware bring-up pass): one diagnostic pulled forward early,
+# specifically because it's the only command in this whole module that touches zero motion -
+# deal_avgs_prtouch is a pure MCU sensor-channel read (see prtouch_mcu.py's deal_avgs()), no
+# start_step_prtouch involved. Exists to let a first live check confirm the load-cell hardware is
+# actually alive and producing plausible numbers relative to [prtouch_v2]/[z_compensate]'s real
+# tri_min_hold/tri_max_hold thresholds, before ever risking a motion-based touch_probe() call.
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 from . import prtouch_mcu
@@ -29,6 +36,9 @@ class PRTouchV2:
         self.mcu = prtouch_mcu.PrtouchMCU(config)
         self.probe = prtouch_probe.PrtouchProbe(config, self.mcu)
         self.heaters = None
+        # Must be built here, not lazily inside clear_nozzle() - see prtouch_nozzle.py's
+        # ClearNozzleConfig docstring.
+        self.clear_nozzle_config = prtouch_nozzle.ClearNozzleConfig(config)
 
         self.hot_min_temp = config.getfloat('hot_min_temp', default=140, minval=80, maxval=200)
         self.hot_max_temp = config.getfloat('hot_max_temp', default=200, minval=180, maxval=300)
@@ -40,6 +50,8 @@ class PRTouchV2:
                                      desc=self.cmd_NOZZLE_CLEAR_help)
         self.gcode.register_command('SAFE_MOVE_Z', self.cmd_SAFE_MOVE_Z,
                                      desc=self.cmd_SAFE_MOVE_Z_help)
+        self.gcode.register_command('READ_PRES', self.cmd_READ_PRES,
+                                     desc=self.cmd_READ_PRES_help)
 
     def _handle_connect(self):
         self.heaters = prtouch_nozzle.NozzleHeaters(self.printer)
@@ -60,6 +72,16 @@ class PRTouchV2:
         speed = gcmd.get_float('SPD', 5., above=0.)
         self.probe.safe_move_z(direction, distance, speed)
 
+    cmd_READ_PRES_help = "Read raw load-cell sensor channels - no motion, diagnostic only"
+
+    def cmd_READ_PRES(self, gcmd):
+        base_cnt = gcmd.get_int('BASE_CNT', 8, minval=1, maxval=32)
+        result = self.mcu.deal_avgs(base_cnt=base_cnt)
+        gcmd.respond_info(
+            "READ_PRES: ch0=%d ch1=%d ch2=%d ch3=%d (tri_min_hold=%d tri_max_hold=%d)"
+            % (result['ch0'], result['ch1'], result['ch2'], result['ch3'],
+               self.probe.tri_min_hold, self.probe.tri_max_hold))
+
     def touch_probe(self, down_min_z, **kwargs):
         """Public API for z_compensate.py (and anything else) to call into - thin passthrough
         to self.probe.touch_probe()."""
@@ -69,7 +91,8 @@ class PRTouchV2:
         """Public API passthrough to prtouch_nozzle.clear_nozzle()."""
         toolhead = self.printer.lookup_object('toolhead')
         prtouch_nozzle.clear_nozzle(self.probe, toolhead, self.gcode, self.heaters,
-                                     self.config, hot_min_temp, hot_max_temp, bed_max_temp)
+                                     self.clear_nozzle_config, hot_min_temp, hot_max_temp,
+                                     bed_max_temp)
 
 
 def load_config(config):

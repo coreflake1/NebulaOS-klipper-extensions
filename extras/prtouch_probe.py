@@ -33,8 +33,15 @@ class PrtouchProbe:
         self.tri_max_hold = config.getint('tri_max_hold', default=(3072 if use_adc else 6000))
         self.tri_hftr_cut = config.getfloat('tri_hftr_cut', default=2.0)
         self.tri_lftr_k1 = config.getfloat('tri_lftr_k1', default=(0.50 if use_adc else 0.70))
-        self.tri_z_down_spd = config.getfloat('tri_z_down_spd', default=(10. if use_adc else 2.5),
-                                               minval=0.1)
+        # 'speed' is this printer's own real [prtouch_v2] key for probe descent speed - neither
+        # our own prior 'tri_z_down_spd' name nor the reference wrapper's 'speeds' (plural,
+        # float-list) match it; confirmed via SSH 2026-08-05 that the real section has a bare
+        # 'speed: 1' with no 'tri_z_down_spd'/'speeds' key at all. 'tri_z_down_spd' is kept as a
+        # fallback name, not a real key on this printer, so it stays fully optional.
+        self.tri_z_down_spd = config.getfloat(
+            'speed',
+            config.getfloat('tri_z_down_spd', default=(10. if use_adc else 2.5), minval=0.1),
+            minval=0.1)
         self.tri_z_up_spd = config.getfloat(
             'lift_speed', default=self.tri_z_down_spd * (1.0 if use_adc else 2.0), minval=0.1)
         self.acc_ctl_mm = config.getfloat('acc_ctl_mm', default=(0.5 if use_adc else 0.25),
