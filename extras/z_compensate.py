@@ -92,6 +92,21 @@ class ZCompensate:
         # prtouch_nozzle.clear_nozzle()'s hot_end_temp param.
         self.hot_end_temp = config.getfloat('hot_end_temp', default=None,
                                              minval=80, maxval=300)
+        # bed_add_temp (real key): additive delta applied to the bed's current target
+        # temperature for the duration of the nozzle-wipe (bed_target + bed_add_temp, see
+        # cmd_nozzle_clear() below). Virgin-Baseline Fix + Rebuild mission (2026-08-08):
+        # maxval=100 is not an arbitrary widening - Creality's own real, factory-shipped
+        # default for this exact printer model is bed_add_temp: 60 (confirmed via
+        # artifacts/reference/stock-printer.cfg, the genuine tracked OEM config, cross-
+        # checked independently against a second, separately-derived real-device fixture -
+        # see klippy_extras/test_printer_cfg_config_validation.py). An earlier maxval=20
+        # bound rejected this genuine factory value outright, halting Klipper entirely -
+        # exactly the bug this comment exists to prevent recurring. 100 gives headroom
+        # above the real factory value without needing to be a full physical-safety bound
+        # itself: [heater_bed]'s own max_temp: 120 is the actual hard ceiling, enforced
+        # independently by Klipper's heater code at the moment any command tries to set
+        # that temperature - this config-time bound only needs to catch a clearly
+        # unreasonable typo'd value, not replace that separate safety layer.
         self.bed_add_temp = config.getfloat('bed_add_temp', default=0, minval=-20, maxval=100)
         bl_offset = config.getfloatlist('bl_offset', default=(0., 0.), count=2)
         self.bl_offset_x, self.bl_offset_y = bl_offset
