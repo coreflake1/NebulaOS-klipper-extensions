@@ -133,6 +133,18 @@ class ZCompensate:
         # pr_probe_cnt (real key): probe-agreement count for this command's own touch, distinct
         # from clear_nozzle()'s own pr_clear_probe_cnt (read in prtouch_nozzle.py).
         self.pr_probe_cnt = config.getint('pr_probe_cnt', default=3, minval=1)
+        # max_offset_correction_mm (2026-08-09 hardening mission, new): a sanity ceiling on the
+        # magnitude of a candidate correction before it's ever applied as a live offset - this
+        # command is documented (module docstring) as a per-print THERMAL/WEAR FINE-TUNE, not a
+        # full re-leveling; a multi-millimeter "correction" can only mean something went wrong
+        # upstream (a bad touch, a corrupted measurement, a miscalibrated BLTouch reference),
+        # never a genuine thermal/wear drift this feature is meant to compensate. The prior
+        # `math.isfinite` check below already caught NaN/inf; this catches a finite but
+        # physically implausible value the same way. Conservative default (2mm) pending real
+        # measurement of this printer's own genuine thermal-drift range - mark for hardware
+        # qualification if real, larger corrections turn out to be legitimate.
+        self.max_offset_correction_mm = config.getfloat('max_offset_correction_mm', default=2.,
+                                                          minval=0.1, maxval=10.)
 
         # Accepted (so Klipper doesn't reject the real config section) but deliberately left
         # unwired - no reference source and no confirmed evidence of their effect, and each
@@ -287,6 +299,14 @@ class ZCompensate:
                 raise self.printer.command_error(
                     "Z_OFFSET_CALIBRATION: measured value %r is not a finite number"
                     % (measured_z,))
+            # A finite but implausibly large candidate (see max_offset_correction_mm's own
+            # comment in __init__) gets the same treatment - rejected before it is ever applied
+            # or published as a completed result, not silently clamped or accepted.
+            if abs(measured_z) > self.max_offset_correction_mm:
+                raise self.printer.command_error(
+                    "Z_OFFSET_CALIBRATION: measured value %.5fmm exceeds "
+                    "max_offset_correction_mm=%.5fmm - refusing to apply an implausibly large "
+                    "correction" % (measured_z, self.max_offset_correction_mm))
 
             self.gcode.run_script_from_command('SET_GCODE_OFFSET Z=%.5f MOVE=0' % measured_z)
         except Exception as e:

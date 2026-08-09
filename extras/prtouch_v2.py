@@ -21,6 +21,16 @@
 # actually alive and producing plausible numbers relative to [prtouch_v2]/[z_compensate]'s real
 # tri_min_hold/tri_max_hold thresholds, before ever risking a motion-based touch_probe() call.
 #
+# 2026-08-09 (load-cell safety hardening mission): READ_PRES now goes through
+# PrtouchProbe.read_diagnostics() (same zero-motion deal_avgs_prtouch read as before) instead of
+# calling deal_avgs directly, so its response includes the same plausibility verdict
+# touch_probe() itself would apply before ever arming a real descent - a user checking this
+# before running a real calibration sees exactly what the safety guard sees, not a lookalike.
+# get_status() (below) exposes the same information through Klipper's own object-status/
+# webhooks mechanism (automatically queryable/subscribable under this module's config section
+# name, same pattern as z_compensate.py's own structured status - see its module comment for
+# how that machinery works) for GuppyScreen/Moonraker to poll without needing to send gcode.
+#
 # This file may be distributed under the terms of the GNU GPLv3 license.
 from . import prtouch_mcu
 from . import prtouch_nozzle
@@ -76,11 +86,33 @@ class PRTouchV2:
 
     def cmd_READ_PRES(self, gcmd):
         base_cnt = gcmd.get_int('BASE_CNT', 8, minval=1, maxval=32)
-        result = self.mcu.deal_avgs(base_cnt=base_cnt)
+        diag = self.probe.read_diagnostics(base_cnt=base_cnt)
+        raw = diag['raw'] or {}
         gcmd.respond_info(
-            "READ_PRES: ch0=%d ch1=%d ch2=%d ch3=%d (tri_min_hold=%d tri_max_hold=%d)"
-            % (result['ch0'], result['ch1'], result['ch2'], result['ch3'],
-               self.probe.tri_min_hold, self.probe.tri_max_hold))
+            "READ_PRES: ch0=%s ch1=%s ch2=%s ch3=%s (tri_min_hold=%d tri_max_hold=%d) "
+            "ok=%s%s"
+            % (raw.get('ch0'), raw.get('ch1'), raw.get('ch2'), raw.get('ch3'),
+               self.probe.tri_min_hold, self.probe.tri_max_hold, diag['ok'],
+               '' if diag['ok'] else (' reason=%s' % diag['reason'])))
+
+    def get_status(self, eventtime):
+        """Zero-motion diagnostic status - see prtouch_probe.py's own last_diagnostic comment
+        for why this returns a cached value rather than triggering a fresh MCU read on every
+        poll. Safe to call at any time, including before klippy:connect (self.probe always
+        exists once __init__ has run) and before any real reading has ever been taken (the
+        cache starts with ok=None/reason='no reading taken yet', not a fabricated value)."""
+        diag = self.probe.last_diagnostic
+        return {
+            'sensor_ok': diag['ok'],
+            'sensor_reason': diag['reason'],
+            'raw': diag['raw'],
+            'tri_min_hold': diag['tri_min_hold'],
+            'tri_max_hold': diag['tri_max_hold'],
+            'max_baseline_abs': diag['max_baseline_abs'],
+            'max_probe_travel_mm': self.probe.max_probe_travel_mm,
+            'max_probe_duration_s': self.probe.max_probe_duration_s,
+            'last_error': self.probe.last_error,
+        }
 
     def touch_probe(self, down_min_z, **kwargs):
         """Public API for z_compensate.py (and anything else) to call into - thin passthrough

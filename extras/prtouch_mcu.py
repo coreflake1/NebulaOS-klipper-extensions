@@ -9,6 +9,8 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging
 
+from . import prtouch_units as units
+
 MAX_BUF_LEN = 32
 MAX_PRES_CNT = 4
 POLL_INTERVAL = 0.010
@@ -93,7 +95,7 @@ class PrtouchMCU:
         self.step_mcu.add_config_cmd(
             'config_step_prtouch oid=%d step_cnt=%d swap_pin=%s sys_time_duty=%u' % (
                 self.step_oid, len(self._z_step_pins), self._step_swap_pin_name,
-                int(self.sys_time_duty * 100000)))
+                units.duty_fraction_to_scaled_units(self.sys_time_duty)))
         for i in range(len(self._z_step_pins)):
             step_par = ppins.parse_pin(self._z_step_pins[i], True, True)
             dir_par = ppins.parse_pin(self._z_dir_pins[i], True, True)
@@ -122,7 +124,7 @@ class PrtouchMCU:
         self.pres_mcu.add_config_cmd(
             'config_pres_prtouch oid=%d use_adc=%d pres_cnt=%d swap_pin=%s sys_time_duty=%u' % (
                 self.pres_oid, self.use_adc, self.pres_cnt, self._pres_swap_pin_name,
-                int(self.sys_time_duty * 100000)))
+                units.duty_fraction_to_scaled_units(self.sys_time_duty)))
         for i in range(self.pres_cnt):
             if self.use_adc:
                 adc_par = ppins.parse_pin(self._pres_adc_pins[i], True, True)
@@ -154,21 +156,21 @@ class PrtouchMCU:
     # -- async response handlers --------------------------------------------------
 
     def _handle_result_run_step_prtouch(self, params):
-        self.step_tri_time = params['tri_time'] / 10000.
+        self.step_tri_time = units.mcu_ticks_to_seconds(params['tri_time'])
         for i in range(4):
             self.step_res.append({
-                'tick': params['tick%d' % i] / 10000.,
+                'tick': units.mcu_ticks_to_seconds(params['tick%d' % i]),
                 'step': params['step%d' % i],
                 'index': params['index'],
             })
 
     def _handle_result_run_pres_prtouch(self, params):
-        self.pres_tri_time = params['tri_time'] / 10000.
+        self.pres_tri_time = units.mcu_ticks_to_seconds(params['tri_time'])
         self.pres_tri_chs = params['tri_chs']
         self.pres_buf_cnt = params['buf_cnt']
         for i in range(2):
             self.pres_res.append({
-                'tick': params['tick_%d' % i] / 10000.,
+                'tick': units.mcu_ticks_to_seconds(params['tick_%d' % i]),
                 'ch0': params['ch0_%d' % i], 'ch1': params['ch1_%d' % i],
                 'ch2': params['ch2_%d' % i], 'ch3': params['ch3_%d' % i],
                 'index': params['index'],
@@ -193,7 +195,8 @@ class PrtouchMCU:
                    min_hold, max_hold):
         self.start_pres_prtouch_cmd.send([
             self.pres_oid, direction, acq_ms, send_ms, need_cnt,
-            int(hftr_cut * 1000), int(lftr_k1 * 1000), int(min_hold), int(max_hold)])
+            units.to_fixed_point(hftr_cut), units.to_fixed_point(lftr_k1),
+            int(min_hold), int(max_hold)])
 
     def stop(self):
         self.start_step_prtouch_cmd.send([self.step_oid, 0, 0, 0, 0, 0, 5, 16, 0])
@@ -234,10 +237,10 @@ class PrtouchMCU:
             if len(self.step_res) > i and self.step_res[i]['index'] == i:
                 continue
             params = self.manual_get_steps_cmd.send([self.step_oid, i])
-            self.step_tri_time = params['tri_time'] / 10000.
+            self.step_tri_time = units.mcu_ticks_to_seconds(params['tri_time'])
             for j in range(4):
                 self.step_res.insert(i + j, {
-                    'tick': params['tick%d' % j] / 10000.,
+                    'tick': units.mcu_ticks_to_seconds(params['tick%d' % j]),
                     'step': params['step%d' % j],
                     'index': params['index'],
                 })
@@ -259,12 +262,12 @@ class PrtouchMCU:
             # ever shows the original's behavior was intentional for some reason not visible in
             # the source.
             params = self.manual_get_pres_cmd.send([self.pres_oid, i])
-            self.pres_tri_time = params['tri_time'] / 10000.
+            self.pres_tri_time = units.mcu_ticks_to_seconds(params['tri_time'])
             self.pres_tri_chs = params['tri_chs']
             self.pres_buf_cnt = params['buf_cnt']
             for j in range(2):
                 self.pres_res.insert(i + j, {
-                    'tick': params['tick_%d' % j] / 10000.,
+                    'tick': units.mcu_ticks_to_seconds(params['tick_%d' % j]),
                     'ch0': params['ch0_%d' % j], 'ch1': params['ch1_%d' % j],
                     'ch2': params['ch2_%d' % j], 'ch3': params['ch3_%d' % j],
                     'index': params['index'],
