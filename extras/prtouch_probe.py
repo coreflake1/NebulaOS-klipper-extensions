@@ -58,7 +58,31 @@
 # Neither is a new physical threshold requiring hardware data - both are conservative ceilings
 # on top of the existing, already-configured per-call values.
 #
+# 2026-08-10 (raw-op timer-incident mission, see docs/NEBULAOS_PRTOUCH_MCU_TIMER_FORENSICS.md):
+# a live no-trigger test of touch_probe() ended in a real MCU firmware shutdown
+# ("sentinel timer called"), preceded by five "Timer too close" MCU warnings. Source-level
+# tracing of the running firmware's exact scheduler was proven infeasible (the running
+# 38d96adc-dirty-20231016_135251 build does not match any source in this repo's history -
+# see the forensics doc), so this fix is evidence-based on observed host/MCU protocol
+# behavior, not on proprietary firmware internals: every single "Timer too close" in that
+# incident occurred immediately after a disarm-then-immediate-rearm transition on the raw
+# step channel, with zero host-side yield in between (the transition either between a probe
+# attempt's own down-then-recovery-lift, or between one retry attempt's recovery lift and the
+# next attempt's own down arm). Two changes address this, independent of whatever the exact
+# firmware-level trigger turns out to be:
+#   - _own_raw_operation(): only one of this module's two public raw-motion entry points
+#     (touch_probe, safe_move_z) may be active at a time - closes the class of risk where a
+#     second, independent invocation could overlap raw MCU traffic with an in-flight one,
+#     regardless of what triggers it (a second gcode/script request, a stray macro, etc.).
+#     The live incident's own second, unexplained Z_OFFSET_CALIBRATION request was proven NOT
+#     to be this incident's actual cause (it arrived 1.6s after the first "Timer too close"),
+#     but there is no legitimate reason to permit the overlap regardless.
+#   - _settle_after_disarm(): a minimum yield after every disarm before the next arm, using
+#     the protocol's own declared pacing granularity (tri_send_ms) as the most evidence-
+#     grounded default available rather than an invented constant - see its own docstring.
+#
 # This file may be distributed under the terms of the GNU GPLv3 license.
+import contextlib
 import logging
 import math
 
@@ -153,6 +177,24 @@ class PrtouchProbe:
                 "prtouch_probe: baseline_reference is set but baseline_deviation_max is not - "
                 "both are required together")
 
+        # Shared raw-operation ownership + settle timing (2026-08-10, see module docstring).
+        # Scoped to this class's two PUBLIC raw-motion entry points only (touch_probe,
+        # safe_move_z) - every other method that touches the raw step/pres channel is a
+        # private helper only ever reached from one of those two, so no reentrancy handling
+        # is needed beyond that (see _own_raw_operation's own docstring).
+        self._raw_op_active = False
+        self._raw_op_name = None
+        self._raw_op_id = 0
+        # raw_op_settle_s: minimum yield after a disarm before the next arm. The real minimum
+        # safe gap is NOT known - that needs hardware qualification - so this defaults to
+        # tri_send_ms (the same value the MCU firmware itself uses, via check_delay(), to pace
+        # its own buffered-sample sends on this exact channel - confirmed against
+        # reference/prtouch_v2.c), converted to seconds, rather than an invented constant.
+        # None (the default) means "derive from tri_send_ms"; set explicitly once real
+        # hardware timing margins are measured.
+        self._raw_op_settle_s_override = config.getfloat('raw_op_settle_s', default=None,
+                                                           minval=0.)
+
         self.mm_per_step = None
         self.bed_mesh = None
         # Diagnostics-only, zero-motion state (see read_diagnostics()) - last_error is
@@ -199,13 +241,67 @@ class PrtouchProbe:
         acc_ctl_cnt = units.distance_mm_to_acc_ctl_cnt(self.acc_ctl_mm, self.mm_per_step)
         return step_cnt, step_us, acc_ctl_cnt
 
+    @contextlib.contextmanager
+    def _own_raw_operation(self, op_name):
+        """Reject a second raw PRTouch operation that tries to start while one (touch_probe or
+        safe_move_z) is already active, instead of letting it queue behind/interleave with the
+        first - see module docstring and docs/NEBULAOS_PRTOUCH_MCU_TIMER_FORENSICS.md secs 3/9.
+        Checked and set with no yield in between, so this is race-free under Klipper's single-
+        threaded/cooperative reactor without needing a lock: whichever call reaches this line
+        first always sets the flag before it can ever yield (via reactor.pause(), which only
+        happens once collect_step_samples()/_settle_after_disarm() run below), so a second call
+        - however it was triggered, from any client - is guaranteed to observe it already set.
+        Deliberately wraps only the two PUBLIC entry points (touch_probe, safe_move_z), not the
+        private helpers they call internally (_fail/_raw_lift/_raw_move/_lift_after_down/
+        _recover_after_no_trigger) - those are only ever reached from within an already-held
+        operation, so re-entering this guard for them would be both unnecessary and wrong
+        (it would make _fail()'s own safety lift raise instead of running)."""
+        if self._raw_op_active:
+            raise PrtouchProbeSafetyError(
+                "prtouch: a raw PRTouch operation (%s) is already in progress - refusing to "
+                "start %s" % (self._raw_op_name, op_name))
+        self._raw_op_active = True
+        self._raw_op_name = op_name
+        self._raw_op_id += 1
+        op_id = self._raw_op_id
+        logging.info("prtouch_probe: raw op #%d start (%s)", op_id, op_name)
+        try:
+            yield op_id
+        finally:
+            logging.info("prtouch_probe: raw op #%d end (%s)", op_id, op_name)
+            self._raw_op_active = False
+            self._raw_op_name = None
+
+    @property
+    def _raw_op_settle_s(self):
+        if self._raw_op_settle_s_override is not None:
+            return self._raw_op_settle_s_override
+        return self.tri_send_ms / 1000.0
+
+    def _settle_after_disarm(self):
+        """Yield at least one raw_op_settle_s tick after a disarm before the next raw MCU arm -
+        see this module's own header comment for the incident evidence this responds to, and
+        _own_raw_operation's docstring for why this cannot itself reopen the race that guard
+        closes (the operation-active flag stays set for the whole duration of this yield)."""
+        eventtime = self.reactor.monotonic()
+        self.reactor.pause(eventtime + self._raw_op_settle_s)
+
     def safe_move_z(self, direction, distance, speed):
         """Non-probing raw Z move via the same MCU step command (safe_move_z-equivalent) - used
-        for the pre-error safety lift and general manual moves outside a probe cycle. direction:
-        1 = up, 0 = down."""
+        for general manual moves outside a probe cycle. direction: 1 = up, 0 = down. This is the
+        PUBLIC entry point (guarded by _own_raw_operation) - _fail()'s own internal safety lift
+        calls _raw_move() directly instead, since it is legitimately nested within whichever
+        public operation already holds the guard."""
+        with self._own_raw_operation('safe_move_z') as op_id:
+            self._raw_move(direction, distance, speed, op_id)
+
+    def _raw_move(self, direction, distance, speed, op_id=None):
         step_cnt, step_us, acc_ctl_cnt = self.get_step_counts(distance, speed)
         if step_cnt == 0:
             return
+        logging.info(
+            "prtouch_probe: raw op #%s arm dir=%d step_cnt=%d step_us=%d acc_ctl_cnt=%d "
+            "send_ms=%d", op_id, direction, step_cnt, step_us, acc_ctl_cnt, self.tri_send_ms)
         self.mcu.reset_buffers()
         self.mcu.start_step(direction, step_cnt, step_us, acc_ctl_cnt,
                              send_ms=self.tri_send_ms, low_spd_nul=self.low_spd_nul,
@@ -215,20 +311,23 @@ class PrtouchProbe:
                 units.probe_timeout_seconds(distance, speed, margin_s=5.0))
         finally:
             # Found 2026-08-06: previously unguarded - a genuine buffer-repair failure
-            # (PrtouchProtocolError) here would skip the disarm below entirely. safe_move_z
-            # is _fail()'s own last-resort safety lift, so letting a repair failure mask the
+            # (PrtouchProtocolError) here would skip the disarm below entirely. This is
+            # _fail()'s own last-resort safety lift path, so letting a repair failure mask the
             # real command_error (and leave the step channel armed) would be exactly the
             # wrong failure mode to introduce into the one path meant to make failures safe.
             self.mcu.start_step(direction, 0, 0, 0, low_spd_nul=self.low_spd_nul,
                                  send_step_duty=self.send_step_duty)
+            logging.info("prtouch_probe: raw op #%s disarm dir=%d", op_id, direction)
+            self._settle_after_disarm()
 
-    def _fail(self, message):
+    def _fail(self, message, op_id=None):
         """ck_and_raise_error-equivalent: Z motion during a probe is a raw, non-interruptible
         MCU-side pulse train, not a Klipper-queued move (ANALYSIS.md sec 6) - the only real
-        safety net is lifting clear before surfacing the error, which is what this does."""
+        safety net is lifting clear before surfacing the error, which is what this does. Calls
+        _raw_move() directly (not the public safe_move_z()) - see safe_move_z's own docstring."""
         logging.info("prtouch_probe: %s", message)
         self.last_error = message
-        self.safe_move_z(1, 5.0, 10.0)
+        self._raw_move(1, 5.0, 10.0, op_id)
         raise self.printer.command_error("prtouch: " + message)
 
     def read_diagnostics(self, base_cnt=8):
@@ -316,33 +415,35 @@ class PrtouchProbe:
         at a reduced surface, using plain command_error rather than Creality's PR_ERR_CODE_*
         catalog (DESIGN.md open question 3, resolved this way for the clean rewrite).
 
-        Raises PrtouchProbeSafetyError, before ever arming a single command, if down_min_z
-        exceeds max_probe_travel_mm or the pre-motion baseline guard rejects the current sensor
+        Raises PrtouchProbeSafetyError, before ever arming a single command, if another raw
+        PRTouch operation is already active (see _own_raw_operation), down_min_z exceeds
+        max_probe_travel_mm, or the pre-motion baseline guard rejects the current sensor
         reading (see _check_baseline_safe).
 
         Suspends any active bed mesh for the duration of the probe cycle (matches the original):
         a loaded mesh applies a Z-compensation transform to every toolhead move, which would
         skew a raw touch-probe reading taken at a specific mesh-relative point.
         """
-        if down_min_z > self.max_probe_travel_mm:
-            self.last_error = (
-                "requested down_min_z=%.3fmm exceeds max_probe_travel_mm=%.3fmm"
-                % (down_min_z, self.max_probe_travel_mm))
-            raise PrtouchProbeSafetyError("prtouch: " + self.last_error)
-        self._check_baseline_safe()
+        with self._own_raw_operation('touch_probe') as op_id:
+            if down_min_z > self.max_probe_travel_mm:
+                self.last_error = (
+                    "requested down_min_z=%.3fmm exceeds max_probe_travel_mm=%.3fmm"
+                    % (down_min_z, self.max_probe_travel_mm))
+                raise PrtouchProbeSafetyError("prtouch: " + self.last_error)
+            self._check_baseline_safe()
 
-        saved_mesh = self.bed_mesh.get_mesh() if self.bed_mesh is not None else None
-        if saved_mesh is not None:
-            self.bed_mesh.set_mesh(None)
-        try:
-            z = self._touch_probe(down_min_z, retries, pro_cnt, tolerance)
-        finally:
+            saved_mesh = self.bed_mesh.get_mesh() if self.bed_mesh is not None else None
             if saved_mesh is not None:
-                self.bed_mesh.set_mesh(saved_mesh)
-        self.last_error = None
-        return z
+                self.bed_mesh.set_mesh(None)
+            try:
+                z = self._touch_probe(down_min_z, retries, pro_cnt, tolerance, op_id)
+            finally:
+                if saved_mesh is not None:
+                    self.bed_mesh.set_mesh(saved_mesh)
+            self.last_error = None
+            return z
 
-    def _touch_probe(self, down_min_z, retries, pro_cnt, tolerance):
+    def _touch_probe(self, down_min_z, retries, pro_cnt, tolerance, op_id=None):
         if tolerance is None:
             tolerance = self.probe_min_3err
         results = []
@@ -351,11 +452,11 @@ class PrtouchProbe:
         while len(results) < pro_cnt:
             if attempt >= retries:
                 self._fail("touch_probe did not converge after %d attempts (results=%s)"
-                            % (attempt, results))
+                            % (attempt, results), op_id)
             if self.reactor.monotonic() >= deadline:
                 self._fail(
                     "touch_probe exceeded max_probe_duration_s=%.1f after %d attempts "
-                    "(results=%s)" % (self.max_probe_duration_s, attempt, results))
+                    "(results=%s)" % (self.max_probe_duration_s, attempt, results), op_id)
             attempt += 1
 
             self.mcu.reset_buffers()
@@ -367,10 +468,14 @@ class PrtouchProbe:
                 # loose between attempts) must not be allowed to keep probing on later
                 # attempts either - re-checked every attempt, not just once up front.
                 self._fail("baseline check failed on attempt %d/%d: %s"
-                            % (attempt, retries, reason))
+                            % (attempt, retries, reason), op_id)
             step_cnt, step_us, acc_ctl_cnt = self.get_step_counts(down_min_z, self.tri_z_down_spd)
             start_pos_z = self.toolhead.get_position()[2]
 
+            logging.info(
+                "prtouch_probe: raw op #%s attempt %d/%d arm dir=0 step_cnt=%d step_us=%d "
+                "acc_ctl_cnt=%d send_ms=%d", op_id, attempt, retries, step_cnt, step_us,
+                acc_ctl_cnt, self.tri_send_ms)
             self.mcu.start_pres(0, self.tri_acq_ms, self.tri_send_ms, self.tri_need_cnt,
                                  self.tri_hftr_cut, self.tri_lftr_k1,
                                  self.tri_min_hold, self.tri_max_hold)
@@ -382,6 +487,9 @@ class PrtouchProbe:
             self.mcu.start_step(0, 0, 0, 0, low_spd_nul=self.low_spd_nul,
                                  send_step_duty=self.send_step_duty)
             self.mcu.start_pres(0, 0, 0, 0, 0, 0, 0, 0)
+            logging.info("prtouch_probe: raw op #%s attempt %d/%d disarm dir=0", op_id, attempt,
+                         retries)
+            self._settle_after_disarm()
 
             if not step_samples or not pres_samples:
                 logging.info("prtouch_probe: no trigger on attempt %d/%d", attempt, retries)
@@ -400,7 +508,7 @@ class PrtouchProbe:
                 # the bed. Always undo the full commanded descent via a raw step move using the
                 # known-commanded step_cnt (not sample-derived, since step_samples is empty
                 # here) before the next attempt or before _fail()'s own final safety lift.
-                self._recover_after_no_trigger(step_cnt)
+                self._recover_after_no_trigger(step_cnt, op_id)
                 continue
 
             try:
@@ -411,11 +519,11 @@ class PrtouchProbe:
                     pres_cnt=self.mcu.pres_cnt)
             except ValueError as e:
                 logging.info("prtouch_probe: %s on attempt %d/%d", e, attempt, retries)
-                self._lift_after_down(step_cnt, step_samples)
+                self._lift_after_down(step_cnt, step_samples, op_id)
                 continue
 
             results.append(z)
-            self._lift_after_down(step_cnt, step_samples)
+            self._lift_after_down(step_cnt, step_samples, op_id)
 
             if len(results) >= 2 and (max(results) - min(results)) <= tolerance:
                 break
@@ -424,7 +532,7 @@ class PrtouchProbe:
         n = len(results)
         return results[n // 2] if n % 2 == 1 else (results[n // 2 - 1] + results[n // 2]) / 2.
 
-    def _lift_after_down(self, step_cnt, step_samples):
+    def _lift_after_down(self, step_cnt, step_samples, op_id=None):
         """'step' is the MCU's own remaining-pulse countdown (reference/prtouch_v2.c: now_steps
         starts at the commanded total and decrements to 0 - confirmed directly from firmware
         source, not inferred from the host wrapper alone), so step_cnt - last_reported_step is
@@ -446,9 +554,9 @@ class PrtouchProbe:
             return
         if traveled == 0:
             return
-        self._raw_lift(traveled)
+        self._raw_lift(traveled, op_id)
 
-    def _recover_after_no_trigger(self, step_cnt):
+    def _recover_after_no_trigger(self, step_cnt, op_id=None):
         """Undo a full, non-triggered commanded descent (see the safety comment at this
         method's call site in _touch_probe). Unlike _lift_after_down, there are no step_samples
         to derive an exact traveled distance from - a no-trigger response is empty by
@@ -457,17 +565,21 @@ class PrtouchProbe:
         traveled = units.step_count_to_distance_mm(step_cnt, self.mm_per_step)
         if traveled <= 0:
             return
-        self._raw_lift(traveled)
+        self._raw_lift(traveled, op_id)
 
-    def _raw_lift(self, traveled):
+    def _raw_lift(self, traveled, op_id=None):
         """Shared by _lift_after_down/_recover_after_no_trigger. 2026-08-09: the trailing
         disarm now runs in a finally block, matching safe_move_z's own 2026-08-06 fix - a
         genuine buffer-repair failure (PrtouchProtocolError) during collect_step_samples()
         previously would have skipped the disarm entirely, leaving the step channel armed on
-        exactly the recovery path meant to make a no-trigger/malformed-response failure safe."""
+        exactly the recovery path meant to make a no-trigger/malformed-response failure safe.
+        2026-08-10: disarm is now followed by _settle_after_disarm() - see module docstring."""
         up_cnt, up_us, up_acc = self.get_step_counts(traveled, self.tri_z_up_spd)
         if up_cnt == 0:
             return
+        logging.info(
+            "prtouch_probe: raw op #%s recovery arm dir=1 step_cnt=%d step_us=%d "
+            "acc_ctl_cnt=%d send_ms=%d", op_id, up_cnt, up_us, up_acc, self.tri_send_ms)
         self.mcu.reset_buffers()
         self.mcu.start_step(1, up_cnt, up_us, up_acc, send_ms=self.tri_send_ms,
                              low_spd_nul=self.low_spd_nul, send_step_duty=self.send_step_duty)
@@ -477,3 +589,5 @@ class PrtouchProbe:
         finally:
             self.mcu.start_step(1, 0, 0, 0, low_spd_nul=self.low_spd_nul,
                                  send_step_duty=self.send_step_duty)
+            logging.info("prtouch_probe: raw op #%s recovery disarm dir=1", op_id)
+            self._settle_after_disarm()

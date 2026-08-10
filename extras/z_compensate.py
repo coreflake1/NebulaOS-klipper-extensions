@@ -268,6 +268,24 @@ class ZCompensate:
         the probe's current z_offset directly. tri_expand_mm (see __init__) is then applied as a
         fixed additive correction on top - see its own comment for the caveat.
         """
+        # Non-reentrancy guard (2026-08-10, see docs/NEBULAOS_PRTOUCH_MCU_TIMER_FORENSICS.md -
+        # a live incident showed two Z_OFFSET_CALIBRATION invocations landing close together
+        # while raw MCU step commands were in flight; that overlap was NOT proven to be the
+        # incident's cause, but there is no legitimate reason to let a second calibration
+        # start or queue behind one already driving the raw prtouch step channel, so this
+        # closes that door regardless of root cause. This is a second, higher-level guard on
+        # top of prtouch_probe.py's own PrtouchProbe._own_raw_operation - that one protects
+        # every individual raw MCU dispatch across ALL callers (SAFE_MOVE_Z, NOZZLE_CLEAR,
+        # this command); this one protects the whole multi-step calibration sequence (the
+        # positioning move + touch_probe + SET_GCODE_OFFSET) as one logical unit. Checked and
+        # set with no yield in between - Klipper's reactor is single-threaded/cooperative, so
+        # this is race-free without needing a lock: whichever invocation's gcode handler is
+        # entered first always sets "running" before it ever yields, so any second invocation
+        # is guaranteed to observe "running" already set.
+        if self.calibration_state == "running":
+            raise self.printer.command_error(
+                "Z_OFFSET_CALIBRATION: a calibration is already in progress")
+
         # Structured status: a new attempt always gets a new id and clears any previous
         # result before doing anything else - a caller polling get_status() must never see a
         # stale "complete"/offset left over from an earlier invocation once a new one has
