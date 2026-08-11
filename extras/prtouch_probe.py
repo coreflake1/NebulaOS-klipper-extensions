@@ -407,7 +407,21 @@ class PrtouchProbe:
         for general manual moves outside a probe cycle. direction: 1 = up, 0 = down. This is the
         PUBLIC entry point (guarded by _own_raw_operation) - _fail()'s own internal safety lift
         calls _raw_move() directly instead, since it is legitimately nested within whichever
-        public operation already holds the guard."""
+        public operation already holds the guard.
+
+        2026-08-12 stock-vs-NebulaOS fidelity mission: the one confirmed remaining deviation
+        from reference/prtouch_v2_wrapper.py's own safe_move_z() (lines 1122-1151) is that stock
+        arms start_pres_prtouch concurrently with every real move (so a manual jog can itself
+        register a trigger and early-stop), while this stays step-only/blind on purpose - this
+        tool exists to isolate raw step behavior from pressure-channel complexity, and a
+        diagnostic that can silently early-stop on a spurious trigger would defeat that purpose.
+        This is unrelated to the read_pres_prtouch/prtouch_event ISR-collision corruption
+        mechanism (see NEBULAOS_PRTOUCH_MCU_TIMER_FORENSICS.md sec 12) - that lives entirely
+        inside the raw pressure read, not in whether start_pres happens to be armed during a
+        step move - and both this path and _touch_probe()'s share the same _settle_after_disarm
+        gap and fail-closed sensor-consistency guard, so this simplification carries no cost
+        against that mechanism. Classified NEBULAOS SAFETY IMPROVEMENT / DELIBERATE
+        SIMPLIFICATION, not a bug - see that same doc's sec 15."""
         with self._own_raw_operation('safe_move_z') as op_id:
             self._raw_move(direction, distance, speed, op_id)
 

@@ -168,6 +168,42 @@ class SuccessfulTriggerTest(unittest.TestCase):
         self.assertAlmostEqual(z, expected, places=6)
 
 
+class StockFidelityOrderingTest(unittest.TestCase):
+    """2026-08-12 stock-vs-NebulaOS behavioral fidelity mission: locks in, as a regression, the
+    one finding that mattered from a full line-by-line comparison against the real stock
+    reference/prtouch_v2_wrapper.py (run_step_prtouch, lines 1157-1307 of that file). Stock
+    always arms start_pres_prtouch BEFORE start_step_prtouch for a given attempt, and always
+    disarms start_step_prtouch BEFORE start_pres_prtouch - this exact ordering was independently
+    already present in _touch_probe() before this mission started, which is why no production
+    behavior change came out of the mission. If this ordering ever regresses, it silently
+    reopens the question this whole investigation spent multiple sessions closing."""
+
+    def test_pres_armed_before_step_armed_each_attempt(self):
+        _, mcu, pv2 = _build()
+        _arm_trigger_response(mcu, pv2, dip_at=20, step_cnt_hint=200)
+        pv2.probe.touch_probe(2.0, retries=1, pro_cnt=1)
+        arm_names = [c.name for c in mcu.sent_commands
+                     if c.name in ('start_pres_prtouch', 'start_step_prtouch')
+                     and c.by_field and c.by_field.get(
+                         'acq_ms' if c.name == 'start_pres_prtouch' else 'step_cnt', 0) > 0]
+        self.assertEqual(arm_names[0], 'start_pres_prtouch')
+        self.assertEqual(arm_names[1], 'start_step_prtouch')
+
+    def test_step_disarmed_before_pres_disarmed_each_attempt(self):
+        _, mcu, pv2 = _build()
+        _arm_trigger_response(mcu, pv2, dip_at=20, step_cnt_hint=200)
+        pv2.probe.touch_probe(2.0, retries=1, pro_cnt=1)
+        # the very first disarm pair after the down-attempt's arms - a stop is step_cnt==0 /
+        # acq_ms==0 - excludes the later lift-back-up arm/disarm, which is step-only (no pres
+        # channel involved at all - matches stock's own recovery lift, also step-only).
+        disarm_names = [c.name for c in mcu.sent_commands
+                         if c.name in ('start_pres_prtouch', 'start_step_prtouch')
+                         and c.by_field and c.by_field.get(
+                             'acq_ms' if c.name == 'start_pres_prtouch' else 'step_cnt', 0) == 0]
+        self.assertEqual(disarm_names[0], 'start_step_prtouch')
+        self.assertEqual(disarm_names[1], 'start_pres_prtouch')
+
+
 class NoTriggerTest(unittest.TestCase):
     def test_no_trigger_exhausts_retries_and_fails_loud(self):
         _, mcu, pv2 = _build()
