@@ -195,6 +195,36 @@ class PrtouchProbe:
         self._raw_op_settle_s_override = config.getfloat('raw_op_settle_s', default=None,
                                                            minval=0.)
 
+        # Sensor-consistency guard (2026-08-11, physical-qualification closure mission - see
+        # docs/NEBULAOS_PRTOUCH_MCU_TIMER_FORENSICS.md's follow-up): live testing found that a
+        # SINGLE deal_avgs_prtouch read (the guard above) is not sufficient. After a raw step
+        # operation (safe_move_z, or touch_probe's own down/lift phases), READ_PRES was
+        # observed to intermittently return near-zero/partial-magnitude garbage (e.g. -1,
+        # -63923, -127864 against a real ~-256000 baseline) that is individually finite and
+        # well under max_baseline_abs - it passes _evaluate_baseline outright, so the existing
+        # single-read guard cannot see it. check_sensor_consistency() takes several independent
+        # reads and requires them to agree with each other and with this session's own
+        # auto-learned healthy baseline (see check_sensor_consistency's own docstring) -
+        # defense in depth, not a fix for whatever is corrupting the underlying MCU read.
+        self.sensor_consistency_reads = config.getint(
+            'sensor_consistency_reads', default=3, minval=2, maxval=10)
+        self.sensor_consistency_settle_s = config.getfloat(
+            'sensor_consistency_settle_s', default=0.05, minval=0.)
+        # NEEDS_HARDWARE_DATA-style defaults, but grounded in real data from this session, not
+        # invented: four genuine healthy back-to-back reads spread across ~300 counts
+        # (-255752..-256031); the corrupted reads observed were tens of thousands to the full
+        # baseline magnitude off. 5000/10000 give >15x headroom over real observed noise while
+        # staying two-plus orders of magnitude below the real corruption seen.
+        self.sensor_consistency_max_spread = config.getfloat(
+            'sensor_consistency_max_spread', default=5000., minval=1.)
+        self.sensor_baseline_max_drift = config.getfloat(
+            'sensor_baseline_max_drift', default=10000., minval=1.)
+        # Auto-learned per-channel reference, refreshed only from a batch that already passed
+        # every check in check_sensor_consistency() - see that method's own docstring. Distinct
+        # from the user-configurable baseline_reference above (which stays opt-in/unset by
+        # default); this one self-populates so the drift check works even with no manual config.
+        self._auto_baseline = None
+
         self.mm_per_step = None
         self.bed_mesh = None
         # Diagnostics-only, zero-motion state (see read_diagnostics()) - last_error is
@@ -215,7 +245,7 @@ class PrtouchProbe:
         # from a deliberate diagnostic request or an actual probe attempt - never a live read
         # triggered by the act of checking status itself.
         self.last_diagnostic = {
-            'ok': None, 'raw': None, 'reason': 'no reading taken yet',
+            'ok': None, 'raw': None, 'reason': 'no reading taken yet', 'state': None,
             'tri_min_hold': self.tri_min_hold, 'tri_max_hold': self.tri_max_hold,
             'max_baseline_abs': self.max_baseline_abs,
         }
@@ -345,6 +375,7 @@ class PrtouchProbe:
         except Exception as e:
             self.last_diagnostic = {
                 'ok': False, 'raw': None, 'reason': 'mcu_read_failed: %s' % e,
+                'state': 'corrupted',
                 'tri_min_hold': self.tri_min_hold, 'tri_max_hold': self.tri_max_hold,
                 'max_baseline_abs': self.max_baseline_abs,
             }
@@ -352,6 +383,7 @@ class PrtouchProbe:
         ok, reason = self._evaluate_baseline(raw)
         self.last_diagnostic = {
             'ok': ok, 'raw': raw, 'reason': reason,
+            'state': 'healthy' if ok else 'corrupted',
             'tri_min_hold': self.tri_min_hold, 'tri_max_hold': self.tri_max_hold,
             'max_baseline_abs': self.max_baseline_abs,
         }
@@ -392,13 +424,109 @@ class PrtouchProbe:
                             self.baseline_deviation_max))
         return True, None
 
+    def check_sensor_consistency(self, base_cnt=8):
+        """Fail-closed pre-motion sensor-health gate (2026-08-11, physical-qualification
+        closure mission). A single deal_avgs_prtouch read (read_diagnostics()) was proven live
+        insufficient: after a raw step operation (safe_move_z, or touch_probe's own down/lift
+        phases), READ_PRES was observed to intermittently return near-zero/partial-magnitude
+        garbage (e.g. -1, -63923, -127864, against a real ~-256000 baseline) that is
+        individually finite and well under max_baseline_abs, so it sailed through
+        _evaluate_baseline outright - no single read can distinguish that from genuine data.
+
+        Takes sensor_consistency_reads independent deal_avgs_prtouch reads, spaced
+        sensor_consistency_settle_s apart, and only returns a 'healthy' verdict if ALL of:
+          - every individual read passes _evaluate_baseline (finite, within max_baseline_abs,
+            any configured baseline_reference deviation) - otherwise 'corrupted', the clearest
+            failure class.
+          - the reads agree with EACH OTHER within sensor_consistency_max_spread per channel -
+            catches exactly the flickering behavior actually observed live, which needs at
+            least two reads to see at all.
+          - if this module has already established an auto-learned baseline (from a previous
+            confirmed-healthy check this session - see self._auto_baseline), this batch's mean
+            must not drift from it by more than sensor_baseline_max_drift - catches a reading
+            that is internally consistent but consistently WRONG (e.g. stuck at a stable-but-
+            false value), which the spread check alone cannot catch.
+        Both failure classes are reported as diag['state'] in {'unstable', 'corrupted'} (vs.
+        'healthy') so a caller/status subscriber can distinguish "sensor looks actively broken"
+        from "sensor readings disagree with each other or with what this session has learned to
+        trust" - both refuse to proceed (diag['ok'] is False for either), matching this method's
+        fail-closed contract; only the label differs.
+
+        Updates self.last_diagnostic like read_diagnostics(). Only ever refreshes
+        self._auto_baseline on a 'healthy' verdict - a rejected batch can never poison the
+        reference future checks compare against.
+
+        NEEDS_HARDWARE_DATA: sensor_consistency_max_spread/sensor_baseline_max_drift are sized
+        against this session's own real observed idle noise floor (~300 counts across genuine
+        healthy reads), not a fabricated number - see this class's __init__ comment for the
+        exact live data point."""
+        def _reject(raw, reason, state):
+            self.last_diagnostic = {
+                'ok': False, 'raw': raw, 'reason': reason, 'state': state,
+                'tri_min_hold': self.tri_min_hold, 'tri_max_hold': self.tri_max_hold,
+                'max_baseline_abs': self.max_baseline_abs,
+            }
+            return self.last_diagnostic
+
+        reads = []
+        for i in range(self.sensor_consistency_reads):
+            if i > 0:
+                eventtime = self.reactor.monotonic()
+                self.reactor.pause(eventtime + self.sensor_consistency_settle_s)
+            try:
+                raw = self.mcu.deal_avgs(base_cnt=base_cnt)
+            except Exception as e:
+                return _reject(None, 'mcu_read_failed: %s' % e, 'corrupted')
+            ok, reason = self._evaluate_baseline(raw)
+            if not ok:
+                return _reject(raw, reason, 'corrupted')
+            reads.append(raw)
+
+        keys = ['ch%d' % i for i in range(4)]
+        spreads = {}
+        for key in keys:
+            vals = [r[key] for r in reads if key in r]
+            if vals:
+                spreads[key] = max(vals) - min(vals)
+        max_spread = max(spreads.values()) if spreads else 0.
+        if max_spread > self.sensor_consistency_max_spread:
+            return _reject(reads[-1], (
+                "repeated reads disagree with each other (max spread %.0f counts across %d "
+                "channel(s) sampled %d times, allowed %.0f) - sensor reading is unstable, not "
+                "trustworthy for a real probe attempt right now" % (
+                    max_spread, len(spreads), len(reads),
+                    self.sensor_consistency_max_spread)), 'unstable')
+
+        latest = reads[-1]
+        if self._auto_baseline is not None:
+            drift = 0.
+            for i, key in enumerate(keys):
+                if key in latest and i < len(self._auto_baseline):
+                    drift = max(drift, abs(latest[key] - self._auto_baseline[i]))
+            if drift > self.sensor_baseline_max_drift:
+                return _reject(latest, (
+                    "reading is internally consistent but has drifted %.0f counts from this "
+                    "session's own established healthy baseline (allowed %.0f) - refusing to "
+                    "trust a stable-but-implausible reading" % (
+                        drift, self.sensor_baseline_max_drift)), 'unstable')
+
+        self._auto_baseline = [
+            (sum(r[key] for r in reads if key in r) / len(reads)) if any(key in r for r in reads)
+            else 0. for key in keys]
+        self.last_diagnostic = {
+            'ok': True, 'raw': latest, 'reason': None, 'state': 'healthy',
+            'tri_min_hold': self.tri_min_hold, 'tri_max_hold': self.tri_max_hold,
+            'max_baseline_abs': self.max_baseline_abs,
+        }
+        return self.last_diagnostic
+
     def _check_baseline_safe(self):
-        """Pre-motion guard - see _evaluate_baseline()'s own docstring for exactly what this
-        does and does not prove. Raises PrtouchProbeSafetyError (never arms anything) rather
-        than the ordinary _fail() path: nothing of THIS call has moved yet, so there is no
-        motion of its own to recover from - unlike a real failed attempt, a fixed safety lift
-        here would itself be an unrequested, unexplained move."""
-        diag = self.read_diagnostics(base_cnt=8)
+        """Pre-motion guard - see check_sensor_consistency()'s own docstring for exactly what
+        this does and does not prove. Raises PrtouchProbeSafetyError (never arms anything)
+        rather than the ordinary _fail() path: nothing of THIS call has moved yet, so there is
+        no motion of its own to recover from - unlike a real failed attempt, a fixed safety
+        lift here would itself be an unrequested, unexplained move."""
+        diag = self.check_sensor_consistency(base_cnt=8)
         if not diag['ok']:
             self.last_error = diag['reason']
             raise PrtouchProbeSafetyError(
@@ -460,13 +588,15 @@ class PrtouchProbe:
             attempt += 1
 
             self.mcu.reset_buffers()
-            diag = self.read_diagnostics(base_cnt=8)
+            diag = self.check_sensor_consistency(base_cnt=8)
             if not diag['ok']:
                 reason = diag['reason']
                 # A sensor that looked fine before touch_probe() started (the guard in
                 # touch_probe() itself) but goes bad mid-sequence (e.g. a connector working
-                # loose between attempts) must not be allowed to keep probing on later
-                # attempts either - re-checked every attempt, not just once up front.
+                # loose between attempts, or the PREVIOUS attempt's own raw step ops leaving
+                # the pressure read degraded - see check_sensor_consistency's own docstring)
+                # must not be allowed to keep probing on later attempts either - re-checked
+                # every attempt, not just once up front.
                 self._fail("baseline check failed on attempt %d/%d: %s"
                             % (attempt, retries, reason), op_id)
             step_cnt, step_us, acc_ctl_cnt = self.get_step_counts(down_min_z, self.tri_z_down_spd)

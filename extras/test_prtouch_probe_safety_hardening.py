@@ -122,16 +122,22 @@ class InvalidSensorDataGuardTest(unittest.TestCase):
                          "a realistic at-rest baseline must not be blocked by the sensor guard")
 
     def test_mid_sequence_sensor_failure_aborts_remaining_retries(self):
-        # first attempt's baseline read is fine; make every SUBSEQUENT deal_avgs response bad,
-        # simulating a connector working loose mid-sequence - must not be allowed to keep
-        # trying on later attempts either (see prtouch_probe.py's own comment on this).
+        # first attempt's baseline read is fine (both the pre-motion check and attempt 1's own
+        # per-attempt check, each of which now consumes sensor_consistency_reads deal_avgs
+        # calls - see check_sensor_consistency()); every deal_avgs call from attempt 2's check
+        # onward is bad, simulating a connector working loose mid-sequence - must not be
+        # allowed to keep trying on later attempts either (see prtouch_probe.py's own comment).
         _, mcu, pv2 = _build()
-        responses = [
-            {'oid': pv2.mcu.pres_oid, 'ch0': -250000, 'ch1': 0, 'ch2': 0, 'ch3': 0},  # pre-motion check
-            {'oid': pv2.mcu.pres_oid, 'ch0': -250000, 'ch1': 0, 'ch2': 0, 'ch3': 0},  # attempt 1
-            {'oid': pv2.mcu.pres_oid, 'ch0': float('nan'), 'ch1': 0, 'ch2': 0, 'ch3': 0},  # attempt 2
-        ]
-        mcu.set_query_response('deal_avgs_prtouch', responses)
+        good_calls = 2 * pv2.probe.sensor_consistency_reads  # pre-motion check + attempt 1's check
+        calls = {'n': 0}
+
+        def _response(call):
+            calls['n'] += 1
+            if calls['n'] <= good_calls:
+                return {'oid': pv2.mcu.pres_oid, 'ch0': -250000, 'ch1': 0, 'ch2': 0, 'ch3': 0}
+            return {'oid': pv2.mcu.pres_oid, 'ch0': float('nan'), 'ch1': 0, 'ch2': 0, 'ch3': 0}
+
+        mcu.set_query_response('deal_avgs_prtouch', _response)
         with self.assertRaises(Exception) as ctx:
             pv2.probe.touch_probe(1.0, retries=10, pro_cnt=1)
         self.assertIn("baseline check failed", str(ctx.exception))
@@ -184,6 +190,109 @@ class AlreadyTriggeredGuardTest(unittest.TestCase):
         config = fake.make_prtouch_v2_config(printer, pins, values)
         with self.assertRaises(fake.ConfigError):
             prtouch_v2.PRTouchV2(config)
+
+
+class SensorConsistencyGuardTest(unittest.TestCase):
+    """check_sensor_consistency() - 2026-08-11 physical-qualification closure mission. Live
+    testing found a single deal_avgs_prtouch read (the guard above) insufficient: after a raw
+    step operation, READ_PRES intermittently returned near-zero/partial-magnitude garbage
+    (-1, -63923, -127864, against a real ~-256000 baseline) that is individually finite and
+    well under max_baseline_abs, so it passed the single-read guard outright. These tests
+    reproduce that exact live pattern against the new multi-read consistency gate."""
+
+    def test_consistent_reads_are_healthy_and_establish_auto_baseline(self):
+        _, mcu, pv2 = _build()
+        diag = pv2.probe.check_sensor_consistency()
+        self.assertTrue(diag['ok'])
+        self.assertEqual(diag['state'], 'healthy')
+        self.assertIsNotNone(pv2.probe._auto_baseline)
+        self.assertAlmostEqual(pv2.probe._auto_baseline[0], -250000, delta=1)
+
+    def test_flickering_reads_are_rejected_as_unstable(self):
+        # the exact live-observed pattern: individually-plausible values that disagree wildly
+        # with each other from one read to the next within a single check.
+        _, mcu, pv2 = _build()
+        it = iter([-1, -127864, -63923])
+        mcu.set_query_response(
+            'deal_avgs_prtouch',
+            lambda call: {'oid': pv2.mcu.pres_oid, 'ch0': next(it), 'ch1': 0, 'ch2': 0, 'ch3': 0})
+        diag = pv2.probe.check_sensor_consistency()
+        self.assertFalse(diag['ok'])
+        self.assertEqual(diag['state'], 'unstable')
+        self.assertIn('disagree', diag['reason'])
+        self.assertIsNone(pv2.probe._auto_baseline,
+                           "a rejected batch must never establish/poison the auto-baseline")
+
+    def test_individually_bad_read_is_rejected_as_corrupted_not_unstable(self):
+        _, mcu, pv2 = _build()
+        mcu.set_query_response(
+            'deal_avgs_prtouch',
+            {'oid': pv2.mcu.pres_oid, 'ch0': float('nan'), 'ch1': 0, 'ch2': 0, 'ch3': 0})
+        diag = pv2.probe.check_sensor_consistency()
+        self.assertFalse(diag['ok'])
+        self.assertEqual(diag['state'], 'corrupted')
+
+    def test_stable_but_drifted_reading_is_rejected_once_a_baseline_is_established(self):
+        # internally consistent (zero spread) but far from what this session already learned
+        # to trust - the spread check alone cannot catch this, only the drift check can.
+        _, mcu, pv2 = _build()
+        first = pv2.probe.check_sensor_consistency()
+        self.assertEqual(first['state'], 'healthy')
+
+        mcu.set_query_response(
+            'deal_avgs_prtouch',
+            {'oid': pv2.mcu.pres_oid, 'ch0': -100000, 'ch1': 0, 'ch2': 0, 'ch3': 0})
+        second = pv2.probe.check_sensor_consistency()
+        self.assertFalse(second['ok'])
+        self.assertEqual(second['state'], 'unstable')
+        self.assertIn('drifted', second['reason'])
+
+    def test_recovering_to_a_genuinely_consistent_reading_is_healthy_again(self):
+        # a rejected check must not be a permanent lockout - once real, consistent, plausible
+        # data comes back, the guard must accept it again.
+        _, mcu, pv2 = _build()
+        mcu.set_query_response(
+            'deal_avgs_prtouch',
+            {'oid': pv2.mcu.pres_oid, 'ch0': float('nan'), 'ch1': 0, 'ch2': 0, 'ch3': 0})
+        self.assertFalse(pv2.probe.check_sensor_consistency()['ok'])
+
+        mcu.set_query_response(
+            'deal_avgs_prtouch',
+            {'oid': pv2.mcu.pres_oid, 'ch0': -250000, 'ch1': 0, 'ch2': 0, 'ch3': 0})
+        good = pv2.probe.check_sensor_consistency()
+        self.assertTrue(good['ok'])
+        self.assertEqual(good['state'], 'healthy')
+
+    def test_touch_probe_refuses_to_arm_any_motion_on_an_unstable_sensor(self):
+        _, mcu, pv2 = _build()
+        it = iter([-1, -127864, -63923])
+        mcu.set_query_response(
+            'deal_avgs_prtouch',
+            lambda call: {'oid': pv2.mcu.pres_oid, 'ch0': next(it), 'ch1': 0, 'ch2': 0, 'ch3': 0})
+        with self.assertRaises(prtouch_probe.PrtouchProbeSafetyError) as ctx:
+            pv2.probe.touch_probe(2.0, retries=1, pro_cnt=1)
+        self.assertIn('unstable', str(ctx.exception))
+        self.assertEqual(mcu.all_calls('start_step_prtouch'), [],
+                          "an unstable sensor must block motion just like a corrupted one")
+
+    def test_get_status_exposes_sensor_state(self):
+        _, mcu, pv2 = _build()
+        pv2.probe.check_sensor_consistency()
+        self.assertEqual(pv2.get_status(0.0)['sensor_state'], 'healthy')
+
+    def test_default_thresholds_tolerate_this_projects_own_documented_real_idle_noise(self):
+        # real healthy back-to-back reads captured live this session spread across ~300 counts
+        # (-255752..-256031) - the default guard must not reject the actual hardware's own
+        # normal noise floor.
+        _, mcu, pv2 = _build()
+        pv2.probe.sensor_consistency_reads = 4
+        it = iter([-255978, -256031, -255855, -255752])
+        mcu.set_query_response(
+            'deal_avgs_prtouch',
+            lambda call: {'oid': pv2.mcu.pres_oid, 'ch0': next(it), 'ch1': 0, 'ch2': 0, 'ch3': 0})
+        diag = pv2.probe.check_sensor_consistency()
+        self.assertTrue(diag['ok'], diag['reason'])
+        self.assertEqual(diag['state'], 'healthy')
 
 
 class DiagnosticsAreZeroMotionAndCachedTest(unittest.TestCase):

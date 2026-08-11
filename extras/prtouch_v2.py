@@ -105,6 +105,7 @@ class PRTouchV2:
         return {
             'sensor_ok': diag['ok'],
             'sensor_reason': diag['reason'],
+            'sensor_state': diag.get('state'),
             'raw': diag['raw'],
             'tri_min_hold': diag['tri_min_hold'],
             'tri_max_hold': diag['tri_max_hold'],
