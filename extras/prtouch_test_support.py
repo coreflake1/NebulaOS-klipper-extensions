@@ -358,6 +358,7 @@ class FakeToolhead:
         self._position = list(position)
         self._kin = FakeKinematics([FakeStepper('z', step_dist)])
         self.moves = []
+        self.homed_axes = 'xyz'  # matches Klipper's real toolhead.get_status() field name/shape
 
     def get_position(self):
         return list(self._position)
@@ -370,6 +371,9 @@ class FakeToolhead:
 
     def wait_moves(self):
         pass
+
+    def get_status(self, eventtime):
+        return {'homed_axes': self.homed_axes}
 
 
 class FakeBedMesh:
@@ -454,14 +458,34 @@ class FakeGCmd:
         self._params = params or {}
         self.responses = []
 
+    def _checked(self, name, value, minval=None, maxval=None, above=None, below=None):
+        # mirrors the real GCodeCommand's own bound-checking - a fake that silently ignored
+        # these would make maxval=/above= constraints on real commands untestable here.
+        if value is None:
+            return value
+        if minval is not None and value < minval:
+            raise self.error("%s must be at least %s" % (name, minval))
+        if maxval is not None and value > maxval:
+            raise self.error("%s must be at most %s" % (name, maxval))
+        if above is not None and value <= above:
+            raise self.error("%s must be above %s" % (name, above))
+        if below is not None and value >= below:
+            raise self.error("%s must be below %s" % (name, below))
+        return value
+
     def get_float(self, name, default=None, **kwargs):
-        return float(self._params[name]) if name in self._params else default
+        value = float(self._params[name]) if name in self._params else default
+        return self._checked(name, value, **kwargs)
 
     def get_int(self, name, default=None, **kwargs):
-        return int(self._params[name]) if name in self._params else default
+        value = int(self._params[name]) if name in self._params else default
+        return self._checked(name, value, **kwargs)
 
     def respond_info(self, msg):
         self.responses.append(msg)
+
+    def error(self, msg):
+        return CommandError(msg)
 
 
 class FakePrinter:

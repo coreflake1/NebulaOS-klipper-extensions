@@ -65,6 +65,8 @@ class PRTouchV2:
         self.gcode.register_command('PRTOUCH_CONFIRM_BASELINE',
                                      self.cmd_PRTOUCH_CONFIRM_BASELINE,
                                      desc=self.cmd_PRTOUCH_CONFIRM_BASELINE_help)
+        self.gcode.register_command('PRTOUCH_TEST_TOUCH', self.cmd_PRTOUCH_TEST_TOUCH,
+                                     desc=self.cmd_PRTOUCH_TEST_TOUCH_help)
 
     def _handle_connect(self):
         self.heaters = prtouch_nozzle.NozzleHeaters(self.printer)
@@ -108,6 +110,30 @@ class PRTouchV2:
         gcmd.respond_info(
             "PRTOUCH_CONFIRM_BASELINE: confirmed ch0=%.0f ch1=%.0f ch2=%.0f ch3=%.0f as the "
             "new TRUSTED_REFERENCE (persisted, survives restarts)" % tuple(values))
+
+    cmd_PRTOUCH_TEST_TOUCH_help = (
+        "Single bounded real touch_probe() attempt on the production lifecycle - retries=1, "
+        "pro_cnt=1 (one attempt, no retry loop). Never applies a Z offset and never runs any "
+        "calibration-result persistence - it only calls PrtouchProbe.touch_probe() and reports "
+        "the resulting Z sample. Requires Z already homed. 2026-08-12 physical-qualification "
+        "prep: the smallest existing production-compatible path that exercises one real, "
+        "pressure-armed descent - see NEBULAOS_PRTOUCH_MCU_TIMER_FORENSICS.md sec 15/16.")
+
+    def cmd_PRTOUCH_TEST_TOUCH(self, gcmd):
+        toolhead = self.printer.lookup_object('toolhead')
+        homed_axes = toolhead.get_status(self.printer.get_reactor().monotonic())['homed_axes']
+        if 'z' not in homed_axes:
+            raise gcmd.error("PRTOUCH_TEST_TOUCH: Z axis must already be homed")
+        # DOWN_MIN_Z's maxval is a small, hard-coded test ceiling - independent of and well
+        # below [prtouch_v2]'s own configured max_probe_travel_mm (default 50mm) - this command
+        # exists specifically to keep the first real touch small, not to expose the full
+        # configured travel range.
+        down_min_z = gcmd.get_float('DOWN_MIN_Z', 3.0, above=0., maxval=5.0)
+        z = self.probe.touch_probe(down_min_z, retries=1, pro_cnt=1)
+        gcmd.respond_info(
+            "PRTOUCH_TEST_TOUCH: single-attempt touch_probe result z=%.4fmm "
+            "(down_min_z=%.2fmm) - no offset applied, nothing persisted beyond the normal "
+            "sensor-baseline guard" % (z, down_min_z))
 
     def get_status(self, eventtime):
         """Zero-motion diagnostic status - see prtouch_probe.py's own last_diagnostic comment

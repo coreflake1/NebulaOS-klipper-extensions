@@ -409,5 +409,46 @@ class SafeMoveZCleanupTest(unittest.TestCase):
         self.assertTrue(disarm_calls, "safe_move_z must disarm even when repair raises")
 
 
+class PrtouchTestTouchCommandTest(unittest.TestCase):
+    """2026-08-12 physical-qualification prep mission: PRTOUCH_TEST_TOUCH is the smallest
+    production-compatible single-touch entry point (see prtouch_v2.py's cmd_PRTOUCH_TEST_TOUCH).
+    Proves it: requires Z homed, performs exactly one real pressure-armed descent (reuses
+    touch_probe(retries=1, pro_cnt=1) - already proven by StockFidelityOrderingTest to match
+    stock's arm/disarm ordering), and never applies an offset or persists a calibration result."""
+
+    def test_blocked_when_z_not_homed(self):
+        printer, mcu, pv2 = _build()
+        printer.objects['toolhead'].homed_axes = 'xy'
+        with self.assertRaises(fake.CommandError):
+            pv2.cmd_PRTOUCH_TEST_TOUCH(fake.FakeGCmd())
+
+    def test_single_touch_reaches_touch_probe_with_one_attempt_one_sample(self):
+        printer, mcu, pv2 = _build()
+        _arm_trigger_response(mcu, pv2, dip_at=20, step_cnt_hint=200)
+        gcmd = fake.FakeGCmd()
+        pv2.cmd_PRTOUCH_TEST_TOUCH(gcmd)
+        down_arms = [c for c in mcu.all_calls('start_step_prtouch')
+                     if c.by_field['step_cnt'] > 0 and c.by_field['dir'] == 0]
+        self.assertEqual(len(down_arms), 1, "PRTOUCH_TEST_TOUCH must send exactly one descent")
+        self.assertIn('z=', gcmd.responses[0])
+        self.assertIn('no offset applied', gcmd.responses[0])
+
+    def test_single_touch_default_travel_is_small_and_capped(self):
+        _, mcu, pv2 = _build()
+        gcmd = fake.FakeGCmd(params={'DOWN_MIN_Z': '50'})
+        with self.assertRaises(fake.CommandError):
+            pv2.cmd_PRTOUCH_TEST_TOUCH(gcmd)
+
+    def test_no_trigger_fails_after_exactly_one_attempt_no_retry(self):
+        _, mcu, pv2 = _build()  # no _arm_trigger_response - every attempt is a genuine no-trigger
+        gcmd = fake.FakeGCmd()
+        with self.assertRaises(Exception):
+            pv2.cmd_PRTOUCH_TEST_TOUCH(gcmd)
+        down_arms = [c for c in mcu.all_calls('start_step_prtouch')
+                     if c.by_field['step_cnt'] > 0 and c.by_field['dir'] == 0]
+        self.assertEqual(len(down_arms), 1,
+                          "a no-trigger result must not cause a second real descent attempt")
+
+
 if __name__ == '__main__':
     unittest.main()
