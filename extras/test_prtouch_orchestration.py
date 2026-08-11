@@ -28,6 +28,12 @@ def _build(prtouch_values=None):
     # _touch_probe) - every scenario needs a response for it regardless of what's under test.
     mcu.set_query_response('deal_avgs_prtouch',
                             {'oid': pv2.mcu.pres_oid, 'ch0': -250000, 'ch1': 0, 'ch2': 0, 'ch3': 0})
+    # 2026-08-12 root-cause mission: touch_probe()'s baseline guard now requires an explicitly
+    # confirmed TRUSTED_REFERENCE (see prtouch_probe.py's three-state model) - prime one here,
+    # against the default response above, before any test-specific override is applied, so
+    # tests unrelated to that guard itself can still reach real motion.
+    pv2.probe.check_sensor_consistency()
+    pv2.probe.confirm_bootstrap_baseline()
     # manual_get_steps/manual_get_pres back the _repair_*_samples path any time a collect_*
     # poll times out without a full 32-sample buffer (an "up" recovery/lift move never gets
     # an async response scripted in most scenarios below, since the test is exercising the

@@ -25,6 +25,11 @@ def _build(prtouch_values=None):
     config.assert_all_consumed()
     mcu.set_query_response('deal_avgs_prtouch',
                             {'oid': pv2.mcu.pres_oid, 'ch0': -250000, 'ch1': 0, 'ch2': 0, 'ch3': 0})
+    # 2026-08-12 root-cause mission: touch_probe()'s baseline guard now requires an explicitly
+    # confirmed TRUSTED_REFERENCE (see prtouch_probe.py's three-state model) - prime one here
+    # so tests unrelated to that guard itself can still reach real motion.
+    pv2.probe.check_sensor_consistency()
+    pv2.probe.confirm_bootstrap_baseline()
 
     def _step_repair(call):
         i = call.args[1]

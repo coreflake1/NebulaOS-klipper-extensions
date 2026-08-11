@@ -62,6 +62,9 @@ class PRTouchV2:
                                      desc=self.cmd_SAFE_MOVE_Z_help)
         self.gcode.register_command('READ_PRES', self.cmd_READ_PRES,
                                      desc=self.cmd_READ_PRES_help)
+        self.gcode.register_command('PRTOUCH_CONFIRM_BASELINE',
+                                     self.cmd_PRTOUCH_CONFIRM_BASELINE,
+                                     desc=self.cmd_PRTOUCH_CONFIRM_BASELINE_help)
 
     def _handle_connect(self):
         self.heaters = prtouch_nozzle.NozzleHeaters(self.printer)
@@ -95,6 +98,17 @@ class PRTouchV2:
                self.probe.tri_min_hold, self.probe.tri_max_hold, diag['ok'],
                '' if diag['ok'] else (' reason=%s' % diag['reason'])))
 
+    cmd_PRTOUCH_CONFIRM_BASELINE_help = (
+        "Promote the current BOOTSTRAP_CANDIDATE sensor reading to a TRUSTED_REFERENCE - "
+        "run this only after independently confirming (e.g. via READ_PRES) that the printer "
+        "is genuinely idle and the reading is real, not corrupted")
+
+    def cmd_PRTOUCH_CONFIRM_BASELINE(self, gcmd):
+        values = self.probe.confirm_bootstrap_baseline()
+        gcmd.respond_info(
+            "PRTOUCH_CONFIRM_BASELINE: confirmed ch0=%.0f ch1=%.0f ch2=%.0f ch3=%.0f as the "
+            "new TRUSTED_REFERENCE (persisted, survives restarts)" % tuple(values))
+
     def get_status(self, eventtime):
         """Zero-motion diagnostic status - see prtouch_probe.py's own last_diagnostic comment
         for why this returns a cached value rather than triggering a fresh MCU read on every
@@ -106,7 +120,8 @@ class PRTouchV2:
             'sensor_ok': diag['ok'],
             'sensor_reason': diag['reason'],
             'sensor_state': diag.get('state'),
-            'sensor_bootstrap': diag.get('bootstrap', False),
+            'sensor_has_trusted_reference': self.probe._auto_baseline is not None,
+            'sensor_bootstrap_candidate_pending': self.probe._bootstrap_candidate is not None,
             'raw': diag['raw'],
             'tri_min_hold': diag['tri_min_hold'],
             'tri_max_hold': diag['tri_max_hold'],

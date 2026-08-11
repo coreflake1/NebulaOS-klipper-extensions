@@ -28,7 +28,15 @@ _TEMP_DIRS = []
 atexit.register(lambda: [shutil.rmtree(d, ignore_errors=True) for d in _TEMP_DIRS])
 
 
-def _build(prtouch_overrides=None):
+def _build(prtouch_overrides=None, prime_trusted_baseline=True):
+    """prime_trusted_baseline=True (the default) immediately confirms a TRUSTED_REFERENCE from
+    the default -250000 mock reading before returning, so every test written before the
+    2026-08-12 three-state model (NO_REFERENCE/BOOTSTRAP_CANDIDATE/TRUSTED_REFERENCE - see
+    prtouch_probe.py's own __init__ comment) - which assumes touch_probe() can proceed past the
+    baseline guard on a freshly-built probe - keeps working unchanged. Tests that specifically
+    exercise the bootstrap/candidate/confirm mechanics themselves (PersistedBaselineGuardTest,
+    parts of SensorConsistencyGuardTest) pass False to see the real NO_REFERENCE starting
+    state."""
     # Every test gets its own throwaway baseline_persist_path unless it explicitly overrides
     # one (see PersistedBaselineGuardTest, which deliberately reuses one path across multiple
     # _build() calls to simulate separate Klipper sessions reading the same file) - this keeps
@@ -48,6 +56,9 @@ def _build(prtouch_overrides=None):
     config.assert_all_consumed()
     mcu.set_query_response('deal_avgs_prtouch',
                             {'oid': pv2.mcu.pres_oid, 'ch0': -250000, 'ch1': 0, 'ch2': 0, 'ch3': 0})
+    if prime_trusted_baseline:
+        pv2.probe.check_sensor_consistency()
+        pv2.probe.confirm_bootstrap_baseline()
 
     # Every no-trigger/guard-failure path in these tests ends in _fail()'s own safety lift
     # (safe_move_z), which - like any real probe attempt that never fills its buffer - falls
@@ -173,6 +184,11 @@ class AlreadyTriggeredGuardTest(unittest.TestCase):
     def test_disabled_by_default_even_with_a_dramatically_different_reading(self):
         _, mcu, pv2 = _build()
         self.assertIsNone(pv2.probe.baseline_reference)
+        # isolates the OPT-IN baseline_reference feature specifically (this test's own
+        # subject) from the separate, always-on auto-learned TRUSTED_REFERENCE drift check
+        # (check_sensor_consistency's own subject, covered elsewhere) - both would otherwise
+        # reject a -100000 reading against _build()'s primed -250000 reference.
+        pv2.probe.sensor_baseline_max_drift = 1e9
         # even a reading that would obviously look "different" to a human has nothing to be
         # compared against with no reference configured - must not block on that basis alone.
         mcu.set_query_response(
@@ -220,18 +236,50 @@ class SensorConsistencyGuardTest(unittest.TestCase):
     well under max_baseline_abs, so it passed the single-read guard outright. These tests
     reproduce that exact live pattern against the new multi-read consistency gate."""
 
-    def test_consistent_reads_are_healthy_and_establish_auto_baseline(self):
-        _, mcu, pv2 = _build()
+    def test_consistent_reads_with_no_trusted_reference_are_a_bootstrap_candidate_not_healthy(self):
+        # 2026-08-12 root-cause mission: an internally-consistent reading with nothing trusted
+        # to compare against must NOT authorize probing on its own - see
+        # confirm_bootstrap_baseline() for the explicit human-driven promotion path.
+        _, mcu, pv2 = _build(prime_trusted_baseline=False)
+        diag = pv2.probe.check_sensor_consistency()
+        self.assertFalse(diag['ok'])
+        self.assertEqual(diag['state'], 'bootstrap_candidate')
+        self.assertIsNone(pv2.probe._auto_baseline)
+        self.assertIsNotNone(pv2.probe._bootstrap_candidate)
+        self.assertAlmostEqual(pv2.probe._bootstrap_candidate[0], -250000, delta=1)
+
+    def test_confirm_bootstrap_baseline_promotes_candidate_to_trusted_reference(self):
+        _, mcu, pv2 = _build(prime_trusted_baseline=False)
+        self.assertFalse(pv2.probe.check_sensor_consistency()['ok'])
+        values = pv2.probe.confirm_bootstrap_baseline()
+        self.assertAlmostEqual(values[0], -250000, delta=1)
+        self.assertIsNotNone(pv2.probe._auto_baseline)
+        self.assertIsNone(pv2.probe._bootstrap_candidate,
+                           "the candidate must be cleared once promoted")
+        # now genuinely trusted - a matching subsequent read is healthy without confirmation.
         diag = pv2.probe.check_sensor_consistency()
         self.assertTrue(diag['ok'])
         self.assertEqual(diag['state'], 'healthy')
-        self.assertIsNotNone(pv2.probe._auto_baseline)
-        self.assertAlmostEqual(pv2.probe._auto_baseline[0], -250000, delta=1)
+
+    def test_confirm_bootstrap_baseline_with_no_candidate_raises(self):
+        _, mcu, pv2 = _build(prime_trusted_baseline=False)
+        with self.assertRaises(prtouch_probe.PrtouchProbeSafetyError):
+            pv2.probe.confirm_bootstrap_baseline()
+
+    def test_bootstrap_candidate_cannot_authorize_touch_probe(self):
+        _, mcu, pv2 = _build(prime_trusted_baseline=False)
+        self.assertFalse(pv2.probe.check_sensor_consistency()['ok'])
+        with self.assertRaises(prtouch_probe.PrtouchProbeSafetyError) as ctx:
+            pv2.probe.touch_probe(2.0, retries=1, pro_cnt=1)
+        self.assertIn('PRTOUCH_CONFIRM_BASELINE', str(ctx.exception))
+        self.assertEqual(mcu.all_calls('start_step_prtouch'), [],
+                          "an unconfirmed bootstrap candidate must never authorize real motion")
 
     def test_flickering_reads_are_rejected_as_unstable(self):
         # the exact live-observed pattern: individually-plausible values that disagree wildly
         # with each other from one read to the next within a single check.
-        _, mcu, pv2 = _build()
+        _, mcu, pv2 = _build()  # primed with a -250000 TRUSTED_REFERENCE
+        baseline_before = list(pv2.probe._auto_baseline)
         it = iter([-1, -127864, -63923])
         mcu.set_query_response(
             'deal_avgs_prtouch',
@@ -240,8 +288,8 @@ class SensorConsistencyGuardTest(unittest.TestCase):
         self.assertFalse(diag['ok'])
         self.assertEqual(diag['state'], 'unstable')
         self.assertIn('disagree', diag['reason'])
-        self.assertIsNone(pv2.probe._auto_baseline,
-                           "a rejected batch must never establish/poison the auto-baseline")
+        self.assertEqual(pv2.probe._auto_baseline, baseline_before,
+                          "a rejected batch must never establish/poison the trusted reference")
 
     def test_individually_bad_read_is_rejected_as_corrupted_not_unstable(self):
         _, mcu, pv2 = _build()
@@ -255,9 +303,8 @@ class SensorConsistencyGuardTest(unittest.TestCase):
     def test_stable_but_drifted_reading_is_rejected_once_a_baseline_is_established(self):
         # internally consistent (zero spread) but far from what this session already learned
         # to trust - the spread check alone cannot catch this, only the drift check can.
+        # _build()'s default priming already establishes a TRUSTED_REFERENCE at -250000.
         _, mcu, pv2 = _build()
-        first = pv2.probe.check_sensor_consistency()
-        self.assertEqual(first['state'], 'healthy')
 
         mcu.set_query_response(
             'deal_avgs_prtouch',
@@ -269,8 +316,10 @@ class SensorConsistencyGuardTest(unittest.TestCase):
 
     def test_recovering_to_a_genuinely_consistent_reading_is_healthy_again(self):
         # a rejected check must not be a permanent lockout - once real, consistent, plausible
-        # data comes back, the guard must accept it again.
+        # data (matching the already-trusted reference) comes back, the guard must accept it
+        # again. _build()'s default priming already establishes a TRUSTED_REFERENCE at -250000.
         _, mcu, pv2 = _build()
+
         mcu.set_query_response(
             'deal_avgs_prtouch',
             {'oid': pv2.mcu.pres_oid, 'ch0': float('nan'), 'ch1': 0, 'ch2': 0, 'ch3': 0})
@@ -296,20 +345,31 @@ class SensorConsistencyGuardTest(unittest.TestCase):
                           "an unstable sensor must block motion just like a corrupted one")
 
     def test_get_status_exposes_sensor_state(self):
-        _, mcu, pv2 = _build()
+        _, mcu, pv2 = _build(prime_trusted_baseline=False)
         pv2.probe.check_sensor_consistency()
-        self.assertEqual(pv2.get_status(0.0)['sensor_state'], 'healthy')
+        status = pv2.get_status(0.0)
+        self.assertEqual(status['sensor_state'], 'bootstrap_candidate')
+        self.assertFalse(status['sensor_has_trusted_reference'])
+        self.assertTrue(status['sensor_bootstrap_candidate_pending'])
+        pv2.probe.confirm_bootstrap_baseline()
+        pv2.probe.check_sensor_consistency()
+        status = pv2.get_status(0.0)
+        self.assertEqual(status['sensor_state'], 'healthy')
+        self.assertTrue(status['sensor_has_trusted_reference'])
+        self.assertFalse(status['sensor_bootstrap_candidate_pending'])
 
     def test_default_thresholds_tolerate_this_projects_own_documented_real_idle_noise(self):
         # real healthy back-to-back reads captured live this session spread across ~300 counts
         # (-255752..-256031) - the default guard must not reject the actual hardware's own
-        # normal noise floor.
-        _, mcu, pv2 = _build()
+        # normal noise floor, once there's a trusted reference to check drift against.
+        _, mcu, pv2 = _build(prime_trusted_baseline=False)
         pv2.probe.sensor_consistency_reads = 4
-        it = iter([-255978, -256031, -255855, -255752])
+        it = iter([-255978, -256031, -255855, -255752, -255978, -256031, -255855, -255752])
         mcu.set_query_response(
             'deal_avgs_prtouch',
             lambda call: {'oid': pv2.mcu.pres_oid, 'ch0': next(it), 'ch1': 0, 'ch2': 0, 'ch3': 0})
+        pv2.probe.check_sensor_consistency()
+        pv2.probe.confirm_bootstrap_baseline()
         diag = pv2.probe.check_sensor_consistency()
         self.assertTrue(diag['ok'], diag['reason'])
         self.assertEqual(diag['state'], 'healthy')
@@ -324,45 +384,44 @@ class PersistedBaselineGuardTest(unittest.TestCase):
     Klipper restart goes through - so reusing one baseline_persist_path across two _build()
     calls is a faithful simulation of two separate Klipper sessions on the same printer."""
 
-    def test_baseline_survives_a_simulated_klipper_restart(self):
+    def test_trusted_reference_survives_a_simulated_klipper_restart(self):
         tmp_dir = tempfile.mkdtemp(prefix='prtouch_baseline_test_')
         _TEMP_DIRS.append(tmp_dir)
         path = os.path.join(tmp_dir, 'prtouch_baseline.json')
 
-        _, mcu1, pv2_1 = _build({'baseline_persist_path': path})
-        first = pv2_1.probe.check_sensor_consistency()
-        self.assertEqual(first['state'], 'healthy')
-        self.assertTrue(first['bootstrap'])
+        _, mcu1, pv2_1 = _build({'baseline_persist_path': path}, prime_trusted_baseline=False)
+        self.assertEqual(pv2_1.probe.check_sensor_consistency()['state'], 'bootstrap_candidate')
+        pv2_1.probe.confirm_bootstrap_baseline()
         self.assertTrue(os.path.exists(path))
 
         # A second, independent instance sharing only the persisted file - not the first
         # instance's Python object - is the real test of "survives a restart".
-        _, mcu2, pv2_2 = _build({'baseline_persist_path': path})
+        _, mcu2, pv2_2 = _build({'baseline_persist_path': path}, prime_trusted_baseline=False)
         self.assertIsNotNone(pv2_2.probe._auto_baseline,
-                              "a fresh instance must load the persisted reference on connect, "
-                              "not start blank like session-local-only baselines did")
+                              "a fresh instance must load the persisted TRUSTED_REFERENCE on "
+                              "connect, not start blank like session-local-only baselines did")
         self.assertAlmostEqual(pv2_2.probe._auto_baseline[0], -250000, delta=1)
         second = pv2_2.probe.check_sensor_consistency()
-        self.assertEqual(second['state'], 'healthy')
-        self.assertFalse(second['bootstrap'],
-                          "a restarted session with an existing persisted reference must not "
-                          "report a fresh bootstrap")
+        self.assertEqual(second['state'], 'healthy',
+                          "a restarted session with an existing TRUSTED_REFERENCE must not "
+                          "need re-confirmation - only the very first establishment does")
 
     def test_corrupted_reading_after_restart_does_not_silently_become_the_new_reference(self):
         # The exact failure mode this mission was asked to close: sensor is corrupted (but
         # internally self-consistent) at the moment a new session starts, with nothing
-        # session-local to compare against - only the file persisted by the PRIOR healthy
+        # session-local to compare against - only the file persisted by the PRIOR confirmed
         # session can catch it.
         tmp_dir = tempfile.mkdtemp(prefix='prtouch_baseline_test_')
         _TEMP_DIRS.append(tmp_dir)
         path = os.path.join(tmp_dir, 'prtouch_baseline.json')
 
-        _, mcu1, pv2_1 = _build({'baseline_persist_path': path})
-        self.assertEqual(pv2_1.probe.check_sensor_consistency()['state'], 'healthy')
+        _, mcu1, pv2_1 = _build({'baseline_persist_path': path}, prime_trusted_baseline=False)
+        pv2_1.probe.check_sensor_consistency()
+        pv2_1.probe.confirm_bootstrap_baseline()
         with open(path) as f:
             persisted_before = json.load(f)
 
-        _, mcu2, pv2_2 = _build({'baseline_persist_path': path})
+        _, mcu2, pv2_2 = _build({'baseline_persist_path': path}, prime_trusted_baseline=False)
         mcu2.set_query_response(
             'deal_avgs_prtouch',
             {'oid': pv2_2.mcu.pres_oid, 'ch0': -1, 'ch1': 0, 'ch2': 0, 'ch3': 0})
@@ -374,21 +433,38 @@ class PersistedBaselineGuardTest(unittest.TestCase):
             persisted_after = json.load(f)
         self.assertEqual(persisted_before, persisted_after,
                           "a corrupted-but-stable reading must never overwrite the persisted "
-                          "reference, even across a simulated restart")
+                          "TRUSTED_REFERENCE, even across a simulated restart")
 
         with self.assertRaises(prtouch_probe.PrtouchProbeSafetyError):
             pv2_2.probe.touch_probe(2.0, retries=1, pro_cnt=1)
         self.assertEqual(mcu2.all_calls('start_step_prtouch'), [])
 
-    def test_missing_persistent_reference_bootstraps_from_first_healthy_read(self):
-        _, mcu, pv2 = _build()  # fresh per-test tmp dir, no file yet
+    def test_a_corrupted_sensor_present_since_the_very_first_boot_never_self_promotes(self):
+        # The scenario the 3-state model (NO_REFERENCE/BOOTSTRAP_CANDIDATE/TRUSTED_REFERENCE)
+        # exists for: a sensor that is corrupted-but-stable from the very first boot (no prior
+        # good session ever ran) would pass every self-consistency check, every single restart,
+        # forever - only an explicit human confirm can ever trust it, and a machine that never
+        # gets one must stay refused indefinitely, not eventually "time out" into trusted.
+        tmp_dir = tempfile.mkdtemp(prefix='prtouch_baseline_test_')
+        _TEMP_DIRS.append(tmp_dir)
+        path = os.path.join(tmp_dir, 'prtouch_baseline.json')
+        for _ in range(5):  # simulate 5 separate restarts, all still on the fresh/never-confirmed
+            _, mcu, pv2 = _build({'baseline_persist_path': path}, prime_trusted_baseline=False)
+            diag = pv2.probe.check_sensor_consistency()
+            self.assertEqual(diag['state'], 'bootstrap_candidate')
+            self.assertFalse(diag['ok'])
+            with self.assertRaises(prtouch_probe.PrtouchProbeSafetyError):
+                pv2.probe.touch_probe(2.0, retries=1, pro_cnt=1)
+        self.assertFalse(os.path.exists(path),
+                          "a never-confirmed candidate must never reach disk at all")
+
+    def test_missing_persistent_reference_creates_a_bootstrap_candidate_not_a_trusted_one(self):
+        _, mcu, pv2 = _build(prime_trusted_baseline=False)  # fresh per-test tmp dir, no file yet
         self.assertIsNone(pv2.probe._auto_baseline)
         diag = pv2.probe.check_sensor_consistency()
-        self.assertEqual(diag['state'], 'healthy')
-        self.assertTrue(diag['bootstrap'])
-        second = pv2.probe.check_sensor_consistency()
-        self.assertFalse(second['bootstrap'],
-                          "only the very first-ever established reference is a bootstrap")
+        self.assertEqual(diag['state'], 'bootstrap_candidate')
+        self.assertFalse(diag['ok'])
+        self.assertIsNotNone(pv2.probe._bootstrap_candidate)
 
     def test_corrupt_persisted_file_is_treated_as_no_reference_not_a_crash(self):
         tmp_dir = tempfile.mkdtemp(prefix='prtouch_baseline_test_')
@@ -397,11 +473,10 @@ class PersistedBaselineGuardTest(unittest.TestCase):
         with open(path, 'w') as f:
             f.write('{not valid json')
 
-        _, mcu, pv2 = _build({'baseline_persist_path': path})
+        _, mcu, pv2 = _build({'baseline_persist_path': path}, prime_trusted_baseline=False)
         self.assertIsNone(pv2.probe._auto_baseline)
         diag = pv2.probe.check_sensor_consistency()
-        self.assertEqual(diag['state'], 'healthy')
-        self.assertTrue(diag['bootstrap'])
+        self.assertEqual(diag['state'], 'bootstrap_candidate')
 
     def test_malformed_baseline_field_is_treated_as_no_reference_not_a_crash(self):
         tmp_dir = tempfile.mkdtemp(prefix='prtouch_baseline_test_')
@@ -410,17 +485,18 @@ class PersistedBaselineGuardTest(unittest.TestCase):
         with open(path, 'w') as f:
             json.dump({'baseline': 'not a list'}, f)
 
-        _, mcu, pv2 = _build({'baseline_persist_path': path})
+        _, mcu, pv2 = _build({'baseline_persist_path': path}, prime_trusted_baseline=False)
         self.assertIsNone(pv2.probe._auto_baseline)
-        self.assertTrue(pv2.probe.check_sensor_consistency()['bootstrap'])
+        self.assertEqual(pv2.probe.check_sensor_consistency()['state'], 'bootstrap_candidate')
 
     def test_normal_drift_within_tolerance_updates_the_persisted_reference(self):
         tmp_dir = tempfile.mkdtemp(prefix='prtouch_baseline_test_')
         _TEMP_DIRS.append(tmp_dir)
         path = os.path.join(tmp_dir, 'prtouch_baseline.json')
 
-        _, mcu, pv2 = _build({'baseline_persist_path': path})
+        _, mcu, pv2 = _build({'baseline_persist_path': path}, prime_trusted_baseline=False)
         pv2.probe.check_sensor_consistency()
+        pv2.probe.confirm_bootstrap_baseline()
         with open(path) as f:
             first_value = json.load(f)['baseline'][0]
         self.assertAlmostEqual(first_value, -250000, delta=1)
@@ -435,14 +511,18 @@ class PersistedBaselineGuardTest(unittest.TestCase):
             second_value = json.load(f)['baseline'][0]
         self.assertAlmostEqual(second_value, -255000, delta=1,
                                 msg="normal in-tolerance drift must still update the persisted "
-                                    "reference, not freeze it forever at the bootstrap value")
+                                    "reference, not freeze it forever at the confirmed value")
 
-    def test_get_status_exposes_bootstrap_flag(self):
-        _, mcu, pv2 = _build()
+    def test_get_status_exposes_trusted_reference_and_candidate_pending_flags(self):
+        _, mcu, pv2 = _build(prime_trusted_baseline=False)
         pv2.probe.check_sensor_consistency()
-        self.assertTrue(pv2.get_status(0.0)['sensor_bootstrap'])
-        pv2.probe.check_sensor_consistency()
-        self.assertFalse(pv2.get_status(0.0)['sensor_bootstrap'])
+        status = pv2.get_status(0.0)
+        self.assertFalse(status['sensor_has_trusted_reference'])
+        self.assertTrue(status['sensor_bootstrap_candidate_pending'])
+        pv2.probe.confirm_bootstrap_baseline()
+        status = pv2.get_status(0.0)
+        self.assertTrue(status['sensor_has_trusted_reference'])
+        self.assertFalse(status['sensor_bootstrap_candidate_pending'])
 
 
 class DiagnosticsAreZeroMotionAndCachedTest(unittest.TestCase):
@@ -452,7 +532,7 @@ class DiagnosticsAreZeroMotionAndCachedTest(unittest.TestCase):
         self.assertEqual(mcu.all_calls('start_step_prtouch'), [])
 
     def test_get_status_before_any_reading_reports_no_reading_taken_yet_not_a_fabricated_value(self):
-        _, _, pv2 = _build()
+        _, _, pv2 = _build(prime_trusted_baseline=False)
         status = pv2.get_status(0.0)
         self.assertIsNone(status['sensor_ok'])
         self.assertIsNone(status['raw'])

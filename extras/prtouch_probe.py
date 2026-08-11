@@ -236,11 +236,29 @@ class PrtouchProbe:
         # this one self-populates so the drift check works even with no manual config, and
         # survives Klipper restarts / Linux reboots (loaded in _handle_connect below) - the one
         # case it cannot help with is a config's very first-ever boot with no persisted file
-        # yet, where the first internally-consistent reading is inherently trusted (see
-        # 'bootstrap' in last_diagnostic - a real, documented limitation, not a fabricated fix).
+        # yet - see the three-state model below for how that case is handled without
+        # silently trusting an unverified reading.
         self.baseline_persist_path = config.get(
             'baseline_persist_path', default='/opt/printer_data/prtouch_baseline.json')
+        # Three explicit states (2026-08-12 root-cause mission, closing a real gap found in
+        # the 2026-08-11 version above: an internally-consistent-but-unverified first reading
+        # is NOT the same as a verified-healthy one - a sensor stuck at a stable-but-corrupted
+        # value would pass every self-consistency check on every single restart, forever, so
+        # trusting it on first sight was never actually safe):
+        #   NO_REFERENCE        - self._auto_baseline is None and self._bootstrap_candidate is
+        #                          None. Nothing to compare against, nothing to confirm yet.
+        #   BOOTSTRAP_CANDIDATE - self._auto_baseline is None, self._bootstrap_candidate holds
+        #                          the latest internally-consistent-but-unverified reading.
+        #                          Visible for diagnostics; check_sensor_consistency() reports
+        #                          it as ok=False, state='bootstrap_candidate' - it can NEVER
+        #                          authorize touch_probe()/Z_OFFSET_CALIBRATION on its own.
+        #   TRUSTED_REFERENCE   - self._auto_baseline is set (persisted, survives restarts).
+        #                          Only reachable by matching an EXISTING trusted reference
+        #                          within tolerance, or by an explicit human confirmation (see
+        #                          confirm_bootstrap_baseline()/PRTOUCH_CONFIRM_BASELINE) -
+        #                          never automatically from a bootstrap candidate alone.
         self._auto_baseline = None
+        self._bootstrap_candidate = None
 
         self.mm_per_step = None
         self.bed_mesh = None
@@ -570,39 +588,79 @@ class PrtouchProbe:
                     self.sensor_consistency_max_spread)), 'unstable')
 
         latest = reads[-1]
-        bootstrap = self._auto_baseline is None
-        if not bootstrap:
-            drift = 0.
-            for i, key in enumerate(keys):
-                if key in latest and i < len(self._auto_baseline):
-                    drift = max(drift, abs(latest[key] - self._auto_baseline[i]))
-            if drift > self.sensor_baseline_max_drift:
-                # Deliberately does NOT update self._auto_baseline or the persisted file below
-                # this point - a stable-but-wrong reading must never overwrite a trusted
-                # reference just because it agrees with itself (see __init__'s own comment on
-                # this exact failure mode). Only readings that are ALREADY close to the
-                # existing trusted baseline (persisted or session-local) ever reach the update
-                # below - that's what makes it safe to persist unconditionally once reached.
-                return _reject(latest, (
-                    "reading is internally consistent but has drifted %.0f counts from the "
-                    "established healthy baseline (allowed %.0f) - refusing to trust a "
-                    "stable-but-implausible reading, and not overwriting the trusted "
-                    "reference with it" % (drift, self.sensor_baseline_max_drift)), 'unstable')
-
-        # Reached only for a batch that either matches the existing trusted reference within
-        # tolerance, or (bootstrap only) is the first reference this printer/session has ever
-        # established - safe to persist either way, per the guarantee above.
-        self._auto_baseline = [
+        batch_mean = [
             (sum(r[key] for r in reads if key in r) / len(reads)) if any(key in r for r in reads)
             else 0. for key in keys]
+
+        if self._auto_baseline is None:
+            # NO_REFERENCE -> BOOTSTRAP_CANDIDATE (2026-08-12 root-cause mission - see
+            # docs/NEBULAOS_PRTOUCH_MCU_TIMER_FORENSICS.md's final synthesis): an internally-
+            # consistent reading with nothing trusted to compare it against is NOT the same as
+            # a verified-healthy reading - a sensor stuck at a stable-but-corrupted value would
+            # look identical to this check on every single restart, forever. Deliberately does
+            # NOT authorize probing (ok=False) and does NOT persist - only an explicit human
+            # confirmation (confirm_bootstrap_baseline()/PRTOUCH_CONFIRM_BASELINE) can promote
+            # this to a real TRUSTED_REFERENCE. Overwrites any earlier candidate with the
+            # latest consistent reading, so a human confirming always trusts fresh data.
+            self._bootstrap_candidate = batch_mean
+            return _reject(latest, (
+                "reading is internally consistent, but no trusted reference exists yet to "
+                "verify it against (first boot, or persisted reference file missing) - "
+                "refusing to authorize a real probe attempt on an unconfirmed reading. Run "
+                "PRTOUCH_CONFIRM_BASELINE after independently checking this is a genuine "
+                "healthy reading to establish it as the trusted reference"), 'bootstrap_candidate')
+
+        drift = 0.
+        for i, key in enumerate(keys):
+            if key in latest and i < len(self._auto_baseline):
+                drift = max(drift, abs(latest[key] - self._auto_baseline[i]))
+        if drift > self.sensor_baseline_max_drift:
+            # Deliberately does NOT update self._auto_baseline or the persisted file below
+            # this point - a stable-but-wrong reading must never overwrite a trusted
+            # reference just because it agrees with itself (see __init__'s own comment on
+            # this exact failure mode). Only readings that are ALREADY close to the
+            # existing trusted baseline ever reach the update below - that's what makes it
+            # safe to persist unconditionally once reached.
+            return _reject(latest, (
+                "reading is internally consistent but has drifted %.0f counts from the "
+                "established TRUSTED_REFERENCE (allowed %.0f) - refusing to trust a "
+                "stable-but-implausible reading, and not overwriting the trusted "
+                "reference with it" % (drift, self.sensor_baseline_max_drift)), 'unstable')
+
+        # Reached only for a batch that matches the existing TRUSTED_REFERENCE within
+        # tolerance - safe to persist (this is normal drift tracking, not a new promotion).
+        self._auto_baseline = batch_mean
         self._save_persisted_baseline(self._auto_baseline)
         self.last_diagnostic = {
             'ok': True, 'raw': latest, 'reason': None, 'state': 'healthy',
-            'bootstrap': bootstrap,
+            'bootstrap': False,
             'tri_min_hold': self.tri_min_hold, 'tri_max_hold': self.tri_max_hold,
             'max_baseline_abs': self.max_baseline_abs,
         }
         return self.last_diagnostic
+
+    def confirm_bootstrap_baseline(self):
+        """BOOTSTRAP_CANDIDATE -> TRUSTED_REFERENCE (2026-08-12 root-cause mission). The one
+        explicit, human-driven promotion path - see check_sensor_consistency()'s own comment
+        on why this can't happen automatically: a sensor stuck at a stable-but-corrupted value
+        would pass every automatic self-consistency check on every single restart, forever, so
+        establishing genuine trust for the very first reference requires a human who has
+        independently verified (e.g. inspected READ_PRES, knows the printer is genuinely idle/
+        untouched) that the candidate is real. Raises PrtouchProbeSafetyError if there is no
+        current candidate (never checked, or the last check was itself corrupted/unstable -
+        checked_sensor_consistency() only ever sets a candidate from an internally-consistent
+        batch). Returns the newly-trusted baseline values."""
+        if self._bootstrap_candidate is None:
+            raise PrtouchProbeSafetyError(
+                "prtouch: no bootstrap candidate to confirm - run READ_PRES or "
+                "check_sensor_consistency() first and confirm it reports "
+                "state=bootstrap_candidate, not corrupted/unstable")
+        self._auto_baseline = self._bootstrap_candidate
+        self._bootstrap_candidate = None
+        self._save_persisted_baseline(self._auto_baseline)
+        logging.info("prtouch_probe: bootstrap candidate %s confirmed as TRUSTED_REFERENCE "
+                     "by explicit operator command", self._auto_baseline)
+        return self._auto_baseline
 
     def _check_baseline_safe(self):
         """Pre-motion guard - see check_sensor_consistency()'s own docstring for exactly what
