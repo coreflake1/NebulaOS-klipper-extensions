@@ -13,14 +13,34 @@
 # klippy_extras/ mirror of this same file for that repo's own invocation form)
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
+import atexit
+import json
+import os
+import shutil
+import tempfile
 import unittest
 
 from . import prtouch_probe
 from . import prtouch_test_support as fake
 from . import prtouch_v2
 
+_TEMP_DIRS = []
+atexit.register(lambda: [shutil.rmtree(d, ignore_errors=True) for d in _TEMP_DIRS])
+
 
 def _build(prtouch_overrides=None):
+    # Every test gets its own throwaway baseline_persist_path unless it explicitly overrides
+    # one (see PersistedBaselineGuardTest, which deliberately reuses one path across multiple
+    # _build() calls to simulate separate Klipper sessions reading the same file) - this keeps
+    # ordinary tests isolated from each other and from whatever the real default
+    # (/opt/printer_data/prtouch_baseline.json) resolves to on the machine running these
+    # tests, which may not exist/be writable here at all.
+    if prtouch_overrides is None or 'baseline_persist_path' not in prtouch_overrides:
+        tmp_dir = tempfile.mkdtemp(prefix='prtouch_baseline_test_')
+        _TEMP_DIRS.append(tmp_dir)
+        overrides = dict(prtouch_overrides or {})
+        overrides['baseline_persist_path'] = os.path.join(tmp_dir, 'prtouch_baseline.json')
+        prtouch_overrides = overrides
     printer, mcu, pins, values = fake.build_environment(prtouch_overrides)
     config = fake.make_prtouch_v2_config(printer, pins, values)
     pv2 = prtouch_v2.PRTouchV2(config)
@@ -293,6 +313,136 @@ class SensorConsistencyGuardTest(unittest.TestCase):
         diag = pv2.probe.check_sensor_consistency()
         self.assertTrue(diag['ok'], diag['reason'])
         self.assertEqual(diag['state'], 'healthy')
+
+
+class PersistedBaselineGuardTest(unittest.TestCase):
+    """check_sensor_consistency()'s persisted baseline (2026-08-12 root-cause mission) - closes
+    a real gap in the original 2026-08-11 session-local-only version: a corrupted-but-stable
+    sensor reading present when Klipper restarts had nothing persisted to compare against, so
+    it could get learned as the new 'healthy' baseline. Each _build() call here creates a
+    genuinely fresh PrtouchProbe/PRTouchV2 instance - the same object construction a real
+    Klipper restart goes through - so reusing one baseline_persist_path across two _build()
+    calls is a faithful simulation of two separate Klipper sessions on the same printer."""
+
+    def test_baseline_survives_a_simulated_klipper_restart(self):
+        tmp_dir = tempfile.mkdtemp(prefix='prtouch_baseline_test_')
+        _TEMP_DIRS.append(tmp_dir)
+        path = os.path.join(tmp_dir, 'prtouch_baseline.json')
+
+        _, mcu1, pv2_1 = _build({'baseline_persist_path': path})
+        first = pv2_1.probe.check_sensor_consistency()
+        self.assertEqual(first['state'], 'healthy')
+        self.assertTrue(first['bootstrap'])
+        self.assertTrue(os.path.exists(path))
+
+        # A second, independent instance sharing only the persisted file - not the first
+        # instance's Python object - is the real test of "survives a restart".
+        _, mcu2, pv2_2 = _build({'baseline_persist_path': path})
+        self.assertIsNotNone(pv2_2.probe._auto_baseline,
+                              "a fresh instance must load the persisted reference on connect, "
+                              "not start blank like session-local-only baselines did")
+        self.assertAlmostEqual(pv2_2.probe._auto_baseline[0], -250000, delta=1)
+        second = pv2_2.probe.check_sensor_consistency()
+        self.assertEqual(second['state'], 'healthy')
+        self.assertFalse(second['bootstrap'],
+                          "a restarted session with an existing persisted reference must not "
+                          "report a fresh bootstrap")
+
+    def test_corrupted_reading_after_restart_does_not_silently_become_the_new_reference(self):
+        # The exact failure mode this mission was asked to close: sensor is corrupted (but
+        # internally self-consistent) at the moment a new session starts, with nothing
+        # session-local to compare against - only the file persisted by the PRIOR healthy
+        # session can catch it.
+        tmp_dir = tempfile.mkdtemp(prefix='prtouch_baseline_test_')
+        _TEMP_DIRS.append(tmp_dir)
+        path = os.path.join(tmp_dir, 'prtouch_baseline.json')
+
+        _, mcu1, pv2_1 = _build({'baseline_persist_path': path})
+        self.assertEqual(pv2_1.probe.check_sensor_consistency()['state'], 'healthy')
+        with open(path) as f:
+            persisted_before = json.load(f)
+
+        _, mcu2, pv2_2 = _build({'baseline_persist_path': path})
+        mcu2.set_query_response(
+            'deal_avgs_prtouch',
+            {'oid': pv2_2.mcu.pres_oid, 'ch0': -1, 'ch1': 0, 'ch2': 0, 'ch3': 0})
+        diag = pv2_2.probe.check_sensor_consistency()
+        self.assertFalse(diag['ok'])
+        self.assertEqual(diag['state'], 'unstable')
+
+        with open(path) as f:
+            persisted_after = json.load(f)
+        self.assertEqual(persisted_before, persisted_after,
+                          "a corrupted-but-stable reading must never overwrite the persisted "
+                          "reference, even across a simulated restart")
+
+        with self.assertRaises(prtouch_probe.PrtouchProbeSafetyError):
+            pv2_2.probe.touch_probe(2.0, retries=1, pro_cnt=1)
+        self.assertEqual(mcu2.all_calls('start_step_prtouch'), [])
+
+    def test_missing_persistent_reference_bootstraps_from_first_healthy_read(self):
+        _, mcu, pv2 = _build()  # fresh per-test tmp dir, no file yet
+        self.assertIsNone(pv2.probe._auto_baseline)
+        diag = pv2.probe.check_sensor_consistency()
+        self.assertEqual(diag['state'], 'healthy')
+        self.assertTrue(diag['bootstrap'])
+        second = pv2.probe.check_sensor_consistency()
+        self.assertFalse(second['bootstrap'],
+                          "only the very first-ever established reference is a bootstrap")
+
+    def test_corrupt_persisted_file_is_treated_as_no_reference_not_a_crash(self):
+        tmp_dir = tempfile.mkdtemp(prefix='prtouch_baseline_test_')
+        _TEMP_DIRS.append(tmp_dir)
+        path = os.path.join(tmp_dir, 'prtouch_baseline.json')
+        with open(path, 'w') as f:
+            f.write('{not valid json')
+
+        _, mcu, pv2 = _build({'baseline_persist_path': path})
+        self.assertIsNone(pv2.probe._auto_baseline)
+        diag = pv2.probe.check_sensor_consistency()
+        self.assertEqual(diag['state'], 'healthy')
+        self.assertTrue(diag['bootstrap'])
+
+    def test_malformed_baseline_field_is_treated_as_no_reference_not_a_crash(self):
+        tmp_dir = tempfile.mkdtemp(prefix='prtouch_baseline_test_')
+        _TEMP_DIRS.append(tmp_dir)
+        path = os.path.join(tmp_dir, 'prtouch_baseline.json')
+        with open(path, 'w') as f:
+            json.dump({'baseline': 'not a list'}, f)
+
+        _, mcu, pv2 = _build({'baseline_persist_path': path})
+        self.assertIsNone(pv2.probe._auto_baseline)
+        self.assertTrue(pv2.probe.check_sensor_consistency()['bootstrap'])
+
+    def test_normal_drift_within_tolerance_updates_the_persisted_reference(self):
+        tmp_dir = tempfile.mkdtemp(prefix='prtouch_baseline_test_')
+        _TEMP_DIRS.append(tmp_dir)
+        path = os.path.join(tmp_dir, 'prtouch_baseline.json')
+
+        _, mcu, pv2 = _build({'baseline_persist_path': path})
+        pv2.probe.check_sensor_consistency()
+        with open(path) as f:
+            first_value = json.load(f)['baseline'][0]
+        self.assertAlmostEqual(first_value, -250000, delta=1)
+
+        # within sensor_baseline_max_drift (default 10000) - legitimate slow drift, not a fault.
+        mcu.set_query_response(
+            'deal_avgs_prtouch',
+            {'oid': pv2.mcu.pres_oid, 'ch0': -255000, 'ch1': 0, 'ch2': 0, 'ch3': 0})
+        diag = pv2.probe.check_sensor_consistency()
+        self.assertEqual(diag['state'], 'healthy')
+        with open(path) as f:
+            second_value = json.load(f)['baseline'][0]
+        self.assertAlmostEqual(second_value, -255000, delta=1,
+                                msg="normal in-tolerance drift must still update the persisted "
+                                    "reference, not freeze it forever at the bootstrap value")
+
+    def test_get_status_exposes_bootstrap_flag(self):
+        _, mcu, pv2 = _build()
+        pv2.probe.check_sensor_consistency()
+        self.assertTrue(pv2.get_status(0.0)['sensor_bootstrap'])
+        pv2.probe.check_sensor_consistency()
+        self.assertFalse(pv2.get_status(0.0)['sensor_bootstrap'])
 
 
 class DiagnosticsAreZeroMotionAndCachedTest(unittest.TestCase):

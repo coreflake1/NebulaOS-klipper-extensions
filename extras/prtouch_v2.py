@@ -106,6 +106,7 @@ class PRTouchV2:
             'sensor_ok': diag['ok'],
             'sensor_reason': diag['reason'],
             'sensor_state': diag.get('state'),
+            'sensor_bootstrap': diag.get('bootstrap', False),
             'raw': diag['raw'],
             'tri_min_hold': diag['tri_min_hold'],
             'tri_max_hold': diag['tri_max_hold'],

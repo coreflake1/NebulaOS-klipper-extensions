@@ -83,8 +83,10 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import contextlib
+import json
 import logging
 import math
+import os
 
 from . import prtouch_calibration
 from . import prtouch_units as units
@@ -219,10 +221,25 @@ class PrtouchProbe:
             'sensor_consistency_max_spread', default=5000., minval=1.)
         self.sensor_baseline_max_drift = config.getfloat(
             'sensor_baseline_max_drift', default=10000., minval=1.)
-        # Auto-learned per-channel reference, refreshed only from a batch that already passed
-        # every check in check_sensor_consistency() - see that method's own docstring. Distinct
-        # from the user-configurable baseline_reference above (which stays opt-in/unset by
-        # default); this one self-populates so the drift check works even with no manual config.
+        # Persisted per-channel reference (2026-08-12, root-cause mission - see
+        # docs/NEBULAOS_PRTOUCH_MCU_TIMER_FORENSICS.md's disassembly-grounded root-cause
+        # section): a SESSION-LOCAL auto-learned baseline (the original 2026-08-11 version of
+        # this guard) has a real gap - if the sensor is already corrupted before the first
+        # healthy-looking read this session (e.g. Klipper restarted while the MCU/HX711 was
+        # still in a corrupted state from an earlier raw step op), a corrupted-but-internally-
+        # consistent reading could get learned as "healthy" with nothing to compare it against.
+        # Persisting the reference to disk and gating every future update against the
+        # PERSISTED value (not just this session's own view) closes that gap: once a real
+        # baseline is established, only readings already close to it can ever update it again -
+        # see check_sensor_consistency()'s own docstring for exactly how. Distinct from the
+        # user-configurable baseline_reference above (which stays opt-in/unset by default);
+        # this one self-populates so the drift check works even with no manual config, and
+        # survives Klipper restarts / Linux reboots (loaded in _handle_connect below) - the one
+        # case it cannot help with is a config's very first-ever boot with no persisted file
+        # yet, where the first internally-consistent reading is inherently trusted (see
+        # 'bootstrap' in last_diagnostic - a real, documented limitation, not a fabricated fix).
+        self.baseline_persist_path = config.get(
+            'baseline_persist_path', default='/opt/printer_data/prtouch_baseline.json')
         self._auto_baseline = None
 
         self.mm_per_step = None
@@ -260,6 +277,57 @@ class PrtouchProbe:
                 break
         if self.mm_per_step is None:
             raise self.printer.config_error("prtouch_probe: no active Z stepper found")
+        self._load_persisted_baseline()
+
+    def _load_persisted_baseline(self):
+        """Loads self._auto_baseline from baseline_persist_path, if a prior session left one -
+        see __init__'s own comment on why this needs to survive Klipper restarts/Linux reboots,
+        not just live in memory for the current session. Never raises: a missing/corrupt/
+        unreadable file just means no trusted reference yet (the next healthy read bootstraps
+        one, same as this guard's original in-memory-only behavior) - a persistence failure
+        must never itself block probing, only the sensor-health checks that already exist for
+        that purpose."""
+        self._auto_baseline = None
+        try:
+            with open(self.baseline_persist_path) as f:
+                data = json.load(f)
+            values = data.get('baseline')
+            if (isinstance(values, list) and len(values) == 4
+                    and all(isinstance(v, (int, float)) for v in values)):
+                self._auto_baseline = [float(v) for v in values]
+                logging.info("prtouch_probe: loaded persisted sensor baseline %s from %s",
+                             self._auto_baseline, self.baseline_persist_path)
+            else:
+                logging.warning(
+                    "prtouch_probe: %s exists but its 'baseline' field isn't 4 numbers (%r) - "
+                    "ignoring it, next healthy read re-bootstraps", self.baseline_persist_path,
+                    values)
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logging.warning(
+                "prtouch_probe: could not load persisted baseline from %s: %s - starting with "
+                "no trusted reference (next healthy read re-bootstraps)",
+                self.baseline_persist_path, e)
+
+    def _save_persisted_baseline(self, values):
+        """Writes self._auto_baseline to baseline_persist_path - see check_sensor_consistency()
+        for the policy governing WHEN this is called (only from an already-accepted 'healthy'
+        verdict, which by construction is already within tolerance of whatever was persisted
+        before, if anything was). Write-then-rename so a crash/power-loss mid-write can never
+        leave a truncated/corrupt file behind for _load_persisted_baseline() to trip over.
+        Never raises: a persistence failure must not block the probe attempt that triggered
+        it - it only means this particular update won't survive a restart."""
+        try:
+            tmp_path = self.baseline_persist_path + '.tmp'
+            with open(tmp_path, 'w') as f:
+                json.dump({'baseline': list(values)}, f)
+            os.replace(tmp_path, self.baseline_persist_path)
+        except Exception as e:
+            logging.warning(
+                "prtouch_probe: failed to persist sensor baseline to %s: %s - in-memory "
+                "reference still updated, but won't survive a restart",
+                self.baseline_persist_path, e)
 
     def get_step_counts(self, distance, speed):
         """get_step_cnts-equivalent: distance/speed -> (step_cnt, step_us, acc_ctl_cnt) for the
@@ -441,20 +509,24 @@ class PrtouchProbe:
           - the reads agree with EACH OTHER within sensor_consistency_max_spread per channel -
             catches exactly the flickering behavior actually observed live, which needs at
             least two reads to see at all.
-          - if this module has already established an auto-learned baseline (from a previous
-            confirmed-healthy check this session - see self._auto_baseline), this batch's mean
-            must not drift from it by more than sensor_baseline_max_drift - catches a reading
-            that is internally consistent but consistently WRONG (e.g. stuck at a stable-but-
-            false value), which the spread check alone cannot catch.
+          - if a trusted baseline is already established (see self._auto_baseline, loaded from
+            baseline_persist_path on klippy:connect if a prior session already wrote one - see
+            __init__'s own comment on why this must survive restarts, not just live in memory),
+            this batch's mean must not drift from it by more than sensor_baseline_max_drift -
+            catches a reading that is internally consistent but consistently WRONG (e.g. stuck
+            at a stable-but-false value), which the spread check alone cannot catch.
         Both failure classes are reported as diag['state'] in {'unstable', 'corrupted'} (vs.
         'healthy') so a caller/status subscriber can distinguish "sensor looks actively broken"
-        from "sensor readings disagree with each other or with what this session has learned to
-        trust" - both refuse to proceed (diag['ok'] is False for either), matching this method's
-        fail-closed contract; only the label differs.
+        from "sensor readings disagree with each other or with the trusted baseline" - both
+        refuse to proceed (diag['ok'] is False for either), matching this method's fail-closed
+        contract; only the label differs.
 
-        Updates self.last_diagnostic like read_diagnostics(). Only ever refreshes
-        self._auto_baseline on a 'healthy' verdict - a rejected batch can never poison the
-        reference future checks compare against.
+        Updates self.last_diagnostic like read_diagnostics(), plus a 'bootstrap' bool (True only
+        when this call established the very first trusted baseline this printer has ever
+        persisted - worth surfacing since that one case is trusted on first sight, not verified
+        against anything). Only ever refreshes self._auto_baseline AND its on-disk copy on a
+        'healthy' verdict - a rejected batch can never poison the reference future checks (this
+        session's or a future restarted one) compare against.
 
         NEEDS_HARDWARE_DATA: sensor_consistency_max_spread/sensor_baseline_max_drift are sized
         against this session's own real observed idle noise floor (~300 counts across genuine
@@ -498,23 +570,35 @@ class PrtouchProbe:
                     self.sensor_consistency_max_spread)), 'unstable')
 
         latest = reads[-1]
-        if self._auto_baseline is not None:
+        bootstrap = self._auto_baseline is None
+        if not bootstrap:
             drift = 0.
             for i, key in enumerate(keys):
                 if key in latest and i < len(self._auto_baseline):
                     drift = max(drift, abs(latest[key] - self._auto_baseline[i]))
             if drift > self.sensor_baseline_max_drift:
+                # Deliberately does NOT update self._auto_baseline or the persisted file below
+                # this point - a stable-but-wrong reading must never overwrite a trusted
+                # reference just because it agrees with itself (see __init__'s own comment on
+                # this exact failure mode). Only readings that are ALREADY close to the
+                # existing trusted baseline (persisted or session-local) ever reach the update
+                # below - that's what makes it safe to persist unconditionally once reached.
                 return _reject(latest, (
-                    "reading is internally consistent but has drifted %.0f counts from this "
-                    "session's own established healthy baseline (allowed %.0f) - refusing to "
-                    "trust a stable-but-implausible reading" % (
-                        drift, self.sensor_baseline_max_drift)), 'unstable')
+                    "reading is internally consistent but has drifted %.0f counts from the "
+                    "established healthy baseline (allowed %.0f) - refusing to trust a "
+                    "stable-but-implausible reading, and not overwriting the trusted "
+                    "reference with it" % (drift, self.sensor_baseline_max_drift)), 'unstable')
 
+        # Reached only for a batch that either matches the existing trusted reference within
+        # tolerance, or (bootstrap only) is the first reference this printer/session has ever
+        # established - safe to persist either way, per the guarantee above.
         self._auto_baseline = [
             (sum(r[key] for r in reads if key in r) / len(reads)) if any(key in r for r in reads)
             else 0. for key in keys]
+        self._save_persisted_baseline(self._auto_baseline)
         self.last_diagnostic = {
             'ok': True, 'raw': latest, 'reason': None, 'state': 'healthy',
+            'bootstrap': bootstrap,
             'tri_min_hold': self.tri_min_hold, 'tri_max_hold': self.tri_max_hold,
             'max_baseline_abs': self.max_baseline_abs,
         }
