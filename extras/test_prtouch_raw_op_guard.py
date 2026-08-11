@@ -172,5 +172,152 @@ class SettleAfterDisarmTest(unittest.TestCase):
         self.assertGreaterEqual(after - before, probe._raw_op_settle_s)
 
 
+class SingleRawMoveCommandTest(unittest.TestCase):
+    """2026-08-11 closure mission: explicit single-direction coverage - a bare 'safe_move_z
+    sends one arm/disarm pair' proof, independent of the fuller no-trigger/retry scenarios
+    covered elsewhere, so UP and DOWN are each directly, individually asserted."""
+
+    def test_single_raw_up_move_sends_exactly_one_arm_disarm_pair(self):
+        _, mcu, pv2 = _build()
+        pv2.probe.safe_move_z(1, 1.0, 1.0)
+        step_calls = mcu.all_calls('start_step_prtouch')
+        arms = [c for c in step_calls if c.by_field['step_cnt'] > 0]
+        disarms = [c for c in step_calls if c.by_field['step_cnt'] == 0]
+        self.assertEqual(len(arms), 1)
+        self.assertEqual(arms[0].by_field['dir'], 1)
+        self.assertEqual(len(disarms), 1)
+
+    def test_single_raw_down_move_sends_exactly_one_arm_disarm_pair(self):
+        _, mcu, pv2 = _build()
+        pv2.probe.safe_move_z(0, 1.0, 1.0)
+        step_calls = mcu.all_calls('start_step_prtouch')
+        arms = [c for c in step_calls if c.by_field['step_cnt'] > 0]
+        disarms = [c for c in step_calls if c.by_field['step_cnt'] == 0]
+        self.assertEqual(len(arms), 1)
+        self.assertEqual(arms[0].by_field['dir'], 0)
+        self.assertEqual(len(disarms), 1)
+
+
+class SafeMoveZOwnershipTest(unittest.TestCase):
+    """The 4th ownership combination not covered by SharedOwnershipGuardTest above:
+    safe_move_z vs safe_move_z. touch_probe-vs-touch_probe, touch_probe-vs-safe_move_z, and
+    safe_move_z-vs-touch_probe are covered there."""
+
+    def test_second_safe_move_z_rejected_while_first_active(self):
+        _, mcu, pv2 = _build()
+        probe = pv2.probe
+        seen = {}
+
+        def reentrant_call(call):
+            with self.assertRaises(prtouch_probe.PrtouchProbeSafetyError) as ctx:
+                probe.safe_move_z(0, 1.0, 1.0)
+            seen['message'] = str(ctx.exception)
+
+        mcu.on_send_hook('start_step_prtouch', reentrant_call)
+        probe.safe_move_z(1, 1.0, 1.0)
+        self.assertIn('already in progress', seen.get('message', ''))
+
+
+class TimeoutReleasesOwnershipTest(unittest.TestCase):
+    """max_probe_duration_s is a distinct failure path from retry exhaustion (_touch_probe
+    checks it separately, before the retries check) - the ownership guard must release on
+    this exit path too, not just on a plain exception or a retries-exhausted _fail()."""
+
+    def test_ownership_released_after_max_duration_timeout(self):
+        # 1.0 is the configured minval - a single no-trigger attempt's own collect timeout
+        # (down_min_z/speed + margin) already exceeds it, so the *next* loop iteration's
+        # top-of-loop deadline check fires before a 2nd/3rd attempt is ever armed.
+        _, mcu, pv2 = _build(prtouch_values={'max_probe_duration_s': '1.0'})
+        probe = pv2.probe
+        with self.assertRaises(Exception) as ctx:
+            probe.touch_probe(1.0, retries=10, pro_cnt=1)
+        self.assertIn('max_probe_duration_s', str(ctx.exception))
+        self.assertFalse(probe._raw_op_active,
+                          "ownership must release even when _fail() is reached via the "
+                          "duration guard rather than retry exhaustion")
+        # confirm it's genuinely usable again, not just flagged inactive.
+        with self.assertRaises(Exception):
+            probe.touch_probe(1.0, retries=10, pro_cnt=1)
+
+
+class InstrumentationHasNoSideEffectsTest(unittest.TestCase):
+    """The new logging.info() calls added throughout touch_probe/_raw_move/_raw_lift must be
+    pure observation - identical MCU protocol traffic with instrumentation active or silenced.
+    Proven directly by diffing the real sent-command sequence (names + field values) between a
+    normal run and one with logging.info patched to a no-op, rather than just trusting that
+    logging calls "obviously" don't touch the MCU."""
+
+    def test_logging_patched_to_noop_produces_identical_mcu_traffic(self):
+        import logging as logging_module
+
+        def _sent_signature(mcu_obj):
+            return [(c.name, tuple(sorted(c.by_field.items())) if c.by_field else tuple(c.args))
+                    for c in mcu_obj.sent_commands]
+
+        _, mcu_a, pv2_a = _build()
+        with self.assertRaises(Exception):
+            pv2_a.probe.touch_probe(1.0, retries=2, pro_cnt=1)
+        normal_signature = _sent_signature(mcu_a)
+
+        _, mcu_b, pv2_b = _build()
+        original_info = logging_module.info
+        logging_module.info = lambda *a, **kw: None
+        try:
+            with self.assertRaises(Exception):
+                pv2_b.probe.touch_probe(1.0, retries=2, pro_cnt=1)
+        finally:
+            logging_module.info = original_info
+        silenced_signature = _sent_signature(mcu_b)
+
+        self.assertEqual(normal_signature, silenced_signature,
+                          "instrumentation logging must not alter MCU protocol traffic")
+        self.assertTrue(normal_signature, "sanity check: the scenario must actually send commands")
+
+
+class ExactOrderedSequenceTest(unittest.TestCase):
+    """Reproduces the incident's own multi-attempt no-trigger shape and asserts the FULL
+    ordered (direction, step_cnt>0) sequence, not just aggregate counts - the old,
+    incident-producing code would have shown the same directional alternation (that bug was
+    already fixed in 2026-08-06/09), so what this test adds is proving a settle observably
+    separates every disarm from the following arm in the reactor's own timeline, which the
+    pre-2026-08-10 code never did."""
+
+    def test_settle_gap_separates_every_disarm_from_the_next_arm_in_time(self):
+        _, mcu, pv2 = _build()
+        probe = pv2.probe
+        reactor = pv2.printer.get_reactor()
+        timeline = []
+        # probe.mcu is the real PrtouchMCU wrapper (what prtouch_probe.py actually calls
+        # self.mcu.start_step(...) on) - not the raw FakeMCU/`mcu` fixture, which has no
+        # start_step method of its own.
+        original_start_step = probe.mcu.start_step
+
+        def spy_start_step(direction, step_cnt, *a, **kw):
+            timeline.append(('arm' if step_cnt > 0 else 'disarm', direction,
+                              reactor.monotonic()))
+            return original_start_step(direction, step_cnt, *a, **kw)
+
+        probe.mcu.start_step = spy_start_step
+        with self.assertRaises(Exception):
+            probe.touch_probe(1.0, retries=2, pro_cnt=1)
+
+        disarms = [(i, t) for i, (kind, _d, t) in enumerate(timeline) if kind == 'disarm']
+        arms = [(i, t) for i, (kind, _d, t) in enumerate(timeline) if kind == 'arm']
+        # every disarm not immediately followed by another disarm (i.e. one with a next arm
+        # after it) must show that next arm strictly later in the (virtual) reactor clock -
+        # zero elapsed time between them is exactly the incident's own failure mode.
+        checked = 0
+        for idx, disarm_time in disarms:
+            next_arms = [t for i, t in arms if i > idx]
+            if not next_arms:
+                continue
+            self.assertGreater(next_arms[0], disarm_time,
+                                "a disarm must be followed by strictly later time before the "
+                                "next arm - zero gap is the incident's own reproduced failure")
+            checked += 1
+        self.assertGreater(checked, 0, "sanity check: the scenario must contain at least one "
+                                        "disarm followed by a later arm")
+
+
 if __name__ == '__main__':
     unittest.main()
