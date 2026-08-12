@@ -39,7 +39,9 @@
 import contextlib
 import math
 
+from . import prtouch_mcu
 from . import prtouch_nozzle
+from . import prtouch_probe
 
 #: Structured status contract, version 1 - see docs/z_compensate_status_api.md. Consumed by
 #: GuppyScreen's recalibration wizard via printer.objects.subscribe, replacing its previous
@@ -244,10 +246,16 @@ class ZCompensate:
         bed_target = heater_bed.get_status(self.printer.get_reactor().monotonic())['target']
         toolhead = self.printer.lookup_object('toolhead')
         with self._probe_overrides() as probe:
-            prtouch_nozzle.clear_nozzle(
-                probe, toolhead, self.gcode, self.prtouch.heaters, self.clear_nozzle_config,
-                hot_start_temp, hot_rub_temp, bed_target + bed_add_temp,
-                hot_end_temp=hot_end_temp)
+            # See the except block in cmd_z_offset_calibration for why this can't just let
+            # PrtouchProbeSafetyError/PrtouchProtocolError propagate unconverted.
+            try:
+                prtouch_nozzle.clear_nozzle(
+                    probe, toolhead, self.gcode, self.prtouch.heaters, self.clear_nozzle_config,
+                    hot_start_temp, hot_rub_temp, bed_target + bed_add_temp,
+                    hot_end_temp=hot_end_temp)
+            except (prtouch_probe.PrtouchProbeSafetyError,
+                    prtouch_mcu.PrtouchProtocolError) as e:
+                raise self.printer.command_error(str(e))
 
     cmd_z_offset_calibration_help = "Auto-tune Z offset via the load-cell nozzle touch"
 
@@ -331,6 +339,18 @@ class ZCompensate:
             self.calibration_state = "error"
             self.calibration_z_offset = None
             self.calibration_error = _sanitize_calibration_error(e)
+            # 2026-08-12 (live incident, see prtouch_v2.py's _guarded() for the full story):
+            # PrtouchProbeSafetyError/PrtouchProtocolError are plain Exception subclasses, not
+            # self.printer.command_error - letting either escape this handler unconverted (the
+            # bare `raise` this replaces) reaches Klipper's gcode dispatcher as an unrecognized
+            # exception, which triggers a full emergency_stop of every MCU instead of a clean
+            # rejection of just this command. Confirmed live: touch_probe()'s own fail-closed
+            # sensor-trust guard doing exactly its job took the whole printer down. Anything
+            # else (a genuine unexpected bug) still re-raises as-is, so Klipper's own internal-
+            # error/shutdown fail-safe still applies to failure modes this doesn't recognize.
+            if isinstance(e, (prtouch_probe.PrtouchProbeSafetyError,
+                               prtouch_mcu.PrtouchProtocolError)):
+                raise self.printer.command_error(str(e))
             raise
 
         # The calibration itself has now genuinely succeeded - a real measurement was taken

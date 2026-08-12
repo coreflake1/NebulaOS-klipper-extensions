@@ -71,13 +71,32 @@ class PRTouchV2:
     def _handle_connect(self):
         self.heaters = prtouch_nozzle.NozzleHeaters(self.printer)
 
+    def _guarded(self, fn, *args, **kwargs):
+        """2026-08-12 (live incident): PrtouchProbeSafetyError/PrtouchProtocolError are plain
+        Exception subclasses, not self.printer.command_error - Klipper's own gcode.py dispatch
+        loop (`except self.error as e:` / bare `except:`) only treats command_error specially as
+        a clean, user-facing rejection; anything else falls into its generic "Internal error on
+        command" handler, which calls printer.invoke_shutdown() - a FULL emergency_stop of every
+        MCU, not a refusal of just this command. Confirmed live: the very first real
+        PRTOUCH_TEST_TOUCH call on fresh hardware hit exactly this path (the fail-closed
+        no-trusted-reference guard correctly refused to probe, via PrtouchProbeSafetyError) and
+        took the whole printer down instead of just rejecting the command - no motion was ever
+        armed (the guard raises before arming anything), but the safety guard's own success case
+        was, ironically, indistinguishable from a genuine internal fault to Klipper's dispatcher.
+        Every gcode entry point that can reach probe/mcu code goes through this wrapper so a
+        correctly-functioning safety refusal is a clean command_error, not a shutdown."""
+        try:
+            return fn(*args, **kwargs)
+        except (prtouch_probe.PrtouchProbeSafetyError, prtouch_mcu.PrtouchProtocolError) as e:
+            raise self.printer.command_error(str(e))
+
     cmd_NOZZLE_CLEAR_help = "Wipe the nozzle using the load-cell touch probe"
 
     def cmd_NOZZLE_CLEAR(self, gcmd):
         hot_min_temp = gcmd.get_float('HOT_MIN_TEMP', self.hot_min_temp)
         hot_max_temp = gcmd.get_float('HOT_MAX_TEMP', self.hot_max_temp)
         bed_max_temp = gcmd.get_float('BED_MAX_TEMP', self.bed_max_temp)
-        self.clear_nozzle(hot_min_temp, hot_max_temp, bed_max_temp)
+        self._guarded(self.clear_nozzle, hot_min_temp, hot_max_temp, bed_max_temp)
 
     cmd_SAFE_MOVE_Z_help = "Raw non-probing Z move via the prtouch MCU step channel"
 
@@ -85,7 +104,7 @@ class PRTouchV2:
         direction = gcmd.get_int('DIR', 1, minval=0, maxval=1)
         distance = gcmd.get_float('DIS', 10., above=0.)
         speed = gcmd.get_float('SPD', 5., above=0.)
-        self.probe.safe_move_z(direction, distance, speed)
+        self._guarded(self.probe.safe_move_z, direction, distance, speed)
 
     cmd_READ_PRES_help = "Read raw load-cell sensor channels - no motion, diagnostic only"
 
@@ -106,7 +125,7 @@ class PRTouchV2:
         "is genuinely idle and the reading is real, not corrupted")
 
     def cmd_PRTOUCH_CONFIRM_BASELINE(self, gcmd):
-        values = self.probe.confirm_bootstrap_baseline()
+        values = self._guarded(self.probe.confirm_bootstrap_baseline)
         gcmd.respond_info(
             "PRTOUCH_CONFIRM_BASELINE: confirmed ch0=%.0f ch1=%.0f ch2=%.0f ch3=%.0f as the "
             "new TRUSTED_REFERENCE (persisted, survives restarts)" % tuple(values))
@@ -129,7 +148,7 @@ class PRTouchV2:
         # exists specifically to keep the first real touch small, not to expose the full
         # configured travel range.
         down_min_z = gcmd.get_float('DOWN_MIN_Z', 3.0, above=0., maxval=5.0)
-        z = self.probe.touch_probe(down_min_z, retries=1, pro_cnt=1)
+        z = self._guarded(self.probe.touch_probe, down_min_z, retries=1, pro_cnt=1)
         gcmd.respond_info(
             "PRTOUCH_TEST_TOUCH: single-attempt touch_probe result z=%.4fmm "
             "(down_min_z=%.2fmm) - no offset applied, nothing persisted beyond the normal "

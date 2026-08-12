@@ -10,6 +10,8 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import unittest
 
+from . import prtouch_mcu
+from . import prtouch_probe
 from . import prtouch_test_support as fake
 from . import prtouch_v2
 from . import z_compensate
@@ -41,6 +43,60 @@ def _build(zcompensate_overrides=None, stub_measurement=0.0, stub_raises=None):
 
     pv2.touch_probe = fake_touch_probe
     return printer, mcu, pv2, zc, calls
+
+
+class SafetyGuardRejectionIsACommandErrorTest(unittest.TestCase):
+    """Live incident, 2026-08-12: PrtouchProbeSafetyError/PrtouchProtocolError are plain
+    Exception subclasses, not self.printer.command_error - real Klipper's gcode.py dispatch loop
+    only recognizes command_error as a clean, user-facing rejection; anything else is treated as
+    an unrecognized internal fault and triggers printer.invoke_shutdown() (a full emergency_stop
+    of every MCU), not just a rejection of this one command. Confirmed live on real hardware: the
+    very first real Z_OFFSET_CALIBRATION-equivalent call on a fresh flash correctly triggered the
+    fail-closed no-trusted-reference guard (touch_probe() raising PrtouchProbeSafetyError before
+    arming anything) - and took the whole printer down anyway, because the exception reached
+    Klipper's dispatcher unconverted. Proves cmd_z_offset_calibration now converts both known
+    prtouch exception types into printer.command_error before they can escape."""
+
+    def test_probe_safety_error_becomes_a_command_error_not_a_raw_exception(self):
+        _, _, pv2, zc, calls = _build(
+            stub_raises=prtouch_probe.PrtouchProbeSafetyError("no trusted reference yet"))
+        gcmd = fake.FakeGCmd()
+        with self.assertRaises(fake.CommandError) as ctx:
+            zc.cmd_z_offset_calibration(gcmd)
+        self.assertIn("no trusted reference yet", str(ctx.exception))
+        # the original, more specific exception type must NOT be what actually escapes -
+        # that's the exact bug this guards against (isinstance, not identity: CommandError
+        # itself must be what Klipper's dispatcher sees).
+        self.assertNotIsInstance(ctx.exception, prtouch_probe.PrtouchProbeSafetyError)
+
+    def test_protocol_error_becomes_a_command_error_not_a_raw_exception(self):
+        _, _, pv2, zc, calls = _build(
+            stub_raises=prtouch_mcu.PrtouchProtocolError("stale buffer, repair failed"))
+        gcmd = fake.FakeGCmd()
+        with self.assertRaises(fake.CommandError) as ctx:
+            zc.cmd_z_offset_calibration(gcmd)
+        self.assertIn("stale buffer, repair failed", str(ctx.exception))
+
+    def test_status_still_records_error_state_after_conversion(self):
+        # the conversion must not regress the existing status-recording behavior these other
+        # tests in this file rely on (see OffsetRangeRejectionTest).
+        _, _, pv2, zc, calls = _build(
+            stub_raises=prtouch_probe.PrtouchProbeSafetyError("no trusted reference yet"))
+        gcmd = fake.FakeGCmd()
+        with self.assertRaises(Exception):
+            zc.cmd_z_offset_calibration(gcmd)
+        status = zc.get_status(0.0)
+        self.assertEqual(status['calibration_state'], "error")
+        self.assertIn("no trusted reference yet", status['calibration_error'])
+
+    def test_a_genuinely_unexpected_error_still_propagates_unconverted(self):
+        # deliberately NOT one of the two known prtouch exception types - Klipper's own
+        # internal-error/shutdown fail-safe should still apply to failure modes this fix
+        # doesn't specifically recognize, rather than silently downgrading every exception.
+        _, _, pv2, zc, calls = _build(stub_raises=RuntimeError("something genuinely unexpected"))
+        gcmd = fake.FakeGCmd()
+        with self.assertRaises(RuntimeError):
+            zc.cmd_z_offset_calibration(gcmd)
 
 
 class OffsetRangeRejectionTest(unittest.TestCase):
