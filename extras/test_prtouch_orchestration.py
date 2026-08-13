@@ -337,16 +337,26 @@ class ExceptionCleanupTest(unittest.TestCase):
         self.assertEqual(bed_mesh.set_mesh_calls[-1], 'a-real-mesh-object',
                           "mesh must be restored via try/finally even on a raised error")
 
-    def test_fail_path_issues_final_safety_lift(self):
+    def test_fail_path_issues_no_extra_lift_beyond_the_matching_recovery(self):
+        # Regression test for the 2026-08-13 redundant-recovery-lift fix: _fail() used to
+        # call _raw_move(1, 5.0, 10.0) on top of whatever recovery already ran, producing 3
+        # raw disarms (descent, recovery, _fail()'s own lift) for a sequence that only ever
+        # needed 2 - confirmed live (docs/NEBULAOS_PRTOUCH_MCU_TIMER_FORENSICS.md sec 16).
+        # retries=1 with no scripted trigger response: exactly one down arm (the descent) and
+        # exactly one up arm (the matching no-trigger recovery) must be sent - no third.
         _, mcu, pv2 = _build()
-        with self.assertRaises(Exception):
+        with self.assertRaises(Exception) as ctx:
             pv2.probe.touch_probe(0.5, retries=1, pro_cnt=1)
-        # _fail() calls safe_move_z(1, 5.0, 10.0) in addition to the per-attempt recovery -
-        # confirm at least one upward safe_move_z-shaped arm was sent after the last
-        # recovery, i.e. cleanup ran even on the terminal failure path.
-        up_arms = [c for c in mcu.all_calls('start_step_prtouch')
-                   if c.by_field['dir'] == 1 and c.by_field['step_cnt'] > 0]
-        self.assertTrue(up_arms)
+        self.assertIn("did not converge", str(ctx.exception))
+        step_calls = mcu.all_calls('start_step_prtouch')
+        down_arms = [c for c in step_calls if c.by_field['dir'] == 0 and c.by_field['step_cnt'] > 0]
+        up_arms = [c for c in step_calls if c.by_field['dir'] == 1 and c.by_field['step_cnt'] > 0]
+        self.assertEqual(len(down_arms), 1, "expected exactly one descent")
+        self.assertEqual(len(up_arms), 1,
+                          "expected exactly one recovery lift and NO additional _fail() lift")
+        self.assertFalse(pv2.probe._raw_op_active, "ownership must release on the failure path")
+        self.assertTrue(pv2.probe._raw_channel_healthy,
+                         "a cleanly-completed recovery must not latch the channel unhealthy")
 
 
 class MalformedResponseTest(unittest.TestCase):
@@ -392,9 +402,9 @@ class SafeMoveZCleanupTest(unittest.TestCase):
     """Regression test for a real gap found 2026-08-06: safe_move_z's final disarm
     (start_step with step_cnt=0) previously ran only if collect_step_samples() completed
     without raising - a genuine buffer-repair failure (PrtouchProtocolError, or any other
-    exception from the manual_get_steps query path) would skip it entirely. safe_move_z is
-    _fail()'s own last-resort safety lift, so this mattered specifically on the one path
-    meant to make failures safe."""
+    exception from the manual_get_steps query path) would skip it entirely. safe_move_z is a
+    user-invocable raw-move command in its own right, so this mattered specifically on a path
+    a caller can trigger directly, not just as part of a probe cycle."""
 
     def test_disarm_still_sent_when_repair_query_raises(self):
         _, mcu, pv2 = _build()

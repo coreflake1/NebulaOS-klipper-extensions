@@ -167,6 +167,8 @@ class PRTouchV2:
             'sensor_state': diag.get('state'),
             'sensor_has_trusted_reference': self.probe._auto_baseline is not None,
             'sensor_bootstrap_candidate_pending': self.probe._bootstrap_candidate is not None,
+            'raw_channel_healthy': self.probe._raw_channel_healthy,
+            'raw_op_active': self.probe._raw_op_active,
             'raw': diag['raw'],
             'tri_min_hold': diag['tri_min_hold'],
             'tri_max_hold': diag['tri_max_hold'],

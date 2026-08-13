@@ -24,7 +24,8 @@
 #      bounded by nothing but the stepper stalling against the bed. Fixed by
 #      _recover_after_no_trigger(), which undoes the full *commanded* step_cnt (not
 #      sample-derived - a no-trigger response is empty by definition) before the next attempt
-#      or before _fail()'s own final lift. Deliberately does NOT replicate the reference's
+#      or before _fail() raises (see _fail()'s own docstring - as of 2026-08-13 it no longer
+#      issues its own lift on top of this one). Deliberately does NOT replicate the reference's
 #      toolhead.set_position() re-homing (which redefines Z=0 at the failure point) - this
 #      module's whole design principle is that BLTouch's Z=0 stays the one authoritative
 #      reference; silently redefining it from a failed touch would undermine
@@ -81,6 +82,18 @@
 #     the protocol's own declared pacing granularity (tri_send_ms) as the most evidence-
 #     grounded default available rather than an invented constant - see its own docstring.
 #
+# 2026-08-13 (redundant-recovery-lift mission): a real, non-retried PRTOUCH_TEST_TOUCH attempt
+# (docs/NEBULAOS_PRTOUCH_MCU_TIMER_FORENSICS.md sec 16) showed _fail() always issuing its own
+# 5mm safety lift even when the no-trigger recovery immediately before it had already restored
+# the full commanded descent - 3 raw disarms for a sequence that only ever needed 2. That
+# specific attempt did not crash the MCU (checked against the actual 2026-08-10 shutdown
+# incident's own timeline in sec 2 of the same doc, which stalled one level earlier, during a
+# recovery lift, with retries still remaining - _fail() was never reached), so this is
+# independent hardening, not a fix for that still-open incident. _fail() no longer moves at
+# all; _raw_lift() (shared by _recover_after_no_trigger/_lift_after_down) now latches
+# _raw_channel_healthy False and refuses all further raw ops (via _own_raw_operation) if a
+# recovery move itself fails to complete, instead of ever guessing with another move.
+#
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import contextlib
 import json
@@ -95,9 +108,10 @@ from . import prtouch_units as units
 class PrtouchProbeSafetyError(Exception):
     """Raised by a pre-motion guard (max travel/duration, invalid/already-triggered sensor
     reading) that refuses to arm any real movement at all - distinct from a command_error
-    raised after a real, physical attempt (which always includes the safety-lift courtesy via
-    _fail()) since these guards trip BEFORE any motion this call has commanded, so there is
-    nothing of this call's own to recover from."""
+    raised after a real, physical attempt (via _fail(), once whatever motion that attempt made
+    has already been recovered - see _fail()'s own docstring) since these guards trip BEFORE
+    any motion this call has commanded, so there is nothing of this call's own to recover
+    from."""
 
 
 class PrtouchProbe:
@@ -187,6 +201,12 @@ class PrtouchProbe:
         self._raw_op_active = False
         self._raw_op_name = None
         self._raw_op_id = 0
+        # Raw-channel health latch (2026-08-13, redundant-recovery-lift mission). Set False only
+        # when a recovery/lift move (_raw_lift) itself fails to complete - i.e. the physical
+        # position is no longer provably known. Deliberately NOT auto-cleared: the only recovery
+        # from "position uncertain" is a human re-homing/restart, not another guess-and-move.
+        # See _raw_lift's own comment for why this is the sole place that ever sets it False.
+        self._raw_channel_healthy = True
         # raw_op_settle_s: minimum yield after a disarm before the next arm. The real minimum
         # safe gap is NOT known - that needs hardware qualification - so this defaults to
         # tri_send_ms (the same value the MCU firmware itself uses, via check_delay(), to pace
@@ -371,7 +391,13 @@ class PrtouchProbe:
         private helpers they call internally (_fail/_raw_lift/_raw_move/_lift_after_down/
         _recover_after_no_trigger) - those are only ever reached from within an already-held
         operation, so re-entering this guard for them would be both unnecessary and wrong
-        (it would make _fail()'s own safety lift raise instead of running)."""
+        (it would make _recover_after_no_trigger's own recovery lift raise instead of
+        running)."""
+        if not self._raw_channel_healthy:
+            raise PrtouchProbeSafetyError(
+                "prtouch: raw PRTouch channel is latched unhealthy after a recovery move did "
+                "not complete cleanly - physical position is no longer provably known; refusing "
+                "to start %s until a Klipper restart (FIRMWARE_RESTART) and re-homing" % op_name)
         if self._raw_op_active:
             raise PrtouchProbeSafetyError(
                 "prtouch: a raw PRTouch operation (%s) is already in progress - refusing to "
@@ -405,9 +431,10 @@ class PrtouchProbe:
     def safe_move_z(self, direction, distance, speed):
         """Non-probing raw Z move via the same MCU step command (safe_move_z-equivalent) - used
         for general manual moves outside a probe cycle. direction: 1 = up, 0 = down. This is the
-        PUBLIC entry point (guarded by _own_raw_operation) - _fail()'s own internal safety lift
-        calls _raw_move() directly instead, since it is legitimately nested within whichever
-        public operation already holds the guard.
+        PUBLIC entry point (guarded by _own_raw_operation); _raw_move() is its own private
+        helper, kept separate from touch_probe()'s down-arm (which arms/disarms the step
+        channel directly - see _touch_probe) since a probe descent must run concurrently with
+        start_pres_prtouch, which safe_move_z deliberately does not (see below).
 
         2026-08-12 stock-vs-NebulaOS fidelity mission: the one confirmed remaining deviation
         from reference/prtouch_v2_wrapper.py's own safe_move_z() (lines 1122-1151) is that stock
@@ -442,22 +469,32 @@ class PrtouchProbe:
         finally:
             # Found 2026-08-06: previously unguarded - a genuine buffer-repair failure
             # (PrtouchProtocolError) here would skip the disarm below entirely. This is
-            # _fail()'s own last-resort safety lift path, so letting a repair failure mask the
-            # real command_error (and leave the step channel armed) would be exactly the
-            # wrong failure mode to introduce into the one path meant to make failures safe.
+            # safe_move_z's own raw-move path, so letting a repair failure mask the real
+            # command_error (and leave the step channel armed) would be exactly the wrong
+            # failure mode to introduce into a path a user can invoke directly.
             self.mcu.start_step(direction, 0, 0, 0, low_spd_nul=self.low_spd_nul,
                                  send_step_duty=self.send_step_duty)
             logging.info("prtouch_probe: raw op #%s disarm dir=%d", op_id, direction)
             self._settle_after_disarm()
 
     def _fail(self, message, op_id=None):
-        """ck_and_raise_error-equivalent: Z motion during a probe is a raw, non-interruptible
-        MCU-side pulse train, not a Klipper-queued move (ANALYSIS.md sec 6) - the only real
-        safety net is lifting clear before surfacing the error, which is what this does. Calls
-        _raw_move() directly (not the public safe_move_z()) - see safe_move_z's own docstring."""
+        """ck_and_raise_error-equivalent, minus its own courtesy safety lift (removed
+        2026-08-13, redundant-recovery-lift mission - see module docstring's incident log
+        entry). Every call site in _touch_probe reaches _fail() only after either (a) the
+        descent that led to this failure was already fully recovered via
+        _recover_after_no_trigger/_lift_after_down (both of which restore the complete
+        commanded travel before returning, and latch _raw_channel_healthy False + raise
+        instead of returning if they can't - see _raw_lift), or (b) no descent has been armed
+        yet this attempt (e.g. the per-attempt baseline guard). In both cases physical position
+        is already correct/unchanged, so an unconditional extra lift here was pure redundant
+        motion stacked on top of an already-completed recovery - confirmed live: a single
+        non-retried PRTOUCH_TEST_TOUCH attempt produced 3 raw disarms (descent, recovery lift,
+        this lift) instead of the 2 the sequence actually needed, each logging a MCU-side
+        `Timer too close` (docs/NEBULAOS_PRTOUCH_MCU_TIMER_FORENSICS.md sec 16 - that same
+        sequence did NOT crash the MCU; this is a redundant-motion cleanup, not a fix for the
+        separate, still-unresolved 2026-08-10 MCU-shutdown incident documented in sec 2)."""
         logging.info("prtouch_probe: %s", message)
         self.last_error = message
-        self._raw_move(1, 5.0, 10.0, op_id)
         raise self.printer.command_error("prtouch: " + message)
 
     def read_diagnostics(self, base_cnt=8):
@@ -793,7 +830,9 @@ class PrtouchProbe:
                 # the same direction with nothing to stop them but the stepper stalling against
                 # the bed. Always undo the full commanded descent via a raw step move using the
                 # known-commanded step_cnt (not sample-derived, since step_samples is empty
-                # here) before the next attempt or before _fail()'s own final safety lift.
+                # here) before the next attempt, or before _fail() raises if retries are
+                # exhausted (as of 2026-08-13, _fail() no longer lifts on its own - this
+                # recovery is the only lift that runs, see _fail()'s own docstring).
                 self._recover_after_no_trigger(step_cnt, op_id)
                 continue
 
@@ -859,7 +898,17 @@ class PrtouchProbe:
         genuine buffer-repair failure (PrtouchProtocolError) during collect_step_samples()
         previously would have skipped the disarm entirely, leaving the step channel armed on
         exactly the recovery path meant to make a no-trigger/malformed-response failure safe.
-        2026-08-10: disarm is now followed by _settle_after_disarm() - see module docstring."""
+        2026-08-10: disarm is now followed by _settle_after_disarm() - see module docstring.
+
+        2026-08-13 (redundant-recovery-lift mission): if collect_step_samples() itself raises
+        here, this recovery move did not provably complete - the physical position it was
+        meant to restore is no longer known. _fail() no longer issues a courtesy lift of its
+        own in that case (see its own docstring), so this is the one place that must react:
+        latch _raw_channel_healthy False (refuses every future raw op via _own_raw_operation
+        until a restart/re-home) instead of silently letting the caller treat this as an
+        ordinary, recovered failure. The trailing disarm attempt still runs regardless (finally,
+        unchanged) - even a channel we no longer trust should still get one disarm attempt
+        rather than none."""
         up_cnt, up_us, up_acc = self.get_step_counts(traveled, self.tri_z_up_spd)
         if up_cnt == 0:
             return
@@ -872,6 +921,13 @@ class PrtouchProbe:
         try:
             self.mcu.collect_step_samples(
                 units.probe_timeout_seconds(traveled, self.tri_z_up_spd))
+        except Exception:
+            self._raw_channel_healthy = False
+            logging.error(
+                "prtouch_probe: raw op #%s recovery lift of %.4fmm did not complete cleanly - "
+                "latching raw channel unhealthy (position no longer provably known)",
+                op_id, traveled)
+            raise
         finally:
             self.mcu.start_step(1, 0, 0, 0, low_spd_nul=self.low_spd_nul,
                                  send_step_duty=self.send_step_duty)

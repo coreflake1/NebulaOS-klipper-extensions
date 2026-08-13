@@ -60,10 +60,11 @@ def _build(prtouch_overrides=None, prime_trusted_baseline=True):
         pv2.probe.check_sensor_consistency()
         pv2.probe.confirm_bootstrap_baseline()
 
-    # Every no-trigger/guard-failure path in these tests ends in _fail()'s own safety lift
-    # (safe_move_z), which - like any real probe attempt that never fills its buffer - falls
-    # through to the manual_get_steps/manual_get_pres repair-query path. Generic zero-filled
-    # repair data, same convention as test_prtouch_orchestration.py's own _build().
+    # Every no-trigger/guard-failure path in these tests ends in the matching recovery lift
+    # (_recover_after_no_trigger), which - like any real probe attempt that never fills its
+    # buffer - falls through to the manual_get_steps/manual_get_pres repair-query path.
+    # Generic zero-filled repair data, same convention as test_prtouch_orchestration.py's own
+    # _build().
     def _step_repair(call):
         i = call.args[1]
         return {'oid': pv2.mcu.step_oid, 'index': i, 'tri_time': 0,

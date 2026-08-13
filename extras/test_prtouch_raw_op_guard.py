@@ -3,9 +3,15 @@
 # incident sequence (no-trigger retries producing repeated disarm/rearm transitions) against
 # the fake MCU harness, and proves the two new safety properties hold:
 #   1. only one of touch_probe()/safe_move_z() may be active at a time, across BOTH public
-#      entry points, however a second call is triggered - without breaking _fail()'s own
-#      internal safety lift, which is legitimately nested inside an already-held operation.
+#      entry points, however a second call is triggered - without breaking
+#      _recover_after_no_trigger()'s own recovery lift, which is legitimately nested inside
+#      an already-held operation.
 #   2. every disarm this module issues is followed by a settle yield before the next arm.
+#
+# Also covers the 2026-08-13 redundant-recovery-lift fix: _fail() no longer issues its own
+# lift on top of an already-completed recovery (see prtouch_probe.py's own docstring), and a
+# recovery lift that itself fails to complete latches the raw channel unhealthy instead of
+# ever guessing with another move.
 #
 # Run from klippy/: python3 -m unittest extras.test_prtouch_raw_op_guard -v
 #
@@ -116,12 +122,13 @@ class SharedOwnershipGuardTest(unittest.TestCase):
         with self.assertRaises(Exception):
             probe.touch_probe(0.5, retries=1, pro_cnt=1)
 
-    def test_fail_internal_safety_lift_not_blocked_by_its_own_guard(self):
-        # Regression proof for the _raw_move refactor: _fail()'s own internal safety lift
-        # must still actually run (and arm an upward move) even though it executes while
-        # touch_probe()'s own guard is held - it must never raise PrtouchProbeSafetyError
-        # against itself, which would silently swallow the real command_error and skip the
-        # safety lift entirely.
+    def test_fail_raises_a_clean_command_error_not_the_raw_op_guard(self):
+        # _fail() itself no longer arms any motion (2026-08-13 fix - see its own docstring),
+        # so the historical concern this test guarded (a nested internal lift tripping over
+        # its own _own_raw_operation guard) no longer applies to _fail() directly. What must
+        # still hold: the exception _fail() raises is a plain command_error, never
+        # PrtouchProbeSafetyError - a caller must not be able to confuse a genuine terminal
+        # failure with the raw-op-already-active rejection this same guard also produces.
         _, mcu, pv2 = _build()
         probe = pv2.probe
         with self.assertRaises(Exception) as ctx:
@@ -129,8 +136,9 @@ class SharedOwnershipGuardTest(unittest.TestCase):
         self.assertNotIsInstance(ctx.exception, prtouch_probe.PrtouchProbeSafetyError)
         up_calls = [c for c in mcu.all_calls('start_step_prtouch')
                     if c.by_field['dir'] == 1 and c.by_field['step_cnt'] > 0]
-        self.assertTrue(up_calls,
-                         "expected _fail()'s own safety lift to have armed an upward move")
+        self.assertEqual(len(up_calls), 1,
+                          "expected exactly the no-trigger recovery's own upward move - no "
+                          "second lift from _fail()")
 
 
 class SettleAfterDisarmTest(unittest.TestCase):
@@ -154,8 +162,10 @@ class SettleAfterDisarmTest(unittest.TestCase):
             probe.touch_probe(1.0, retries=retries, pro_cnt=1)
         # Per attempt: one settle after the down-arm's disarm, one after the recovery lift's
         # own disarm - exactly the two transitions the live incident's "Timer too close"
-        # warnings clustered around - plus one more for _fail()'s own final safety-lift disarm.
-        self.assertEqual(len(calls), retries * 2 + 1)
+        # warnings clustered around. No extra settle beyond that: _fail() (reached once
+        # retries are exhausted) no longer issues a lift of its own (2026-08-13 fix), so there
+        # is no third disarm to settle after.
+        self.assertEqual(len(calls), retries * 2)
 
     def test_settle_duration_defaults_to_tri_send_ms(self):
         _, mcu, pv2 = _build()
@@ -277,6 +287,74 @@ class InstrumentationHasNoSideEffectsTest(unittest.TestCase):
         self.assertEqual(normal_signature, silenced_signature,
                           "instrumentation logging must not alter MCU protocol traffic")
         self.assertTrue(normal_signature, "sanity check: the scenario must actually send commands")
+
+
+class RawChannelHealthLatchTest(unittest.TestCase):
+    """2026-08-13 redundant-recovery-lift mission: if a recovery/lift move itself fails to
+    complete, the physical position it was meant to restore is no longer provably known.
+    _fail() no longer papers over that with a guessed extra move (see its own docstring) -
+    instead _raw_lift() latches _raw_channel_healthy False, and _own_raw_operation refuses
+    every future raw op (touch_probe or safe_move_z) until a restart."""
+
+    def test_recovery_failure_latches_raw_channel_unhealthy(self):
+        # The descent itself must complete cleanly (its own manual_get_steps repair queries
+        # must succeed) so the failure below is unambiguously the RECOVERY lift's - the first
+        # 8 manual_get_steps calls repair the down move's buffer (MAX_BUF_LEN=32, 4 samples
+        # per call); every call after that belongs to the recovery lift's own repair attempt.
+        _, mcu, pv2 = _build()
+        probe = pv2.probe
+        call_count = {'n': 0}
+
+        def flaky_repair(call):
+            call_count['n'] += 1
+            if call_count['n'] > 8:
+                raise RuntimeError("simulated manual_get_steps comms failure during recovery")
+            i = call.args[1]
+            return {'oid': pv2.mcu.step_oid, 'index': i, 'tri_time': 0,
+                    'tick0': i * 100, 'tick1': (i + 1) * 100, 'tick2': (i + 2) * 100,
+                    'tick3': (i + 3) * 100, 'step0': i, 'step1': i + 1, 'step2': i + 2,
+                    'step3': i + 3}
+
+        mcu.set_query_response('manual_get_steps', flaky_repair)
+        self.assertTrue(probe._raw_channel_healthy)
+        with self.assertRaises(RuntimeError):
+            probe.touch_probe(0.5, retries=1, pro_cnt=1)
+        self.assertFalse(probe._raw_channel_healthy,
+                          "a recovery lift that didn't complete must latch unhealthy")
+        # ownership itself still releases - this is a distinct, longer-lived latch, not a
+        # substitute for the per-call ownership guard.
+        self.assertFalse(probe._raw_op_active)
+
+    def test_unhealthy_raw_channel_rejects_touch_probe(self):
+        _, mcu, pv2 = _build()
+        probe = pv2.probe
+        probe._raw_channel_healthy = False
+        with self.assertRaises(prtouch_probe.PrtouchProbeSafetyError) as ctx:
+            probe.touch_probe(0.5, retries=1, pro_cnt=1)
+        self.assertIn('unhealthy', str(ctx.exception))
+        # confirmed before arming anything - no MCU traffic at all.
+        self.assertEqual(mcu.all_calls('start_step_prtouch'), [])
+
+    def test_unhealthy_raw_channel_rejects_safe_move_z(self):
+        _, mcu, pv2 = _build()
+        probe = pv2.probe
+        probe._raw_channel_healthy = False
+        with self.assertRaises(prtouch_probe.PrtouchProbeSafetyError) as ctx:
+            probe.safe_move_z(1, 1.0, 1.0)
+        self.assertIn('unhealthy', str(ctx.exception))
+        self.assertEqual(mcu.all_calls('start_step_prtouch'), [])
+
+    def test_healthy_channel_unaffected_by_an_ordinary_no_trigger_failure(self):
+        # A plain no-trigger/retries-exhausted failure (the matching recovery completes fine)
+        # must NOT latch the channel unhealthy - only a recovery move that itself fails to
+        # complete should ever do that.
+        _, mcu, pv2 = _build()
+        probe = pv2.probe
+        with self.assertRaises(Exception):
+            probe.touch_probe(0.5, retries=1, pro_cnt=1)
+        self.assertTrue(probe._raw_channel_healthy)
+        # genuinely still usable - not just flagged healthy.
+        probe.safe_move_z(1, 1.0, 1.0)
 
 
 class ExactOrderedSequenceTest(unittest.TestCase):
