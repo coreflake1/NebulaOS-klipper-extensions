@@ -39,12 +39,16 @@ class BlocksRealMotionTest(unittest.TestCase):
                 pv2.mcu.start_step(0, 100, 2000, 4)
 
     def test_allows_zero_step_cnt_stop_idiom(self):
-        # step_cnt=0 is the documented "stop/disarm" call (PrtouchMCU.stop(), and every
-        # start_step(..., 0, ...) after an arm) - it moves nothing and must stay usable
-        # even under the guard, or cleanup code itself would be unable to run.
+        # step_cnt=0 is the documented "stop/disarm" call (PrtouchMCU.stop_step(), and every
+        # real raw-op disarm site in prtouch_probe.py) - it moves nothing and must stay usable
+        # even under the guard, or cleanup code itself would be unable to run. 2026-08-14
+        # disarm-protocol mission: start_step() itself now rejects step_cnt=0 outright (it is
+        # not a valid disarm on the real wire protocol without send_ms=0 too - see
+        # prtouch_mcu.py's start_step()/stop_step() docstrings), so this guard-level test now
+        # exercises stop_step() directly, same as every real caller does.
         _, mcu, pv2 = _build()
         with guard_mod.guard(pv2):
-            pv2.mcu.start_step(0, 0, 0, 0)  # must not raise
+            pv2.mcu.stop_step()  # must not raise
         self.assertTrue(mcu.last_call('start_step_prtouch'))
 
     def test_blocks_touch_probe_end_to_end(self):

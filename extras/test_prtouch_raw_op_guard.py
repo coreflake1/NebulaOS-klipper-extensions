@@ -372,15 +372,22 @@ class ExactOrderedSequenceTest(unittest.TestCase):
         timeline = []
         # probe.mcu is the real PrtouchMCU wrapper (what prtouch_probe.py actually calls
         # self.mcu.start_step(...) on) - not the raw FakeMCU/`mcu` fixture, which has no
-        # start_step method of its own.
+        # start_step/stop_step methods of its own. 2026-08-14 disarm-protocol mission: arm and
+        # disarm are now two distinct methods (start_step() rejects step_cnt=0 outright), so
+        # both must be spied on to reconstruct the same arm/disarm timeline as before.
         original_start_step = probe.mcu.start_step
+        original_stop_step = probe.mcu.stop_step
 
         def spy_start_step(direction, step_cnt, *a, **kw):
-            timeline.append(('arm' if step_cnt > 0 else 'disarm', direction,
-                              reactor.monotonic()))
+            timeline.append(('arm', direction, reactor.monotonic()))
             return original_start_step(direction, step_cnt, *a, **kw)
 
+        def spy_stop_step():
+            timeline.append(('disarm', None, reactor.monotonic()))
+            return original_stop_step()
+
         probe.mcu.start_step = spy_start_step
+        probe.mcu.stop_step = spy_stop_step
         with self.assertRaises(Exception):
             probe.touch_probe(1.0, retries=2, pro_cnt=1)
 

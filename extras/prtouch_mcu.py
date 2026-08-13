@@ -187,9 +187,34 @@ class PrtouchMCU:
 
     def start_step(self, direction, step_cnt, step_us, acc_ctl_cnt, send_ms=10,
                    low_spd_nul=5, send_step_duty=16, auto_rtn=0):
+        """ARM only. 2026-08-14 (disarm-protocol mission): step_cnt=0 is rejected here, not
+        silently accepted - see stop_step()'s own docstring for why a step_cnt=0 call through
+        THIS method (which defaults send_ms=10) is not the same thing as a real disarm on the
+        actual MCU wire protocol, and would not cleanly stop the step timer."""
+        if step_cnt == 0:
+            raise ValueError(
+                "prtouch_mcu: start_step() called with step_cnt=0 (send_ms=%d) - this is not "
+                "a valid disarm on the real MCU protocol (see stop_step()'s own docstring); "
+                "call stop_step() instead" % send_ms)
         self.start_step_prtouch_cmd.send([
             self.step_oid, direction, send_ms, step_cnt, step_us, acc_ctl_cnt,
             low_spd_nul, send_step_duty, auto_rtn])
+
+    def stop_step(self):
+        """The one real step-disarm packet. 2026-08-14 (disarm-protocol mission - see
+        docs/NEBULAOS_PRTOUCH_MCU_TIMER_FORENSICS.md sec 18/19): reference/prtouch_v2.c's
+        command_start_step_prtouch checks send_ms==0 (its 3rd wire field, `args[2]`) as the
+        dedicated stop sentinel - on a match it sets need_stop=1, calls stop_sys_time(), and
+        returns immediately, WITHOUT ever reaching sched_add_timer(). Every real stock disarm
+        call (reference/prtouch_v2_wrapper.py, e.g. line 445) sends send_ms=0 for exactly this
+        reason. This host's own disarm calls previously went through start_step()'s own
+        send_ms=10 default instead (step_cnt=0 but send_ms=10) - on the real protocol that
+        does NOT hit the send_ms==0 early-return, and instead falls through to the normal arm
+        path with step_cnt=0/step_us=0/acc_ctl_cnt=0 - a degenerate re-arm, not a clean stop.
+        This method exists so that mistake is structurally impossible to make again: it always
+        sends the exact stock disarm shape (all fields zero but oid), and start_step() itself
+        now refuses a step_cnt=0 call rather than silently accepting one."""
+        self.start_step_prtouch_cmd.send([self.step_oid, 0, 0, 0, 0, 0, 0, 0, 0])
 
     def start_pres(self, direction, acq_ms, send_ms, need_cnt, hftr_cut, lftr_k1,
                    min_hold, max_hold):
@@ -197,10 +222,6 @@ class PrtouchMCU:
             self.pres_oid, direction, acq_ms, send_ms, need_cnt,
             units.to_fixed_point(hftr_cut), units.to_fixed_point(lftr_k1),
             int(min_hold), int(max_hold)])
-
-    def stop(self):
-        self.start_step_prtouch_cmd.send([self.step_oid, 0, 0, 0, 0, 0, 5, 16, 0])
-        self.start_pres_prtouch_cmd.send([self.pres_oid, 0, 0, 0, 0, 0, 0, 0, 0])
 
     def deal_avgs(self, base_cnt=8):
         return self.deal_avgs_prtouch_cmd.send([self.pres_oid, base_cnt])

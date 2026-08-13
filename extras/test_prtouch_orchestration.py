@@ -115,6 +115,80 @@ def _arm_trigger_response(mcu, pv2, dip_at=20, step_cnt_hint=200):
     mcu.on_send_hook('start_pres_prtouch', on_pres)
 
 
+class DisarmProtocolWireFormatTest(unittest.TestCase):
+    """2026-08-14 disarm-protocol mission: reference/prtouch_v2.c's command_start_step_prtouch
+    treats send_ms==0 (its 3rd wire field) as the dedicated stop sentinel - on a match it sets
+    need_stop=1, calls stop_sys_time(), and returns immediately, WITHOUT ever reaching
+    sched_add_timer(). Every real stock disarm (reference/prtouch_v2_wrapper.py, e.g. line 445)
+    sends send_ms=0 for exactly this reason. This host's own disarm calls previously went
+    through start_step()'s own send_ms=10 default instead - step_cnt=0 but send_ms=10 does NOT
+    hit that early-return on the real protocol, and falls through to a degenerate re-arm with
+    zero timing instead of a clean stop. Fixed by routing every real disarm through the new
+    stop_step() (always all-zero fields, including send_ms=0), and start_step() itself now
+    refuses a step_cnt=0 call outright (see test_prtouch_protocol.py's own tests for that).
+    These tests prove the fix holds across every real orchestration path that disarms, not
+    just stop_step() in isolation."""
+
+    def _assert_every_disarm_has_send_ms_zero(self, mcu):
+        disarms = [c for c in mcu.all_calls('start_step_prtouch') if c.by_field['step_cnt'] == 0]
+        self.assertTrue(disarms, "sanity check: the scenario must contain at least one disarm")
+        for c in disarms:
+            self.assertEqual(
+                c.by_field['send_ms'], 0,
+                "every disarm must send send_ms=0 (the real MCU protocol's stop sentinel) - "
+                "got %r" % (c.by_field,))
+
+    def test_touch_probe_success_path_disarm_has_send_ms_zero(self):
+        _, mcu, pv2 = _build()
+        _arm_trigger_response(mcu, pv2, dip_at=20, step_cnt_hint=200)
+        z = pv2.probe.touch_probe(2.0, retries=3, pro_cnt=2, tolerance=1000.0)
+        self.assertIsInstance(z, float)
+        self._assert_every_disarm_has_send_ms_zero(mcu)
+
+    def test_no_trigger_recovery_path_disarm_has_send_ms_zero(self):
+        _, mcu, pv2 = _build()
+        with self.assertRaises(Exception):
+            pv2.probe.touch_probe(1.0, retries=2, pro_cnt=1)
+        self._assert_every_disarm_has_send_ms_zero(mcu)
+
+    def test_exception_cleanup_path_disarm_has_send_ms_zero(self):
+        # SafeMoveZCleanupTest's own scenario: a repair-query failure during collect must
+        # still reach the disarm in _raw_move's finally block, and that disarm must still be
+        # the real send_ms=0 stop, not a degenerate re-arm.
+        _, mcu, pv2 = _build()
+
+        def raising_repair(call):
+            raise RuntimeError("simulated manual_get_steps comms failure")
+
+        mcu.set_query_response('manual_get_steps', raising_repair)
+        with self.assertRaises(RuntimeError):
+            pv2.probe.safe_move_z(1, 5.0, 10.0)
+        self._assert_every_disarm_has_send_ms_zero(mcu)
+
+    def test_arm_still_sends_configured_nonzero_send_ms(self):
+        _, mcu, pv2 = _build(prtouch_values={'tri_send_ms': '25'})
+        with self.assertRaises(Exception):
+            pv2.probe.touch_probe(1.0, retries=1, pro_cnt=1)
+        arms = [c for c in mcu.all_calls('start_step_prtouch') if c.by_field['step_cnt'] > 0]
+        self.assertTrue(arms)
+        for c in arms:
+            self.assertEqual(c.by_field['send_ms'], 25,
+                              "a real arm must still send the configured tri_send_ms, not 0")
+
+    def test_disarm_step_cnt_is_always_zero_too(self):
+        # send_ms=0 alone isn't the whole stop packet - step_cnt/step_us/acc_ctl_cnt must all
+        # be zero too (stop_step()'s own fixed shape), matching reference's own all-zero
+        # disarm idiom exactly, not just the one field that happens to gate the C-side branch.
+        _, mcu, pv2 = _build()
+        with self.assertRaises(Exception):
+            pv2.probe.touch_probe(1.0, retries=1, pro_cnt=1)
+        disarms = [c for c in mcu.all_calls('start_step_prtouch') if c.by_field['send_ms'] == 0]
+        self.assertTrue(disarms)
+        for c in disarms:
+            self.assertEqual((c.by_field['step_cnt'], c.by_field['step_us'],
+                               c.by_field['acc_ctl_cnt']), (0, 0, 0))
+
+
 class SuccessfulTriggerTest(unittest.TestCase):
     def test_single_attempt_success_with_agreeing_second_sample(self):
         _, mcu, pv2 = _build()

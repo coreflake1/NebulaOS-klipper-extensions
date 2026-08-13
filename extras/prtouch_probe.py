@@ -472,8 +472,7 @@ class PrtouchProbe:
             # safe_move_z's own raw-move path, so letting a repair failure mask the real
             # command_error (and leave the step channel armed) would be exactly the wrong
             # failure mode to introduce into a path a user can invoke directly.
-            self.mcu.start_step(direction, 0, 0, 0, low_spd_nul=self.low_spd_nul,
-                                 send_step_duty=self.send_step_duty)
+            self.mcu.stop_step()
             logging.info("prtouch_probe: raw op #%s disarm dir=%d", op_id, direction)
             self._settle_after_disarm()
 
@@ -807,8 +806,7 @@ class PrtouchProbe:
             timeout = units.probe_timeout_seconds(down_min_z, self.tri_z_down_spd)
             step_samples = self.mcu.collect_step_samples(timeout)
             pres_samples = self.mcu.collect_pres_samples(timeout)
-            self.mcu.start_step(0, 0, 0, 0, low_spd_nul=self.low_spd_nul,
-                                 send_step_duty=self.send_step_duty)
+            self.mcu.stop_step()
             self.mcu.start_pres(0, 0, 0, 0, 0, 0, 0, 0)
             logging.info("prtouch_probe: raw op #%s attempt %d/%d disarm dir=0", op_id, attempt,
                          retries)
@@ -929,7 +927,6 @@ class PrtouchProbe:
                 op_id, traveled)
             raise
         finally:
-            self.mcu.start_step(1, 0, 0, 0, low_spd_nul=self.low_spd_nul,
-                                 send_step_duty=self.send_step_duty)
+            self.mcu.stop_step()
             logging.info("prtouch_probe: raw op #%s recovery disarm dir=1", op_id)
             self._settle_after_disarm()
