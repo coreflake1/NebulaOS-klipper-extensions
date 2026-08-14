@@ -37,6 +37,7 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import contextlib
+import logging
 import math
 
 from . import prtouch_mcu
@@ -189,10 +190,47 @@ class ZCompensate:
         self.prtouch = self.printer.lookup_object('prtouch_v2')
         self.probe = self.printer.lookup_object('probe')
         self.bed_mesh = self.printer.lookup_object('bed_mesh')
+        self.home_x, self.home_y = self._resolve_z_home_xy()
+
+    def _resolve_z_home_xy(self):
+        """home_x/home_y must be the real toolhead XY the printer's own homing sequence sits
+        at when G28 Z actually probes - see cmd_z_offset_calibration's own docstring for why
+        (the whole point of touching bl_offset away from this point is to land the NOZZLE on
+        the exact bed spot BLTouch's probe already touched during Z-homing).
+
+        2026-08-14 (XY-reference mission): this used to be computed purely from [bed_mesh]'s
+        own mesh_min/mesh_max - a real, independently-confirmed bug, not a design choice.
+        [bed_mesh]'s center has no necessary relationship to where this printer's own homing
+        macro (simpleaf/homing.cfg's [homing_override]) actually leaves the toolhead before
+        G28 Z probes: that macro's own _POST_HOME_XY moves to the FIXED (not bed_mesh-derived)
+        [gcode_macro _HOMING_PARAMS] home_x/home_y (110, 111 on this printer), and neither of
+        _PRE_HOME_Z's own two conditional re-positioning branches (klicky's ATTACH_PROBE, or
+        the _saf_z_endstop elif) are active on this config, so nothing moves the toolhead again
+        before the real probe touch - confirmed by reading both macros directly, not assumed.
+        On this printer [bed_mesh]'s own center is (110.0, 112.5) - a full 1.5mm off in Y from
+        where Z-homing actually happens, silently skewing every calibration's target point.
+
+        Prefers _HOMING_PARAMS' own home_x/home_y (the actual source of truth for where G28 Z
+        probes) when that macro exists and defines them - this is the same object Jinja's own
+        printer["gcode_macro _HOMING_PARAMS"].home_x resolves to inside homing.cfg itself, so
+        this reads the identical value the real homing sequence uses, not a second, potentially-
+        divergent copy. Falls back to the old [bed_mesh]-center approximation, with a loud
+        warning, for any printer.cfg that doesn't use this SimpleAF-style homing macro at all -
+        this module is not specific to one printer's macro pack, so that fallback must stay
+        usable, just no longer silent about being an approximation."""
+        homing_params = self.printer.lookup_object('gcode_macro _HOMING_PARAMS', None)
+        if homing_params is not None:
+            variables = homing_params.variables
+            if 'home_x' in variables and 'home_y' in variables:
+                return float(variables['home_x']), float(variables['home_y'])
+            logging.warning(
+                "z_compensate: [gcode_macro _HOMING_PARAMS] exists but defines no home_x/"
+                "home_y - falling back to the [bed_mesh]-center approximation for the "
+                "Z-offset calibration target, which is NOT proven to match where this "
+                "printer's own homing sequence actually probes Z")
         min_x, min_y = self.bed_mesh.bmc.mesh_min
         max_x, max_y = self.bed_mesh.bmc.mesh_max
-        self.home_x = min_x + (max_x - min_x) / 2.
-        self.home_y = min_y + (max_y - min_y) / 2.
+        return min_x + (max_x - min_x) / 2., min_y + (max_y - min_y) / 2.
 
     def get_status(self, eventtime):
         """Structured status contract v1 - see the module-level comment and
@@ -260,8 +298,10 @@ class ZCompensate:
     cmd_z_offset_calibration_help = "Auto-tune Z offset via the load-cell nozzle touch"
 
     def cmd_z_offset_calibration(self, gcmd):
-        """Touch-probe at the point BLTouch already homed (bed center, adjusted by bl_offset -
-        the nozzle-to-probe-tip distance) via prtouch_v2.touch_probe(), then apply the result as
+        """Touch-probe at the point BLTouch already homed (self.home_x/self.home_y - see
+        _resolve_z_home_xy()'s own docstring for where that really comes from, as of
+        2026-08-14 no longer a [bed_mesh]-center approximation - adjusted by bl_offset, the
+        nozzle-to-probe-tip distance) via prtouch_v2.touch_probe(), then apply the result as
         a live Z gcode-offset for this print (see module docstring for why not a permanent
         z_offset rewrite by default).
 
