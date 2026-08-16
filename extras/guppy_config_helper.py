@@ -1,3 +1,13 @@
+# GuppyScreen config-write helper (_GUPPY_SAVE_CONFIG / _GUPPY_DELETE_CONFIG)
+#
+# Copyright (C) 2024  ballaswag <https://github.com/ballaswag>
+# Originally from ballaswag/guppyscreen, k1/k1_mods/guppy_config_helper.py, first published
+# in commit a20edd7 ("add guppy config helper", 2024-01-17).
+#
+# Vendored into NebulaOS unmodified except for this header, which the original file did not
+# carry. See VENDORED.md. This is community-authored code, not NebulaOS's own work.
+#
+# This file may be distributed under the terms of the GNU GPLv3 license.
 class GuppyConfigHelper:
     def __init__(self, config):
         self.printer = config.get_printer()

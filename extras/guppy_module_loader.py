@@ -1,3 +1,19 @@
+# Runtime enable/disable of Klipper printer objects (_GUPPY_LOAD_MODULE / _GUPPY_UNLOAD_MODULE)
+#
+# Copyright (C) 2024  ballaswag <https://github.com/ballaswag>
+# Originally from ballaswag/guppyscreen, k1/k1_mods/guppy_module_loader.py, first published
+# in commit 1d7e584 ("Add tmc metrics graphs...", 2024-02-01).
+#
+# Vendored into NebulaOS unmodified except for this header, which the original file did not
+# carry. See VENDORED.md. This is community-authored code, not NebulaOS's own work.
+#
+# Note on the name: this does NOT provide a general external-module loading mechanism. It
+# registers two gcode commands that call printer.load_object()/printer.objects.pop() so
+# GuppyScreen's TMC panel can bring [tmcstatus] up on demand. It routes through Klipper's own
+# loader and is therefore subject to the same klippy/extras/ filesystem gate as everything
+# else - it depends on NebulaOS's composition, it does not replace it.
+#
+# This file may be distributed under the terms of the GNU GPLv3 license.
 import os.path
 import tempfile
 

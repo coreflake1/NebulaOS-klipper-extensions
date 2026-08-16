@@ -1,0 +1,143 @@
+# Vendored modules and provenance
+
+Not everything in this repository is NebulaOS's own work, and this file says exactly which
+parts are not.
+
+The rule it exists to enforce is simple: **community-authored code is never presented as
+NebulaOS's own.** Where a file arrived carrying its author's copyright header, that header is
+preserved untouched. Where a file arrived with no header at all, the real author was traced
+through the upstream project's own git history — not guessed at — and an accurate header was
+added.
+
+Everything here is GPLv3, matching [`LICENSE`](LICENSE). Individual file headers, not this
+table, are authoritative for the file they appear in.
+
+## Summary
+
+| Module | Author | Upstream | Header | NebulaOS delta |
+|---|---|---|---|---|
+| `extras/gcode_shell_command.py` | Eric Callahan, © 2019 | via `pellcorp/klipper` | present upstream, preserved | none beyond the Pellcorp lineage carried in this repo's history |
+| `extras/virtual_pins.py` | Pedro Lamas, © 2023 | via `pellcorp/klipper` | present upstream, preserved | none |
+| `extras/calibrate_shaper_config.py` | ballaswag, © 2023 | `ballaswag/guppyscreen` | **absent upstream — added** | header only |
+| `extras/guppy_config_helper.py` | ballaswag, © 2024 | `ballaswag/guppyscreen` | **absent upstream — added** | header only |
+| `extras/guppy_module_loader.py` | ballaswag, © 2024 | `ballaswag/guppyscreen` | **absent upstream — added** | header only |
+| `extras/tmcstatus.py` | ballaswag, © 2024 | `ballaswag/guppyscreen` | **absent upstream — added** | header, plus a `klippy:connect` deferral fix |
+| `extras/nebulaos_temperature_mcu.py` | Kevin O'Connor © 2020-2024 (base), NebulaOS © 2026 (GD32 curves) | `Klipper3d/klipper` | derived, both credited | subclass + three GD32 calibration curves |
+
+Everything else in `extras/` — the nine `prtouch_*`/`z_compensate` modules, `nebulaos_version`,
+`nebulaos_compat`, and the test suite — is NebulaOS's own work.
+
+## Per-module detail
+
+### `gcode_shell_command.py` — Eric Callahan, © 2019
+
+Runs a shell command from gcode. GPLv3 header present in the original and preserved verbatim.
+
+Not in mainline Klipper, so it cannot be dropped by waiting for upstream. It reached NebulaOS
+through the Pellcorp base fork, and this repository's filtered history carries the real
+Pellcorp commits — including Jason Pell's `02799c2` ("expand variables in gcode shell
+command"), which is the one line by which this copy differs from the copy shipped inside
+`NebulaOS-guppyscreen/k1/k1_mods/`. That delta is inherited deliberately, not silently: the
+`os.path.expandvars()` call is load-bearing for the shipped macro set.
+
+Live in five sections of the shipped config, and invoked from GuppyScreen's compiled C++
+(`inputshaper_panel.cpp`, `belts_calibration_panel.cpp`) as a Klipper gcode command. That is
+why it cannot simply be replaced by Moonraker's own shell-command machinery — doing so means
+changing GuppyScreen.
+
+### `virtual_pins.py` — Pedro Lamas, © 2023
+
+Virtual pin support. GPLv3 header present in the original and preserved verbatim. Inherited
+from the Pellcorp base. Not in mainline. Live via `[virtual_pins]` and
+`pin: virtual_pin:BED_WARP_STABILISE_pin` in the shipped config.
+
+### `calibrate_shaper_config.py` — ballaswag, © 2023
+
+Persists input-shaper calibration results to `printer.cfg`, behind `SAVE_INPUT_SHAPER`.
+
+**Had no copyright or licence header of any kind.** Traced to `ballaswag/guppyscreen` commit
+`4a5cf94` ("initial guppy screen code commit. code at 0.0.11-beta", 2023-12-12), whose
+repository is GPLv3. A header naming ballaswag was added; the code is otherwise byte-identical
+to the upstream copy.
+
+Note that this is **not** a Pellcorp inheritance, contrary to an earlier NebulaOS audit that
+grouped all five community extras together. NebulaOS added it itself, and the real upstream is
+GuppyScreen.
+
+### `guppy_config_helper.py` — ballaswag, © 2024
+
+`_GUPPY_SAVE_CONFIG` / `_GUPPY_DELETE_CONFIG`, driven from GuppyScreen's TMC tuning panel.
+**Had no header.** Traced to `ballaswag/guppyscreen` commit `a20edd7` ("add guppy config
+helper", 2024-01-17). Header added; code otherwise byte-identical.
+
+### `guppy_module_loader.py` — ballaswag, © 2024
+
+`_GUPPY_LOAD_MODULE` / `_GUPPY_UNLOAD_MODULE`. **Had no header.** Traced to
+`ballaswag/guppyscreen` commit `1d7e584` (2024-02-01). Header added; code otherwise
+byte-identical.
+
+The name invites a wrong assumption worth correcting here, because it matters to this
+repository's architecture: this is **not** a general external-module loading mechanism and
+does not help Klipper load extras from outside `klippy/extras/`. It registers two gcode
+commands that call `printer.load_object()` and `printer.objects.pop()`, so it routes through
+Klipper's own loader and hits the same filesystem gate as everything else. It *depends on*
+NebulaOS's symlink composition rather than relieving it — which also means `tmcstatus.py` must
+be composed in like every other module, even though no config section declares it.
+
+### `tmcstatus.py` — ballaswag, © 2024, with a NebulaOS fix
+
+TMC driver status reporting for GuppyScreen's TMC panel, loaded on demand via
+`_GUPPY_LOAD_MODULE SECTION=tmcstatus`. **Had no header.** Traced to `ballaswag/guppyscreen`
+commit `1d7e584` (2024-02-01). Header added.
+
+**This module was previously misclassified as NebulaOS-authored** (in
+`_project/missions/2026-08-phase1-klipper-no-fork-analysis.md` §4.1). It is not. Direct
+comparison against the upstream GuppyScreen tree shows the two files differ by exactly one
+change, which is NebulaOS's: `handle_connect()` is registered on the `klippy:connect` event
+rather than called directly from `__init__`. The original's direct call depends on
+`printer.cfg` section order and broke a real boot on this printer with `Unknown config object
+'tmc2208 stepper_x'`, because `[tmcstatus]` loaded before the TMC driver sections it looks up.
+
+### `nebulaos_temperature_mcu.py` — derived from Klipper
+
+MCU die-temperature support for the GD32 chips this printer uses. Subclasses Klipper's own
+`klippy/extras/temperature_mcu.py` (© 2020-2024 Kevin O'Connor, GPLv3) rather than copying it,
+so the derivation is a live import and upstream fixes are inherited automatically. Both
+copyrights appear in the file header.
+
+The original content is the three GD32 calibration curves, carried forward from
+`NebulaOS-klipper`'s own `temperature_mcu.py` at the shipped `KLIPPER_PIN`.
+
+Upstream contribution is worth doing independently of this repository: the curves are ~15
+lines and mechanically identical in form to the entries mainline already carries. If
+`Klipper3d/klipper` accepts them, this module can go away entirely.
+
+## Why vendor these at all
+
+Every one of these six modules is absent from mainline Klipper, so none of them can be dropped
+by waiting for upstream, and each is live in the shipped configuration or invoked from
+GuppyScreen's compiled code.
+
+Pinning "the original author's repository" instead would be fiction for four of them: their
+real source is GuppyScreen, whose copies already ship duplicated inside
+`NebulaOS-guppyscreen/k1/k1_mods/`. And `gcode_shell_command.py` carries a deliberate
+one-line lineage delta that must be preserved knowingly rather than inherited by accident.
+Vendoring with explicit provenance is the honest version of a situation that already existed.
+
+## Filename collision risk
+
+The vendored names are kept as-is for now — `gcode_shell_command`, `virtual_pins`,
+`calibrate_shaper_config`, `guppy_config_helper`, `guppy_module_loader`. GuppyScreen's
+compiled C++ hardcodes several of the gcode commands they register, so renaming them is a
+coordinated change across repositories, not a free rename.
+
+That leaves a real, if unlikely, hazard: if mainline Klipper ever ships a file at one of these
+paths, git will silently replace NebulaOS's symlink with upstream's regular file, and the
+vendored module is shadowed with no error anywhere. `gcode_shell_command` and `virtual_pins`
+are exactly the kind of module mainline could adopt.
+
+The mitigation is mandatory and lives in the platform layer, not here: the composition step
+must verify that every managed destination path is still a symlink resolving inside this
+repository, and refuse to activate otherwise. That requirement is declared in
+`nebulaos-extensions.json`'s `composition.require_symlink_resolving_inside_source`. See
+[`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md).

@@ -1,3 +1,17 @@
+# TMC stepper-driver status reporting for GuppyScreen's TMC panel
+#
+# Copyright (C) 2024  ballaswag <https://github.com/ballaswag>
+# Copyright (C) 2026  NebulaOS contributors (klippy:connect deferral, see below)
+#
+# Originally from ballaswag/guppyscreen, k1/k1_mods/tmcstatus.py, first published in commit
+# 1d7e584 ("Add tmc metrics graphs...", 2024-02-01). See VENDORED.md.
+#
+# NebulaOS delta beyond this header: handle_connect() is registered on the "klippy:connect"
+# event instead of being called directly from __init__. The original's direct call depends on
+# printer.cfg section order and broke a real boot on this printer ("Unknown config object
+# 'tmc2208 stepper_x'") because [tmcstatus] loaded before the driver sections it looks up.
+#
+# This file may be distributed under the terms of the GNU GPLv3 license.
 import logging
 
 TRINAMIC_DRIVERS = ["tmc2130", "tmc2208", "tmc2209", "tmc2240", "tmc2660", "tmc5160"]

@@ -1,3 +1,14 @@
+# Persist input-shaper calibration results to printer.cfg (SAVE_INPUT_SHAPER)
+#
+# Copyright (C) 2023  ballaswag <https://github.com/ballaswag>
+# Originally from ballaswag/guppyscreen, k1/k1_mods/calibrate_shaper_config.py, first
+# published in commit 4a5cf94 ("initial guppy screen code commit. code at 0.0.11-beta",
+# 2023-12-12).
+#
+# Vendored into NebulaOS unmodified except for this header, which the original file did not
+# carry. See VENDORED.md. This is community-authored code, not NebulaOS's own work.
+#
+# This file may be distributed under the terms of the GNU GPLv3 license.
 class CalibrateShaperConfig:
     def __init__(self, config):
         self.printer = config.get_printer();
