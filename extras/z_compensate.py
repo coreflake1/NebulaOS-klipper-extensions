@@ -88,6 +88,7 @@ class ZCompensate:
         self.bed_mesh = None
         self.home_x = None
         self.home_y = None
+        self.mesh_min, self.mesh_max = self._read_configured_mesh_bounds(config)
 
         self.hot_start_temp = config.getfloat('hot_start_temp', default=140, minval=80, maxval=200)
         self.hot_rub_temp = config.getfloat('hot_rub_temp', default=180, minval=80, maxval=300)
@@ -192,6 +193,53 @@ class ZCompensate:
         self.bed_mesh = self.printer.lookup_object('bed_mesh')
         self.home_x, self.home_y = self._resolve_z_home_xy()
 
+    @staticmethod
+    def _read_configured_mesh_bounds(config):
+        """The CONFIGURED [bed_mesh] area bounds, read from the config rather than off
+        BedMeshCalibrate's internals.
+
+        Official-mainline migration (2026-08-17). This used to be
+        `self.bed_mesh.bmc.mesh_min` / `.bmc.mesh_max` - reaching through BedMesh's public
+        object into `bmc`, a BedMeshCalibrate instance, and then into two of its instance
+        attributes. Nothing about that is part of any interface Klipper offers; all three hops
+        are internal, and upstream is free to rename or restructure any of them in a routine
+        refactor. It still resolves at the qualified pin, but "it happens to work today" is
+        not a compatibility contract.
+
+        The obvious-looking public replacement is WRONG and was rejected after reading
+        mainline's source. `bed_mesh.get_status()` does expose `mesh_min`/`mesh_max`, but
+        `BedMesh.update_status()` populates them from `self.z_mesh` - the mesh currently
+        LOADED - and leaves them at (0., 0.) when no mesh has been probed or loaded. The
+        configured bounds and the loaded-mesh bounds are different quantities. This call site
+        needs the configured ones, and runs at klippy:connect, before any mesh exists; taking
+        get_status() would have silently produced a (0., 0.) fallback target - a worse bug
+        than the coupling it replaced, and one no offline test of a probed printer would show.
+
+        So this reads the same config keys `BedMeshCalibrate._init_mesh_config()` itself reads,
+        through `config.getsection()` - the ordinary, documented ConfigWrapper API that this
+        module set already uses for `[printer]` and `[stepper_z]` (prtouch_mcu.py). The
+        derivation mirrors upstream's own: a round bed (`mesh_radius`) yields
+        (-radius, -radius)..(radius, radius) with the same .1mm floor upstream applies; a
+        rectangular bed yields `mesh_min`..`mesh_max` verbatim. Both produce values identical
+        to what `bmc.mesh_min`/`bmc.mesh_max` held.
+
+        Returns (None, None) when `[bed_mesh]` is absent - this whole path is only a fallback
+        for printers without a `_HOMING_PARAMS` macro, and `_resolve_z_home_xy()` reports the
+        missing-section case itself rather than failing here at config time.
+        """
+        if not config.has_section('bed_mesh'):
+            return None, None
+        mesh_cfg = config.getsection('bed_mesh')
+        radius = mesh_cfg.getfloat('mesh_radius', None, above=0.)
+        if radius is not None:
+            # Mirrors bed_mesh.py's own "radius may have precision to .1mm" floor, and its
+            # own choice not to offset these bounds by mesh_origin.
+            radius = math.floor(radius * 10) / 10
+            return (-radius, -radius), (radius, radius)
+        min_x, min_y = mesh_cfg.getfloatlist('mesh_min', count=2)
+        max_x, max_y = mesh_cfg.getfloatlist('mesh_max', count=2)
+        return (min_x, min_y), (max_x, max_y)
+
     def _resolve_z_home_xy(self):
         """home_x/home_y must be the real toolhead XY the printer's own homing sequence sits
         at when G28 Z actually probes - see cmd_z_offset_calibration's own docstring for why
@@ -228,8 +276,16 @@ class ZCompensate:
                 "home_y - falling back to the [bed_mesh]-center approximation for the "
                 "Z-offset calibration target, which is NOT proven to match where this "
                 "printer's own homing sequence actually probes Z")
-        min_x, min_y = self.bed_mesh.bmc.mesh_min
-        max_x, max_y = self.bed_mesh.bmc.mesh_max
+        if self.mesh_min is None:
+            raise self.printer.config_error(
+                "z_compensate: cannot determine the Z-offset calibration XY target. Neither "
+                "[gcode_macro _HOMING_PARAMS] (with home_x/home_y) nor a [bed_mesh] section "
+                "is present, so there is no source for either the real Z-homing position or "
+                "the fallback bed-centre approximation. Add home_x/home_y to a "
+                "[gcode_macro _HOMING_PARAMS] section - the accurate option - or configure "
+                "[bed_mesh].")
+        min_x, min_y = self.mesh_min
+        max_x, max_y = self.mesh_max
         return min_x + (max_x - min_x) / 2., min_y + (max_y - min_y) / 2.
 
     def get_status(self, eventtime):

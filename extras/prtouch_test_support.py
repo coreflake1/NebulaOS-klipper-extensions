@@ -437,13 +437,22 @@ class FakeToolhead:
 
 
 class FakeBedMesh:
-    class _Bmc:
-        def __init__(self, mesh_min, mesh_max):
-            self.mesh_min = mesh_min
-            self.mesh_max = mesh_max
+    """Deliberately has NO `bmc` attribute.
+
+    z_compensate.py used to read `bed_mesh.bmc.mesh_min` / `.bmc.mesh_max` - three hops into
+    BedMesh's internals, none of them part of any interface Klipper offers. The official-
+    mainline migration replaced that with a read of the same `[bed_mesh]` config keys through
+    the public ConfigWrapper API. Omitting `bmc` from this fake is what keeps that decision
+    enforced: any future reintroduction of the private coupling fails here with an
+    AttributeError instead of quietly working until an upstream refactor breaks a printer.
+
+    `mesh_min`/`mesh_max` are still stored so make_z_compensate_config() can build a
+    `[bed_mesh]` config section whose values agree with this object.
+    """
 
     def __init__(self, mesh_min=(5., 10.), mesh_max=(215., 215.)):
-        self.bmc = self._Bmc(mesh_min, mesh_max)
+        self.mesh_min = mesh_min
+        self.mesh_max = mesh_max
         self._mesh = None
         self.set_mesh_calls = []
 
@@ -658,8 +667,28 @@ def make_prtouch_v2_config(printer, pins, values, section='prtouch_v2'):
                                        'stepper_z': stepper_z_section})
 
 
-def make_z_compensate_config(printer, values, section='z_compensate'):
-    return FakeConfig(values, section=section, printer=printer)
+def make_z_compensate_config(printer, values, section='z_compensate', bed_mesh_values=None):
+    """A [z_compensate] config that can also see a [bed_mesh] SECTION, not just the bed_mesh
+    printer object.
+
+    Real Klipper always has both: the section in printer.cfg and the object it produces.
+    z_compensate.py now reads the configured mesh bounds from the section (public
+    ConfigWrapper API) instead of off BedMesh's internals, so the fake has to supply the
+    section too. By default the section's values are taken from the FakePrinter's own
+    FakeBedMesh, which keeps the two halves of the fake from disagreeing with each other.
+
+    Pass bed_mesh_values={} to model a printer with no [bed_mesh] section at all.
+    """
+    other_sections = {}
+    if bed_mesh_values is None:
+        bed_mesh = printer.lookup_object('bed_mesh', None)
+        if bed_mesh is not None:
+            bed_mesh_values = {'mesh_min': bed_mesh.mesh_min,
+                               'mesh_max': bed_mesh.mesh_max}
+    if bed_mesh_values:
+        other_sections['bed_mesh'] = FakeConfig(bed_mesh_values, section='bed_mesh')
+    return FakeConfig(values, section=section, printer=printer,
+                      other_sections=other_sections)
 
 
 def connect(printer, mcu):

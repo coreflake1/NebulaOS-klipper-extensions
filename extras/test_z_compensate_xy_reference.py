@@ -111,5 +111,66 @@ class FallbackToBedMeshCenterTest(unittest.TestCase):
         self.assertEqual((zc.home_x, zc.home_y), (110.0, 112.5))
 
 
+class ConfiguredMeshBoundsSourceTest(unittest.TestCase):
+    """Official-mainline migration (2026-08-17): the fallback's mesh bounds now come from the
+    [bed_mesh] config SECTION via the public ConfigWrapper API, not from
+    bed_mesh.bmc.mesh_min/.mesh_max - three hops into BedMeshCalibrate's internals, which
+    Klipper offers no compatibility promise about.
+
+    The bounds must be the CONFIGURED ones. bed_mesh.get_status()'s mesh_min/mesh_max look
+    like the obvious public replacement but are the bounds of the currently LOADED mesh, and
+    are (0., 0.) until one has been probed - and this whole path runs at klippy:connect,
+    before any mesh exists."""
+
+    def _bounds(self, bed_mesh_values):
+        printer, _mcu, _pins, _values = fake.build_environment()
+        config = fake.make_z_compensate_config(
+            printer, dict(fake.REAL_Z_COMPENSATE_CONFIG),
+            bed_mesh_values=bed_mesh_values)
+        return z_compensate.ZCompensate._read_configured_mesh_bounds(config)
+
+    def test_rectangular_bed_reads_mesh_min_and_mesh_max(self):
+        mesh_min, mesh_max = self._bounds({'mesh_min': '5, 10', 'mesh_max': '215, 215'})
+        self.assertEqual(mesh_min, (5., 10.))
+        self.assertEqual(mesh_max, (215., 215.))
+
+    def test_round_bed_derives_bounds_from_mesh_radius(self):
+        # Mirrors bed_mesh.py's own round-bed derivation: -radius..+radius on both axes,
+        # with radius floored to .1mm precision, and deliberately not offset by mesh_origin
+        # (upstream does not offset them either).
+        mesh_min, mesh_max = self._bounds({'mesh_radius': '75.0'})
+        self.assertEqual(mesh_min, (-75.0, -75.0))
+        self.assertEqual(mesh_max, (75.0, 75.0))
+
+    def test_round_bed_radius_is_floored_to_a_tenth_of_a_mm(self):
+        mesh_min, mesh_max = self._bounds({'mesh_radius': '75.06'})
+        self.assertEqual(mesh_max, (75.0, 75.0))
+        self.assertEqual(mesh_min, (-75.0, -75.0))
+
+    def test_no_bed_mesh_section_yields_no_bounds(self):
+        self.assertEqual(self._bounds({}), (None, None))
+
+    def test_fake_bed_mesh_object_exposes_no_private_bmc(self):
+        # Guard against silently reintroducing the private coupling: if production code goes
+        # back to bed_mesh.bmc.mesh_min, it must fail here rather than work by accident.
+        printer, _mcu, _pins, _values = fake.build_environment()
+        self.assertFalse(hasattr(printer.lookup_object('bed_mesh'), 'bmc'))
+
+    def test_missing_both_sources_refuses_rather_than_guessing(self):
+        # No _HOMING_PARAMS macro and no [bed_mesh] section: there is no source at all for a
+        # calibration target, so this must raise with an actionable message rather than
+        # silently calibrating against (0, 0).
+        printer, mcu, pins, values = fake.build_environment()
+        prtouch_config = fake.make_prtouch_v2_config(printer, pins, values)
+        printer.add_object('prtouch_v2', prtouch_v2.PRTouchV2(prtouch_config))
+        zc_config = fake.make_z_compensate_config(
+            printer, dict(fake.REAL_Z_COMPENSATE_CONFIG), bed_mesh_values={})
+        zc = z_compensate.ZCompensate(zc_config)
+        with self.assertRaises(fake.ConfigError) as ctx:
+            zc._resolve_z_home_xy()
+        self.assertIn('_HOMING_PARAMS', str(ctx.exception))
+        self.assertIn('bed_mesh', str(ctx.exception))
+
+
 if __name__ == '__main__':
     unittest.main()
