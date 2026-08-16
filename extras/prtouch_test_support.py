@@ -15,6 +15,11 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import re
 
+# Imported for its async-response format tables only, so FakeMCU's default fake dictionary
+# stays in lockstep with the formats the production module actually asks for. prtouch_mcu
+# imports nothing from this module, so there is no import cycle.
+from . import prtouch_mcu
+
 
 class ConfigError(Exception):
     pass
@@ -246,6 +251,21 @@ class FakeQueryCommand:
         return provider
 
 
+class FakeAsyncResponse:
+    """What mainline MCU.register_serial_response() returns: an AsyncResponseWrapper. Only
+    .unregister() is part of the surface production code can use, so only that is modeled."""
+
+    def __init__(self, mcu, name, oid):
+        self.mcu = mcu
+        self.name = name
+        self.oid = oid
+        self.unregistered = False
+
+    def unregister(self):
+        self.mcu.response_handlers.get(self.name, {}).pop(self.oid, None)
+        self.unregistered = True
+
+
 class FakeMCU:
     """The 'chip' object returned by ppins.parse_pin()['chip'] - stands in for both
     step_mcu and pres_mcu. A single instance is normally shared for both (this printer has
@@ -261,6 +281,17 @@ class FakeMCU:
         self.on_send = {}
         self.query_responses = {}
         self.response_handlers = {}  # name -> {oid: handler}
+        self.registered_response_formats = {}  # name -> format actually registered
+        # Default fake MCU dictionary: the first (best-evidence) candidate format for each of
+        # prtouch_mcu.py's three async subscriptions. Kept as a set of exact strings so it
+        # models mainline msgproto.lookup_command()'s exact-string match, not a fuzzy one.
+        self.valid_response_formats = set(
+            sub[1][0] for sub in (prtouch_mcu.RESULT_RUN_STEP_PRTOUCH,
+                                  prtouch_mcu.RESULT_RUN_PRES_PRTOUCH,
+                                  prtouch_mcu.RESULT_READ_PRES_PRTOUCH))
+
+    def get_name(self):
+        return self.name
 
     def create_oid(self):
         oid = self._next_oid
@@ -284,8 +315,37 @@ class FakeMCU:
         cmd = FakeQueryCommand(self, fmt, resp_fmt, oid=oid)
         return cmd
 
-    def register_response(self, handler, name, oid):
+    def check_valid_response(self, msgformat):
+        """Mirror of mainline MCU.check_valid_response() (klippy/mcu.py). Returns whether the
+        MCU's dictionary declares this exact format string - a bool, never a raise.
+
+        The default fake dictionary accepts the FIRST candidate format prtouch_mcu.py offers
+        for each of its three async subscriptions, which is the shape derived from the
+        already-validated result_manual_get_steps / resault_manual_get_pres query responses.
+        Tests that want to model an MCU declaring a different (or no) format assign to
+        self.valid_response_formats directly."""
+        return msgformat in self.valid_response_formats
+
+    def register_serial_response(self, handler, msgformat, oid=None):
+        """Mirror of mainline MCU.register_serial_response() (renamed from register_response()
+        by mainline commit c89393cda, 2026-02-26).
+
+        Two real behaviours of the mainline wrapper are reproduced here, because the module
+        under test depends on both:
+          * the second argument is the full message FORMAT, and the subscription is keyed on
+            the message NAME taken off the front of it (msgformat.split()[0]), exactly as
+            AsyncResponseWrapper does - so push_response() still addresses handlers by name;
+          * the format is validated, and an undeclared format raises rather than silently
+            registering a callback that could never fire.
+        An AsyncResponseWrapper-shaped object with .unregister() is returned."""
+        if msgformat not in self.valid_response_formats:
+            raise AssertionError(
+                "FakeMCU: register_serial_response() with a format this MCU does not declare:"
+                " %r" % (msgformat,))
+        name = msgformat.split()[0]
         self.response_handlers.setdefault(name, {})[oid] = handler
+        self.registered_response_formats[name] = msgformat
+        return FakeAsyncResponse(self, name, oid)
 
     # -- scenario-facing API ---------------------------------------------------------
 
