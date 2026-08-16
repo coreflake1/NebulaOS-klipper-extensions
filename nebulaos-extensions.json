@@ -1,0 +1,98 @@
+{
+  "compat_schema_version": 1,
+  "extensions_version": "1.0.0-qual1",
+  "nebulaos_api_level": 1,
+
+  "klipper": {
+    "qualified_commit": "fe4eb8650bd7de4c2100a14eaf09b0965c430e29",
+    "min_commit": null,
+    "max_commit": null,
+    "allow_unqualified": false
+  },
+
+  "required_klipper_symbols": [
+    "mcu:MCU.register_serial_response",
+    "mcu:MCU.check_valid_response",
+    "mcu:MCU.create_oid",
+    "mcu:MCU.register_config_callback",
+    "mcu:MCU.add_config_cmd",
+    "mcu:MCU.lookup_command",
+    "mcu:MCU.lookup_query_command",
+    "mcu:MCU.get_constants",
+    "extras.heaters:PrinterHeaters.add_sensor_factory",
+    "extras.heaters:PrinterHeaters.setup_sensor",
+    "extras.temperature_mcu:PrinterTemperatureMCU.config_unknown",
+    "extras.temperature_mcu:PrinterTemperatureMCU.calc_base",
+    "extras.temperature_mcu:PrinterTemperatureMCU.handle_mcu_identify",
+    "toolhead:ToolHead.get_kinematics",
+    "toolhead:ToolHead.get_position",
+    "toolhead:ToolHead.set_position",
+    "toolhead:ToolHead.wait_moves",
+    "gcode:GCodeDispatch.register_command",
+    "gcode:GCodeDispatch.run_script_from_command",
+    "pins:PrinterPins.setup_pin"
+  ],
+
+  "forbidden_klipper_symbols": [
+    "mcu:MCU.register_response"
+  ],
+
+  "composition": {
+    "source_dir": "extras",
+    "destination_dir": "klippy/extras",
+    "exclude_file": ".git/info/exclude",
+    "link_type": "symlink",
+    "marker_file": ".nebulaos-composed",
+    "require_symlink_resolving_inside_source": true
+  },
+
+  "modules": [
+    {"path": "extras/prtouch_v2.py", "role": "runtime"},
+    {"path": "extras/prtouch_probe.py", "role": "runtime"},
+    {"path": "extras/prtouch_mcu.py", "role": "runtime"},
+    {"path": "extras/prtouch_nozzle.py", "role": "runtime"},
+    {"path": "extras/prtouch_calibration.py", "role": "runtime"},
+    {"path": "extras/prtouch_units.py", "role": "runtime"},
+    {"path": "extras/prtouch_safety_guard.py", "role": "runtime"},
+    {"path": "extras/prtouch_test_support.py", "role": "runtime"},
+    {"path": "extras/z_compensate.py", "role": "runtime"},
+    {"path": "extras/tmcstatus.py", "role": "runtime"},
+    {"path": "extras/nebulaos_version.py", "role": "runtime"},
+    {"path": "extras/nebulaos_compat.py", "role": "runtime"},
+    {"path": "extras/nebulaos_temperature_mcu.py", "role": "runtime"},
+    {"path": "extras/gcode_shell_command.py", "role": "runtime"},
+    {"path": "extras/virtual_pins.py", "role": "runtime"},
+    {"path": "extras/calibrate_shaper_config.py", "role": "runtime"},
+    {"path": "extras/guppy_config_helper.py", "role": "runtime"},
+    {"path": "extras/guppy_module_loader.py", "role": "runtime"},
+
+    {"path": "extras/test_nebulaos_compat.py", "role": "test"},
+    {"path": "extras/test_nebulaos_temperature_mcu.py", "role": "test"},
+    {"path": "extras/test_nebulaos_version.py", "role": "test"},
+    {"path": "extras/test_prtouch_calibration.py", "role": "test"},
+    {"path": "extras/test_prtouch_config.py", "role": "test"},
+    {"path": "extras/test_prtouch_orchestration.py", "role": "test"},
+    {"path": "extras/test_prtouch_probe_safety_hardening.py", "role": "test"},
+    {"path": "extras/test_prtouch_protocol.py", "role": "test"},
+    {"path": "extras/test_prtouch_raw_op_guard.py", "role": "test"},
+    {"path": "extras/test_prtouch_safety_guard.py", "role": "test"},
+    {"path": "extras/test_prtouch_serial_response.py", "role": "test"},
+    {"path": "extras/test_prtouch_units.py", "role": "test"},
+    {"path": "extras/test_z_compensate_offset_safety.py", "role": "test"},
+    {"path": "extras/test_z_compensate_reentrancy_guard.py", "role": "test"},
+    {"path": "extras/test_z_compensate_xy_reference.py", "role": "test"}
+  ],
+
+  "sensor_types": [
+    {"sensor_type": "nebulaos_temperature_mcu",
+     "provided_by": "extras/nebulaos_temperature_mcu.py"}
+  ],
+
+  "chelper": {
+    "enforced_by": "platform",
+    "requirement": "prebuilt_so_mtime_newer_than_all_chelper_sources",
+    "target": "klippy/chelper/c_helper.so",
+    "source_dir": "klippy/chelper",
+    "platform_result_file": null
+  }
+}
