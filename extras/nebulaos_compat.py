@@ -41,22 +41,26 @@
 #   5. Every sensor_type the manifest declares is registered before any [temperature_sensor]
 #      section can ask for it.
 #
-# NOT checked here, deliberately, and left with a declared interface for the platform layer
-# (NebulaOS-firmware) to implement:
-#   * Composition integrity - that every composed destination path is a real symlink resolving
-#     inside this repository, and not an upstream regular file that silently replaced one.
-#     This is a property of the Klipper checkout, which the platform composes and owns; by the
-#     time Klippy is running, a collision has already shadowed the module and this process is
-#     importing upstream's file, not ours. The manifest's "composition" block is the contract
-#     for that check; see COMPOSITION_CONTRACT below and docs/COMPATIBILITY.md.
-#   * The c_helper.so mtime invariant - that the shipped prebuilt library is newer than every
-#     chelper source, so mainline never attempts a gcc rebuild on a device with no toolchain.
-#     Deciding this needs firmware build-time information that does not exist inside this
-#     repository. The manifest's "chelper" block declares the requirement and names an optional
-#     platform_result_file the platform can write its verdict into; see CHELPER_CONTRACT.
+# Shared with the platform layer (NebulaOS-firmware), which owns the authoritative version of
+# each and runs it BEFORE Klippy starts - the only place either failure can be prevented
+# rather than merely noticed:
+#   6. Composition integrity - that every runtime module is reachable as a symlink resolving
+#      inside this repository, and not an upstream regular file that silently replaced one.
+#      The platform's check is the load-bearing one. This one is the second layer, for the
+#      cases the platform never saw: a hand-updated checkout, a restored backup, a developer
+#      install, a device composed by older firmware. Because the compatibility contract places
+#      [nebulaos_compat] before any other NebulaOS section, it still runs before any other
+#      managed module has been imported. Governed by
+#      composition.require_symlink_resolving_inside_source; see COMPOSITION_CONTRACT below.
+#   7. The c_helper.so mtime invariant - that the shipped prebuilt library is newer than every
+#      chelper source, so mainline never attempts a gcc rebuild on a device with no toolchain.
+#      Deciding this needs firmware build-time and boot-time information that does not exist
+#      inside this repository, so the platform decides it and publishes a verdict at
+#      chelper.platform_result_file, which this module reads and refuses to start on. That
+#      turns a gcc crash part-way through boot into a named preflight error.
 #
-# Both are Stage 2 work. They are declared rather than stubbed so that the interface is fixed
-# now and the platform can be built against it without renegotiating the manifest.
+# Both interfaces were declared here in Stage 1 and are wired to a real platform
+# implementation as of Stage 2; the manifest shape did not have to change to do it.
 
 import json
 import logging
@@ -112,11 +116,15 @@ toolchain, so a rebuild attempt is not a slow path - it raises, and Klippy does 
   requirement          "prebuilt_so_mtime_newer_than_all_chelper_sources"
   target               path of the prebuilt library, relative to the Klipper checkout
   source_dir           directory whose sources must all be older than the target
-  platform_result_file optional path the platform may write its verdict to. When set, this
-                       module reads it and refuses to start if the verdict is not a pass, so
-                       the failure surfaces as a precise preflight error instead of a gcc
-                       crash mid-boot. When null (the default today), this module performs no
-                       chelper check at all and the platform owns it end to end.
+  platform_result_file path the platform writes its verdict to, relative to the Klipper
+                       checkout (or absolute). This module reads it and refuses to start if
+                       the verdict is not a pass, so the failure surfaces as a precise
+                       preflight error instead of a gcc crash mid-boot. NebulaOS-firmware
+                       writes it from /etc/nebulaos-chelper-preflight.sh at every activation
+                       and after every update, and bakes one into the immutable /opt/klipper
+                       copy at build time (that tree is on a read-only squashfs, so nothing
+                       can write it there at boot). Set to null to disable the check and
+                       leave the invariant entirely to the platform.
 """
 
 
@@ -338,6 +346,79 @@ def check_klipper_commit(manifest, klipper_dir, git_runner=_git,
         % (installed, qualified, klipper_dir, MANIFEST_FILENAME))
 
 
+def check_composition_integrity(manifest, klipper_dir, repo_root):
+    """Verify that every runtime module is reachable as a symlink resolving into THIS
+    repository - the collision guard, from inside the running process.
+
+    The platform (NebulaOS-firmware) owns the authoritative version of this check and runs
+    it before Klippy starts, which is the only place it can prevent the failure rather than
+    merely notice it. This is the second layer, and it exists because the platform check can
+    be bypassed in ways nobody plans: a hand-updated checkout, a restored backup, a
+    developer install, a device that was composed by an older firmware.
+
+    The failure being guarded against is genuinely silent. If upstream Klipper ships a
+    regular file at a path this repository also manages, git replaces the symlink with
+    upstream's file at exit code 0, with no warning and nothing in any status output. The
+    module is then shadowed: Klippy runs upstream's code while every version report still
+    says NebulaOS. The names most exposed are the vendored community ones -
+    gcode_shell_command and virtual_pins are exactly the kind of module mainline could adopt.
+
+    Running this from [nebulaos_compat], which the compatibility contract already places
+    before any other NebulaOS section, means the check happens before any other managed
+    module has been imported.
+
+    Governed by composition.require_symlink_resolving_inside_source. When that is false the
+    check is skipped entirely, which is what makes a copy-based or overlay-based deployment
+    - or the immutable factory-fallback tree, where the modules are deliberately real files -
+    able to use this same module without lying about how it was assembled.
+    """
+    spec = manifest.get('composition') or {}
+    if not spec.get('require_symlink_resolving_inside_source'):
+        return None
+    source_dir = spec.get('source_dir', 'extras')
+    destination_dir = spec.get('destination_dir', 'klippy/extras')
+
+    src_root = os.path.realpath(os.path.join(repo_root, source_dir))
+    problems = []
+    checked = 0
+    for entry in manifest.get('modules', ()):
+        if not isinstance(entry, dict) or 'path' not in entry:
+            continue
+        if entry.get('role') == 'test':
+            continue
+        base = os.path.basename(entry['path'])
+        dest = os.path.join(klipper_dir, destination_dir, base)
+        checked += 1
+        if not os.path.islink(dest):
+            if os.path.exists(dest):
+                problems.append(
+                    "  %s/%s is a regular file, not a link into this repository - the "
+                    "module is SHADOWED by a file upstream Klipper now ships"
+                    % (destination_dir, base))
+            else:
+                problems.append(
+                    "  %s/%s is missing - composition is incomplete"
+                    % (destination_dir, base))
+            continue
+        resolved = os.path.realpath(dest)
+        if not os.path.isfile(resolved):
+            problems.append("  %s/%s is a dangling link (target %s does not exist)"
+                            % (destination_dir, base, resolved))
+        elif not resolved.startswith(src_root + os.sep):
+            problems.append(
+                "  %s/%s resolves to %s, which is outside this repository's %s"
+                % (destination_dir, base, resolved, src_root))
+    if problems:
+        raise CompatibilityError(
+            "the composed module set does not match this extension repository:\n%s\n"
+            "Refusing to start. A shadowed module means Klipper would run upstream's code "
+            "while every version report still claims NebulaOS's, which for a load-cell probe "
+            "is a physical-safety difference, not a cosmetic one. Re-run the platform's "
+            "composition step (NebulaOS-firmware's /etc/nebulaos-klipper-compose.sh)."
+            % ('\n'.join(problems),))
+    return checked
+
+
 def check_chelper_verdict(manifest, klipper_dir):
     """Consume the platform's chelper verdict, if it published one.
 
@@ -418,6 +499,7 @@ def run_preflight(manifest_path, klipper_dir, printer=None, config=None,
     check_modules_present(manifest, repo_root, include_tests=include_tests)
     check_required_symbols(manifest)
     installed = check_klipper_commit(manifest, klipper_dir)
+    composed = check_composition_integrity(manifest, klipper_dir, repo_root)
     check_chelper_verdict(manifest, klipper_dir)
     sensor_types = []
     if printer is not None:
@@ -429,6 +511,7 @@ def run_preflight(manifest_path, klipper_dir, printer=None, config=None,
         'qualified_klipper_commit': (manifest.get('klipper') or {}).get('qualified_commit'),
         'installed_klipper_commit': installed,
         'managed_module_count': len(manifest.get('modules', ())),
+        'verified_composed_modules': composed,
         'registered_sensor_types': sensor_types,
         'composition': manifest.get('composition'),
         'chelper': manifest.get('chelper'),

@@ -298,11 +298,25 @@ class ChelperVerdictTest(unittest.TestCase):
     """The mtime invariant is the platform's to enforce; this consumes its published verdict."""
 
     def test_no_result_file_declared_means_no_check(self):
+        # Setting platform_result_file to null hands the invariant to the platform end to
+        # end. The shipped manifest no longer does that (Stage 2 wired it to a real path -
+        # see the test below), but the escape hatch stays supported and tested, because a
+        # deployment whose platform enforces the invariant without publishing a verdict is
+        # a legitimate configuration rather than a broken one.
         manifest = _load_real_manifest()
-        self.assertIsNone(manifest['chelper']['platform_result_file'],
-                          "today the platform owns this end to end")
+        manifest['chelper']['platform_result_file'] = None
         self.assertIsNone(
             nebulaos_compat.check_chelper_verdict(manifest, '/irrelevant'))
+
+    def test_the_real_manifest_now_names_the_platform_verdict_file(self):
+        # Stage 2 wired this to a real path. It stays relative to the Klipper checkout so it
+        # travels with the tree the platform composed - a migration that replaces
+        # apps/klipper takes the stale verdict with it instead of leaving one behind that
+        # describes a tree that no longer exists.
+        manifest = _load_real_manifest()
+        self.assertEqual(manifest['chelper']['platform_result_file'],
+                         '.nebulaos-chelper-verdict.json')
+        self.assertFalse(os.path.isabs(manifest['chelper']['platform_result_file']))
 
     def test_a_declared_but_unwritten_verdict_is_refused(self):
         manifest = _load_real_manifest()
@@ -338,6 +352,155 @@ class ChelperVerdictTest(unittest.TestCase):
             self.assertIn('gcc', str(ctx.exception))
         finally:
             shutil.rmtree(tmp)
+
+
+class CompositionIntegrityTest(unittest.TestCase):
+    """The collision guard, seen from inside the running process.
+
+    The failure these cover is the one that produces no error anywhere: git replacing a
+    managed symlink with an upstream regular file at exit code 0. Every case below asserts
+    a refusal, because a composition check that passes on a shadowed module manufactures
+    exactly the confidence it exists to withhold.
+    """
+
+    def _compose(self, tmp, roles=None, link=True):
+        """Build a throwaway (extensions repo, Klipper checkout) pair and compose them the
+        way NebulaOS-firmware does. Returns (manifest, klipper_dir, repo_root)."""
+        repo_root = os.path.join(tmp, 'ext')
+        klipper = os.path.join(tmp, 'klipper')
+        os.makedirs(os.path.join(repo_root, 'extras'))
+        os.makedirs(os.path.join(klipper, 'klippy', 'extras'))
+        modules = roles or [('extras/alpha.py', 'runtime'),
+                            ('extras/beta.py', 'runtime'),
+                            ('extras/test_gamma.py', 'test')]
+        for path, _role in modules:
+            with open(os.path.join(repo_root, path), 'w') as f:
+                f.write('# %s\n' % (path,))
+            if link:
+                os.symlink(os.path.join(repo_root, path),
+                           os.path.join(klipper, 'klippy', 'extras',
+                                        os.path.basename(path)))
+        manifest = {
+            'composition': {
+                'source_dir': 'extras',
+                'destination_dir': 'klippy/extras',
+                'require_symlink_resolving_inside_source': True,
+            },
+            'modules': [{'path': p, 'role': r} for p, r in modules],
+        }
+        return manifest, klipper, repo_root
+
+    def test_a_correctly_composed_tree_passes(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            manifest, klipper, root = self._compose(tmp)
+            # Only the two runtime modules are required; the test module may legitimately
+            # be skipped by a deployment.
+            self.assertEqual(
+                nebulaos_compat.check_composition_integrity(manifest, klipper, root), 2)
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_an_upstream_file_shadowing_a_module_is_refused(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            manifest, klipper, root = self._compose(tmp)
+            dest = os.path.join(klipper, 'klippy', 'extras', 'alpha.py')
+            os.unlink(dest)
+            with open(dest, 'w') as f:
+                f.write('# upstream Klipper now ships this\n')
+            with self.assertRaises(nebulaos_compat.CompatibilityError) as ctx:
+                nebulaos_compat.check_composition_integrity(manifest, klipper, root)
+            msg = str(ctx.exception)
+            self.assertIn('SHADOWED', msg)
+            self.assertIn('alpha.py', msg)
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_a_link_escaping_the_repository_is_refused(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            manifest, klipper, root = self._compose(tmp)
+            outsider = os.path.join(tmp, 'outsider.py')
+            with open(outsider, 'w') as f:
+                f.write('# not ours\n')
+            dest = os.path.join(klipper, 'klippy', 'extras', 'beta.py')
+            os.unlink(dest)
+            os.symlink(outsider, dest)
+            with self.assertRaises(nebulaos_compat.CompatibilityError) as ctx:
+                nebulaos_compat.check_composition_integrity(manifest, klipper, root)
+            self.assertIn('outside this repository', str(ctx.exception))
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_a_dangling_link_is_refused(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            manifest, klipper, root = self._compose(tmp)
+            os.unlink(os.path.join(root, 'extras', 'alpha.py'))
+            with self.assertRaises(nebulaos_compat.CompatibilityError) as ctx:
+                nebulaos_compat.check_composition_integrity(manifest, klipper, root)
+            self.assertIn('dangling', str(ctx.exception))
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_a_missing_runtime_module_is_refused(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            manifest, klipper, root = self._compose(tmp)
+            os.unlink(os.path.join(klipper, 'klippy', 'extras', 'beta.py'))
+            with self.assertRaises(nebulaos_compat.CompatibilityError) as ctx:
+                nebulaos_compat.check_composition_integrity(manifest, klipper, root)
+            self.assertIn('composition is incomplete', str(ctx.exception))
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_a_missing_test_module_is_tolerated(self):
+        # A deployment may legitimately skip test modules; only a missing runtime module is
+        # never legitimate.
+        tmp = tempfile.mkdtemp()
+        try:
+            manifest, klipper, root = self._compose(tmp)
+            os.unlink(os.path.join(klipper, 'klippy', 'extras', 'test_gamma.py'))
+            self.assertEqual(
+                nebulaos_compat.check_composition_integrity(manifest, klipper, root), 2)
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_every_problem_is_reported_at_once(self):
+        # One restart per problem is a miserable way to fix a broken deployment.
+        tmp = tempfile.mkdtemp()
+        try:
+            manifest, klipper, root = self._compose(tmp)
+            os.unlink(os.path.join(klipper, 'klippy', 'extras', 'alpha.py'))
+            os.unlink(os.path.join(klipper, 'klippy', 'extras', 'beta.py'))
+            with self.assertRaises(nebulaos_compat.CompatibilityError) as ctx:
+                nebulaos_compat.check_composition_integrity(manifest, klipper, root)
+            msg = str(ctx.exception)
+            self.assertIn('alpha.py', msg)
+            self.assertIn('beta.py', msg)
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_the_check_is_skipped_when_the_manifest_does_not_require_it(self):
+        # A copy-based deployment, or the immutable factory-fallback tree where the modules
+        # are deliberately real files, uses this same module and must not be told its own
+        # correct layout is broken.
+        tmp = tempfile.mkdtemp()
+        try:
+            manifest, klipper, root = self._compose(tmp, link=False)
+            manifest['composition']['require_symlink_resolving_inside_source'] = False
+            self.assertIsNone(
+                nebulaos_compat.check_composition_integrity(manifest, klipper, root))
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_the_real_manifest_requires_the_guard(self):
+        manifest = _load_real_manifest()
+        self.assertTrue(
+            manifest['composition']['require_symlink_resolving_inside_source'],
+            "the shipped manifest must demand the collision guard - the vendored community "
+            "module names are exactly the ones mainline could adopt")
 
 
 class SensorTypeRegistrationTest(unittest.TestCase):
@@ -386,7 +549,7 @@ class CompositionContractTest(unittest.TestCase):
 
 
 class EndToEndPreflightTest(unittest.TestCase):
-    def _run(self, mutate=None, printer=None):
+    def _run(self, mutate=None, printer=None, compose=True):
         manifest = _load_real_manifest()
         if mutate is not None:
             mutate(manifest)
@@ -398,8 +561,27 @@ class EndToEndPreflightTest(unittest.TestCase):
             path = os.path.join(tmp, nebulaos_compat.MANIFEST_FILENAME)
             with open(path, 'w') as f:
                 json.dump(manifest, f)
+
+            # A stand-in Klipper checkout, composed the way NebulaOS-firmware composes a
+            # real one. Stage 2 added two checks that are properties of the CHECKOUT rather
+            # than of this repository - composition integrity and the platform's chelper
+            # verdict - so an end-to-end preflight can no longer be run against a path that
+            # does not exist. Building a real composed tree here keeps this test genuinely
+            # end to end instead of quietly excusing the two newest checks from it.
+            klipper = os.path.join(tmp, 'klipper')
+            dest = os.path.join(klipper, 'klippy', 'extras')
+            os.makedirs(dest)
+            if compose:
+                for entry in manifest.get('modules', ()):
+                    src = os.path.join(REPO_ROOT, entry['path'])
+                    if os.path.isfile(src):
+                        os.symlink(src, os.path.join(dest, os.path.basename(entry['path'])))
+                verdict = manifest.get('chelper', {}).get('platform_result_file')
+                if verdict:
+                    with open(os.path.join(klipper, verdict), 'w') as f:
+                        json.dump({'status': 'ok'}, f)
             return nebulaos_compat.run_preflight(
-                path, '/irrelevant', printer=printer, config=None,
+                path, klipper, printer=printer, config=None,
                 include_tests=True)
         finally:
             shutil.rmtree(tmp)
@@ -420,6 +602,19 @@ class EndToEndPreflightTest(unittest.TestCase):
         self.assertEqual(status['qualified_klipper_commit'], QUALIFIED)
         self.assertEqual(status['registered_sensor_types'], ['nebulaos_temperature_mcu'])
         self.assertGreater(status['managed_module_count'], 25)
+        # Every runtime module was verified as a link resolving inside this repository.
+        runtime = [e for e in _load_real_manifest()['modules']
+                   if e.get('role') != 'test']
+        self.assertEqual(status['verified_composed_modules'], len(runtime))
+
+    def test_an_uncomposed_checkout_fails_the_whole_preflight(self):
+        # The end-to-end shape of the collision guard: a Klipper checkout where the managed
+        # modules are simply not there at all.
+        def allow(manifest):
+            manifest['klipper']['allow_unqualified'] = True
+        with self.assertRaises(nebulaos_compat.CompatibilityError) as ctx:
+            self._run(mutate=allow, printer=self._printer(), compose=False)
+        self.assertIn('composition is incomplete', str(ctx.exception))
 
     def test_a_missing_required_api_fails_the_whole_preflight(self):
         def break_symbols(manifest):

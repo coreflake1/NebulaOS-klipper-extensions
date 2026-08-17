@@ -60,8 +60,8 @@ and by the platform's composition and update steps.
 | `forbidden_klipper_symbols` | APIs this set has migrated **off**. Their reappearance means the installed Klipper is older than the qualified one, or is not official Klipper. |
 | `modules` | Every managed module, with `role`: `runtime` or `test`. A deployment may skip `test` modules; a missing `runtime` module is never legitimate. |
 | `sensor_types` | Sensor types this set registers with `[heaters]`, and which module provides each. |
-| `composition` | The platform's composition contract — see below. |
-| `chelper` | The platform's `c_helper.so` contract — see below. |
+| `composition` | The platform's composition contract, and the collision guard this repository re-checks — see below. |
+| `chelper` | The platform's `c_helper.so` contract, and where it publishes its verdict — see below. |
 
 ## What `nebulaos_compat.py` checks
 
@@ -78,8 +78,11 @@ anything can be checked against it, and its shape understood before its contents
    `register_response` rename automatically, before any motion. All problems are accumulated
    into one message rather than surfacing one restart at a time.
 4. **The installed Klipper commit** is the qualified one, or inside a declared ancestry range.
-5. **The platform's `c_helper.so` verdict**, if it published one.
-6. **Every declared sensor type is registered**, by force-loading its providing module.
+5. **Composition integrity** — every runtime module is reachable as a symlink resolving
+   inside this repository, so a module silently shadowed by an upstream file is caught
+   before any other managed module loads.
+6. **The platform's `c_helper.so` verdict.**
+7. **Every declared sensor type is registered**, by force-loading its providing module.
 
 ## Section ordering
 
@@ -102,10 +105,12 @@ So the ordering dependency is removed as far as it can be, and made loud where i
   registration, so a genuine ordering mistake produces a message naming the sensor type and
   its provider instead of Klipper's bare `Unknown temperature sensor`.
 
-## Handed to the platform (Stage 2)
+## Shared with the platform
 
-Two checks are declared here with a fixed interface but deliberately not implemented in this
-repository, because neither can be answered from inside it.
+Two checks are owned by the platform (`NebulaOS-firmware`), because only it can run them
+*before* Klippy starts — the one place either failure can be prevented rather than merely
+noticed. Both interfaces were declared here first and are wired to a real platform
+implementation as of Stage 2, without the manifest shape having to change to do it.
 
 ### Composition integrity — the collision guard
 
@@ -115,11 +120,22 @@ The extension is then shadowed with no error anywhere. The names most exposed ar
 community ones: `gcode_shell_command` and `virtual_pins` are exactly the kind of module
 mainline could adopt.
 
-By the time Klippy is running, a collision has already happened and this process is importing
-upstream's file rather than ours — so the check has to live in the platform, before Klippy
-starts. `composition.require_symlink_resolving_inside_source` is `true`, and the platform MUST
-verify after composition and after any Klipper update that every destination path is a symlink
+By the time Klippy is running, a collision has already happened — so the authoritative check
+lives in the platform, before Klippy starts.
+`composition.require_symlink_resolving_inside_source` is `true`, and the platform MUST verify
+after composition and after any Klipper update that every destination path is a symlink
 resolving inside `source_dir`, refusing to activate otherwise.
+`NebulaOS-firmware`'s `/etc/nebulaos-klipper-compose.sh` does exactly that, on every activation
+and inside every update transaction, and treats a regular file at a managed path as a hard
+error that is never overwritten and never worked around.
+
+`nebulaos_compat.py` re-checks it as a second layer, for the deployments the platform never
+saw: a hand-updated checkout, a restored backup, a developer install, a device composed by
+older firmware. Because `[nebulaos_compat]` is the first NebulaOS section, this still runs
+before any other managed module has been imported. It is skipped entirely when
+`require_symlink_resolving_inside_source` is `false` — which is what lets a copy-based
+deployment, or the immutable factory-fallback tree where the modules are deliberately real
+files, use this same module without misdescribing how it was assembled.
 
 ### `c_helper.so` mtime invariant
 
@@ -129,12 +145,23 @@ never invokes gcc. NebulaOS ships a cross-compiled `c_helper.so` and the device 
 toolchain, so a rebuild attempt does not merely take a while — it raises, and Klippy does not
 start.
 
-Enforcing this needs firmware build-time information that does not exist inside this
-repository, so the platform owns it. The manifest's `chelper` block declares the requirement
-and names an optional `platform_result_file`; when set, `nebulaos_compat.py` reads it and
-refuses to start on a failing verdict, so the failure appears as a named preflight error
-rather than a gcc crash part-way through boot. It is `null` today, meaning the platform owns
-this end to end.
+Enforcing this needs build-time and boot-time information that does not exist inside this
+repository, so the platform owns the decision and publishes the result.
+`platform_result_file` is `.nebulaos-chelper-verdict.json`, relative to the Klipper checkout —
+so the verdict travels with the tree it describes, and a migration that replaces
+`apps/klipper` takes any stale verdict with it rather than leaving one behind describing a
+tree that no longer exists.
+
+`NebulaOS-firmware` writes it from `/etc/nebulaos-chelper-preflight.sh` at every activation and
+inside every update transaction, and bakes one into the immutable `/opt/klipper` copy at build
+time (that tree is a read-only squashfs, so nothing can write it there at boot). The build
+additionally *enforces* the invariant rather than hoping for it: `cp -r` does not preserve
+mtimes and `git read-tree` rewrites them, so without an explicit step the ordering inside a
+seed archive would be decided by directory-walk order.
+
+`nebulaos_compat.py` reads the verdict and refuses to start on anything but a pass — including
+when the file is absent, since its absence means the platform never checked. Setting it back to
+`null` disables this consumer and leaves the invariant entirely to the platform.
 
 ## Moving the qualified pin
 

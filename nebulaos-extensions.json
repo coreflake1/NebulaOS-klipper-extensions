@@ -93,6 +93,6 @@
     "requirement": "prebuilt_so_mtime_newer_than_all_chelper_sources",
     "target": "klippy/chelper/c_helper.so",
     "source_dir": "klippy/chelper",
-    "platform_result_file": null
+    "platform_result_file": ".nebulaos-chelper-verdict.json"
   }
 }
