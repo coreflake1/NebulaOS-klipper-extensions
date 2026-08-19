@@ -228,5 +228,120 @@ class FailClosedTest(unittest.TestCase):
         self.assertIn('result_run_pres_prtouch', str(ctx.exception))
 
 
+class ReadPresFormatTest(unittest.TestCase):
+    """result_read_pres_prtouch specifically (Phase 1.5 hardware closure, 2026-08-19): the
+    format used to be wrong - borrowed from a different command (resault_manual_get_pres) -
+    and real hardware rejected it. Corrected against reference/prtouch_v2.c:766 and
+    ANALYSIS.md:33, both of which agree on `oid=%c tick=%u ch0=%i ch1=%i ch2=%i ch3=%i`, a
+    single-reading message with no index/tri_time/tri_chs/buf_cnt on the wire at all -
+    unlike result_run_pres_prtouch, a genuinely different message this fix does not touch."""
+
+    # The exact string this table used to carry, kept here (not in production code any more)
+    # so this test documents the regression it guards against rather than just asserting a
+    # positive.
+    OLD_WRONG_SURROGATE = (
+        'result_read_pres_prtouch oid=%c index=%c tri_time=%u tri_chs=%c buf_cnt=%u'
+        ' tick_0=%u ch0_0=%i ch1_0=%i ch2_0=%i ch3_0=%i'
+        ' tick_1=%u ch0_1=%i ch1_1=%i ch2_1=%i ch3_1=%i')
+
+    def test_old_surrogate_is_gone_from_the_candidate_table(self):
+        _required, candidates = prtouch_mcu.RESULT_READ_PRES_PRTOUCH
+        self.assertNotIn(self.OLD_WRONG_SURROGATE, candidates)
+
+    def test_an_mcu_declaring_only_the_old_surrogate_is_refused(self):
+        # The old surrogate is not silently treated as authoritative just because some MCU
+        # happens to declare it - it is not in the table any more, so select_response_format
+        # can never choose it, full stop.
+        mcu = fake.FakeMCU()
+        mcu.valid_response_formats = {self.OLD_WRONG_SURROGATE}
+        chosen = prtouch_mcu.select_response_format(
+            mcu, prtouch_mcu.RESULT_READ_PRES_PRTOUCH, 'result_read_pres_prtouch')
+        self.assertIsNone(chosen)
+
+    def test_registration_succeeds_against_the_real_wire_format(self):
+        printer, mcu, pv2 = _build_unconnected()
+        fake.connect(printer, mcu)
+        self.assertEqual(
+            mcu.registered_response_formats['result_read_pres_prtouch'],
+            'result_read_pres_prtouch oid=%c tick=%u ch0=%i ch1=%i ch2=%i ch3=%i')
+
+    def test_missing_fields_rejected_safely(self):
+        # An MCU declaring a format that validates but is missing a required field (here,
+        # ch3) must not be selected - the same required-field guard every other subscription
+        # already has, exercised here specifically for read_pres.
+        truncated = 'result_read_pres_prtouch oid=%c tick=%u ch0=%i ch1=%i ch2=%i'
+        mcu = fake.FakeMCU()
+        mcu.valid_response_formats = {truncated}
+        chosen = prtouch_mcu.select_response_format(
+            mcu, prtouch_mcu.RESULT_READ_PRES_PRTOUCH, 'result_read_pres_prtouch')
+        self.assertIsNone(chosen)
+
+    def test_malformed_response_rejected_safely(self):
+        # An MCU that never declares ANY known format for this message is the "malformed
+        # dictionary" case - PRTouch must refuse to start (fail-closed), not attempt to
+        # subscribe with something it cannot parse.
+        printer, mcu = FailClosedTest()._connect_with_formats([])
+        with self.assertRaises(fake.ConfigError) as ctx:
+            fake.connect(printer, mcu)
+        self.assertIn('result_run_step_prtouch', str(ctx.exception))
+
+    def test_oid_routes_to_the_correct_subscriber(self):
+        printer, mcu, pv2 = _build_unconnected()
+        fake.connect(printer, mcu)
+        self.assertIn(pv2.mcu.pres_oid,
+                      mcu.response_handlers['result_read_pres_prtouch'])
+
+    def test_tick_ch0_ch1_ch2_ch3_all_parsed_with_signed_values(self):
+        printer, mcu, pv2 = _build_unconnected()
+        fake.connect(printer, mcu)
+        chunks = fake.make_read_pres_result(
+            pv2.mcu.pres_oid, [(1000, -5, 10, -15, 20)])
+        mcu.push_response('result_read_pres_prtouch', pv2.mcu.pres_oid, chunks[0])
+        self.assertEqual(len(pv2.mcu.pres_res), 1)
+        entry = pv2.mcu.pres_res[0]
+        self.assertEqual(entry['ch0'], -5)
+        self.assertEqual(entry['ch1'], 10)
+        self.assertEqual(entry['ch2'], -15)
+        self.assertEqual(entry['ch3'], 20)
+        self.assertGreater(entry['tick'], 0)
+
+    def test_tick_progression_and_index_assigned_by_arrival_order(self):
+        # No index exists on the wire for this message (see the module header note) - it is
+        # assigned as the append position, which is what this test pins down.
+        printer, mcu, pv2 = _build_unconnected()
+        fake.connect(printer, mcu)
+        chunks = fake.make_read_pres_result(
+            pv2.mcu.pres_oid, [(1000, 1, 2, 3, 4), (2000, 5, 6, 7, 8), (3000, 9, 10, 11, 12)])
+        for chunk in chunks:
+            mcu.push_response('result_read_pres_prtouch', pv2.mcu.pres_oid, chunk)
+        self.assertEqual([e['index'] for e in pv2.mcu.pres_res], [0, 1, 2])
+        ticks = [e['tick'] for e in pv2.mcu.pres_res]
+        self.assertEqual(ticks, sorted(ticks))
+
+    def test_manual_get_pres_query_format_is_independent_and_unchanged(self):
+        # The synchronous query command this async format used to be wrongly copied from is
+        # untouched - it still carries its own, genuinely different, dual-reading payload.
+        printer, mcu, pv2 = _build_unconnected()
+        fake.connect(printer, mcu)
+        self.assertEqual(
+            pv2.mcu.manual_get_pres_cmd.resp_name, 'resault_manual_get_pres')
+        self.assertIn('tri_time',
+                       fake._field_names(
+                           'resault_manual_get_pres oid=%c index=%c tri_time=%u tri_chs=%c'
+                           ' buf_cnt=%u tick_0=%u ch0_0=%i ch1_0=%i ch2_0=%i ch3_0=%i'
+                           ' tick_1=%u ch0_1=%i ch1_1=%i ch2_1=%i ch3_1=%i'))
+
+    def test_delivered_samples_reach_the_normal_pres_res_callback_path(self):
+        # End-to-end: registered through the real API, dispatched through the real handler,
+        # landing in the same self.pres_res list result_run_pres_prtouch/_repair_pres_samples
+        # already use - not a separate, parallel code path.
+        printer, mcu, pv2 = _build_unconnected()
+        fake.connect(printer, mcu)
+        chunks = fake.make_read_pres_result(
+            pv2.mcu.pres_oid, [(1000, 1, 2, 3, 4)])
+        mcu.push_response('result_read_pres_prtouch', pv2.mcu.pres_oid, chunks[0])
+        self.assertEqual(pv2.mcu.pres_res[-1]['ch1'], 2)
+
+
 if __name__ == '__main__':
     unittest.main()
