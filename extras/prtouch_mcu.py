@@ -133,22 +133,29 @@ def format_param_names(msgformat):
             for part in msgformat.strip().split()[1:] if '=' in part]
 
 
+def _has_new_serial_api(mcu):
+    """True when the MCU object provides the post-c89393cda serial API
+    (register_serial_response + check_valid_response).  False on v0.13.0
+    and earlier, where only register_response(cb, NAME, oid) exists."""
+    return hasattr(mcu, 'register_serial_response')
+
+
 def select_response_format(mcu, subscription, msgname):
     """Pick the candidate format the connected MCU actually declares.
 
-    Uses only MCU.check_valid_response(), a public mainline API that returns a bool rather
-    than raising. Returns the winning format string, or None if the MCU declares none of
-    them (the caller turns that into a fail-closed config error)."""
+    On post-c89393cda Klipper this uses MCU.check_valid_response() to probe the MCU
+    dictionary.  On v0.13.0 (where that API does not exist) the first candidate whose
+    declared parameter set covers the handler-required fields is accepted without MCU-side
+    validation — the serial parser already knows the real format from the MCU dictionary
+    and will parse it correctly regardless."""
     required, candidates = subscription
+    has_check = hasattr(mcu, 'check_valid_response')
     for msgformat in candidates:
-        if not mcu.check_valid_response(msgformat):
+        if has_check and not mcu.check_valid_response(msgformat):
             continue
         declared = set(format_param_names(msgformat))
         missing = [name for name in required if name not in declared]
         if missing:
-            # The MCU agrees this format exists, but it does not carry a field one of this
-            # module's own handlers reads. Treat that as no match rather than registering a
-            # subscription that would KeyError on the first real sample.
             logging.warning(
                 "prtouch_mcu: '%s' candidate format validated but is missing handler-required"
                 " field(s) %s - skipping candidate", msgname, ', '.join(missing))
@@ -231,8 +238,11 @@ class PrtouchMCU:
         self.pres_read_response = None
 
     def _subscribe(self, mcu, callback, subscription, msgname, oid):
-        """Register one async response subscription against mainline's
-        MCU.register_serial_response(), resolving the exact declared format first.
+        """Register one async response subscription, resolving the exact declared
+        format first.
+
+        Supports both the post-c89393cda API (register_serial_response with full format
+        validation) and the v0.13.0 API (register_response with message name only).
 
         Fail-closed: if the connected MCU declares none of the candidate formats, this raises
         a config error rather than leaving PRTouch running with a telemetry callback that can
@@ -253,7 +263,11 @@ class PrtouchMCU:
                 % (mcu.get_name(), msgname, ', '.join(required),
                    '\n    '.join(candidates), msgname.upper()))
         logging.info("prtouch_mcu: subscribing to '%s' as: %s", msgname, msgformat)
-        return mcu.register_serial_response(callback, msgformat, oid)
+        if _has_new_serial_api(mcu):
+            return mcu.register_serial_response(callback, msgformat, oid)
+        else:
+            mcu.register_response(callback, msgname, oid)
+            return None
 
     def _build_step_config(self):
         ppins = self.printer.lookup_object('pins')
