@@ -701,6 +701,17 @@ def connect(printer, mcu):
     printer.send_event("klippy:connect")
 
 
+def make_read_pres_result(pres_oid, samples):
+    """Build the params dicts for 'result_read_pres_prtouch' under its real, corrected format
+    (reference/prtouch_v2.c:766: `oid=%c tick=%u ch0=%i ch1=%i ch2=%i ch3=%i`) - one reading
+    per broadcast, no index/tri_time/tri_chs/buf_cnt on the wire (unlike result_run_pres_prtouch,
+    a genuinely different message). `samples` is a list of (tick_ticks, ch0, ch1, ch2, ch3)."""
+    return [
+        {'oid': pres_oid, 'tick': tick, 'ch0': ch0, 'ch1': ch1, 'ch2': ch2, 'ch3': ch3}
+        for (tick, ch0, ch1, ch2, ch3) in samples
+    ]
+
+
 def make_pres_result(pres_oid, tri_time_ticks, tri_chs, buf_cnt, samples):
     """Build the params dicts (2-per-message, result_run_pres_prtouch's real chunk size)
     needed to push `samples` (list of (tick_ticks, ch0, ch1, ch2, ch3), len multiple of 2)."""

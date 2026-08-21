@@ -25,7 +25,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(
     nebulaos_compat.__file__)))
 REAL_MANIFEST = os.path.join(REPO_ROOT, nebulaos_compat.MANIFEST_FILENAME)
 
-QUALIFIED = 'fe4eb8650bd7de4c2100a14eaf09b0965c430e29'
+QUALIFIED = '61c0c8d2ef40340781835dd53fb04cc7a454e37a'
 
 
 def _load_real_manifest():
@@ -177,28 +177,29 @@ class RequiredSymbolTest(unittest.TestCase):
     def test_a_missing_required_api_is_refused_and_named(self):
         manifest = _load_real_manifest()
         manifest['required_klipper_symbols'] = [
-            'mcu:MCU.register_serial_response',
+            'mcu:MCU.register_response',
             'mcu:MCU.a_method_that_does_not_exist',
         ]
         with self.assertRaises(nebulaos_compat.CompatibilityError) as ctx:
             nebulaos_compat.check_required_symbols(manifest)
         msg = str(ctx.exception)
         self.assertIn('a_method_that_does_not_exist', msg)
-        self.assertNotIn('register_serial_response', msg)
+        self.assertNotIn('register_response', msg)
 
     def test_the_actual_historical_breakage_would_have_been_caught(self):
-        # The real one: an older Klipper providing register_response and not
-        # register_serial_response. Both halves of the manifest's contract fire.
+        # The real one: a newer Klipper providing register_serial_response and not
+        # register_response. The manifest requires register_response (v0.13.0 API);
+        # requiring register_serial_response here shows the gate catches the drift.
         manifest = _load_real_manifest()
-        manifest['required_klipper_symbols'] = ['mcu:MCU.register_response']
+        manifest['required_klipper_symbols'] = ['mcu:MCU.register_serial_response']
         with self.assertRaises(nebulaos_compat.CompatibilityError) as ctx:
             nebulaos_compat.check_required_symbols(manifest)
-        self.assertIn('register_response', str(ctx.exception))
+        self.assertIn('register_serial_response', str(ctx.exception))
 
     def test_a_forbidden_symbol_that_reappears_is_refused(self):
         manifest = _load_real_manifest()
         manifest['required_klipper_symbols'] = []
-        manifest['forbidden_klipper_symbols'] = ['mcu:MCU.register_serial_response']
+        manifest['forbidden_klipper_symbols'] = ['mcu:MCU.register_response']
         with self.assertRaises(nebulaos_compat.CompatibilityError) as ctx:
             nebulaos_compat.check_required_symbols(manifest)
         self.assertIn('must not be relied on', str(ctx.exception))
@@ -212,7 +213,7 @@ class RequiredSymbolTest(unittest.TestCase):
 
     def test_a_malformed_symbol_spec_is_refused(self):
         manifest = _load_real_manifest()
-        manifest['required_klipper_symbols'] = ['mcu.MCU.register_serial_response']
+        manifest['required_klipper_symbols'] = ['mcu.MCU.register_response']
         with self.assertRaises(nebulaos_compat.CompatibilityError):
             nebulaos_compat.check_required_symbols(manifest)
 

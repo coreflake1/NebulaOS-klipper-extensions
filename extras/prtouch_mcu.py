@@ -101,15 +101,28 @@ RESULT_RUN_PRES_PRTOUCH = (
      ' tick_1=%u ch0_1=%i ch1_1=%i ch2_1=%i ch3_1=%i'),
 )
 
-# _handle_result_read_pres_prtouch stores the raw params dict, and _repair_pres_samples()
-# reads ['index'] off entries in that same list, so index is required here.
+# Phase 1.5 hardware closure (2026-08-19): the entry above (candidate 1, borrowed from
+# resault_manual_get_pres) was WRONG - real hardware rejected it outright ("MCU ... does not
+# declare any known format for the async response 'result_read_pres_prtouch'"). The assumption
+# that read_pres_prtouch shares manual_get_pres's dual-reading/index/tri_time/tri_chs/buf_cnt
+# payload doesn't hold: they are two different commands in two different code paths in the real
+# firmware. Confirmed directly, byte-for-byte, against this project's own vendored ground truth:
+#   - reference/prtouch_v2.c:766 (Creality's own source, prtouch_pres_task's `read_fix_cnt`
+#     branch): sendf("result_read_pres_prtouch oid=%c tick=%u ch0=%i ch1=%i ch2=%i ch3=%i", ...)
+#     - one broadcast per requested sample (driven by read_pres_prtouch's own acq_ms/cnt
+#     arguments, see command_read_pres_prtouch at prtouch_v2.c:622), not a dual-buffered,
+#     index-tagged, triggered batch like result_run_pres_prtouch's genuinely separate sendf at
+#     prtouch_v2.c:783 (RESULT_RUN_PRES_PRTOUCH above is unaffected - that candidate is correct).
+#   - ANALYSIS.md:33 independently documents the identical mapping:
+#     `result_read_pres_prtouch oid=%c tick=%u ch0..3=%i`.
+# No index field exists on the wire for this message; the real firmware never tags a read_pres
+# broadcast with a buffer position, unlike the two commands that do (manual_get_steps/
+# manual_get_pres, and result_run_step_prtouch). Handled in _handle_result_read_pres_prtouch()
+# below, which assigns 'index' as the append position - exactly the same position-tracking
+# invariant _repair_pres_samples()'s own self.pres_res[i]['index'] == i check already relies on.
 RESULT_READ_PRES_PRTOUCH = (
-    ('index', 'tri_time', 'tri_chs', 'buf_cnt',
-     'tick_0', 'ch0_0', 'ch1_0', 'ch2_0', 'ch3_0',
-     'tick_1', 'ch0_1', 'ch1_1', 'ch2_1', 'ch3_1'),
-    ('result_read_pres_prtouch oid=%c index=%c tri_time=%u tri_chs=%c buf_cnt=%u'
-     ' tick_0=%u ch0_0=%i ch1_0=%i ch2_0=%i ch3_0=%i'
-     ' tick_1=%u ch0_1=%i ch1_1=%i ch2_1=%i ch3_1=%i',),
+    ('tick', 'ch0', 'ch1', 'ch2', 'ch3'),
+    ('result_read_pres_prtouch oid=%c tick=%u ch0=%i ch1=%i ch2=%i ch3=%i',),
 )
 
 
@@ -120,22 +133,29 @@ def format_param_names(msgformat):
             for part in msgformat.strip().split()[1:] if '=' in part]
 
 
+def _has_new_serial_api(mcu):
+    """True when the MCU object provides the post-c89393cda serial API
+    (register_serial_response + check_valid_response).  False on v0.13.0
+    and earlier, where only register_response(cb, NAME, oid) exists."""
+    return hasattr(mcu, 'register_serial_response')
+
+
 def select_response_format(mcu, subscription, msgname):
     """Pick the candidate format the connected MCU actually declares.
 
-    Uses only MCU.check_valid_response(), a public mainline API that returns a bool rather
-    than raising. Returns the winning format string, or None if the MCU declares none of
-    them (the caller turns that into a fail-closed config error)."""
+    On post-c89393cda Klipper this uses MCU.check_valid_response() to probe the MCU
+    dictionary.  On v0.13.0 (where that API does not exist) the first candidate whose
+    declared parameter set covers the handler-required fields is accepted without MCU-side
+    validation — the serial parser already knows the real format from the MCU dictionary
+    and will parse it correctly regardless."""
     required, candidates = subscription
+    has_check = hasattr(mcu, 'check_valid_response')
     for msgformat in candidates:
-        if not mcu.check_valid_response(msgformat):
+        if has_check and not mcu.check_valid_response(msgformat):
             continue
         declared = set(format_param_names(msgformat))
         missing = [name for name in required if name not in declared]
         if missing:
-            # The MCU agrees this format exists, but it does not carry a field one of this
-            # module's own handlers reads. Treat that as no match rather than registering a
-            # subscription that would KeyError on the first real sample.
             logging.warning(
                 "prtouch_mcu: '%s' candidate format validated but is missing handler-required"
                 " field(s) %s - skipping candidate", msgname, ', '.join(missing))
@@ -218,8 +238,11 @@ class PrtouchMCU:
         self.pres_read_response = None
 
     def _subscribe(self, mcu, callback, subscription, msgname, oid):
-        """Register one async response subscription against mainline's
-        MCU.register_serial_response(), resolving the exact declared format first.
+        """Register one async response subscription, resolving the exact declared
+        format first.
+
+        Supports both the post-c89393cda API (register_serial_response with full format
+        validation) and the v0.13.0 API (register_response with message name only).
 
         Fail-closed: if the connected MCU declares none of the candidate formats, this raises
         a config error rather than leaving PRTouch running with a telemetry callback that can
@@ -240,7 +263,11 @@ class PrtouchMCU:
                 % (mcu.get_name(), msgname, ', '.join(required),
                    '\n    '.join(candidates), msgname.upper()))
         logging.info("prtouch_mcu: subscribing to '%s' as: %s", msgname, msgformat)
-        return mcu.register_serial_response(callback, msgformat, oid)
+        if _has_new_serial_api(mcu):
+            return mcu.register_serial_response(callback, msgformat, oid)
+        else:
+            mcu.register_response(callback, msgname, oid)
+            return None
 
     def _build_step_config(self):
         ppins = self.printer.lookup_object('pins')
@@ -338,7 +365,16 @@ class PrtouchMCU:
             })
 
     def _handle_result_read_pres_prtouch(self, params):
-        self.pres_res.append(params)
+        # No index on the wire for this message (see RESULT_READ_PRES_PRTOUCH's header note) -
+        # assigned here as the append position, matching the normalized entry shape every other
+        # producer of self.pres_res (result_run_pres_prtouch, _repair_pres_samples) already uses.
+        index = len(self.pres_res)
+        self.pres_res.append({
+            'tick': units.mcu_ticks_to_seconds(params['tick']),
+            'ch0': params['ch0'], 'ch1': params['ch1'],
+            'ch2': params['ch2'], 'ch3': params['ch3'],
+            'index': index,
+        })
 
     # -- public API -----------------------------------------------------------
 

@@ -4,15 +4,14 @@
   "nebulaos_api_level": 1,
 
   "klipper": {
-    "qualified_commit": "fe4eb8650bd7de4c2100a14eaf09b0965c430e29",
+    "qualified_commit": "61c0c8d2ef40340781835dd53fb04cc7a454e37a",
     "min_commit": null,
     "max_commit": null,
     "allow_unqualified": false
   },
 
   "required_klipper_symbols": [
-    "mcu:MCU.register_serial_response",
-    "mcu:MCU.check_valid_response",
+    "mcu:MCU.register_response",
     "mcu:MCU.create_oid",
     "mcu:MCU.register_config_callback",
     "mcu:MCU.add_config_cmd",
@@ -33,9 +32,7 @@
     "pins:PrinterPins.setup_pin"
   ],
 
-  "forbidden_klipper_symbols": [
-    "mcu:MCU.register_response"
-  ],
+  "forbidden_klipper_symbols": [],
 
   "composition": {
     "source_dir": "extras",
@@ -80,7 +77,8 @@
     {"path": "extras/test_prtouch_units.py", "role": "test"},
     {"path": "extras/test_z_compensate_offset_safety.py", "role": "test"},
     {"path": "extras/test_z_compensate_reentrancy_guard.py", "role": "test"},
-    {"path": "extras/test_z_compensate_xy_reference.py", "role": "test"}
+    {"path": "extras/test_z_compensate_xy_reference.py", "role": "test"},
+    {"path": "extras/test_tmcstatus.py", "role": "test"}
   ],
 
   "sensor_types": [
