@@ -11,7 +11,10 @@ import subprocess
 import tempfile
 import unittest
 
-import nebulaos_version
+try:
+    from . import nebulaos_version
+except ImportError:
+    import nebulaos_version
 
 
 class FakePrinter(object):

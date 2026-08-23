@@ -9,7 +9,10 @@ import math
 import random
 import unittest
 
-import prtouch_units as units
+try:
+    from . import prtouch_units as units
+except ImportError:
+    import prtouch_units as units
 
 
 class McuTickConversionTest(unittest.TestCase):
