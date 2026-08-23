@@ -1,0 +1,190 @@
+# NebulaOS Z-offset contact probe — nozzle load cell adapter for Z-offset calibration
+#
+# Uses the nozzle load cell (HX711 strain gauge) for Z-offset calibration ONLY.
+# BLTouch remains the global Klipper probe for Z homing, bed mesh, and
+# probe:z_virtual_endstop. This module does NOT register as a global probe —
+# no printer.add_object('probe', self), no ProbeCommandHelper, no HomingViaProbeHelper.
+#
+# Consumed exclusively by z_compensate.py's Z_OFFSET_CALIBRATION command, which calls
+# touch_probe(down_min_z, pro_cnt) to get a single averaged Z contact position.
+#
+# Architecture: creates its own HX711 sensor and upstream LoadCell, wrapping upstream
+# Klipper's load_cell + trigger_analog primitives. Zero host core patches
+# (HOST_KLIPPER_CORE_PATCHES=0). The LoadCell wrapper provides LOAD_CELL_READ,
+# LOAD_CELL_TARE, LOAD_CELL_CALIBRATE, and LOAD_CELL_DIAGNOSTIC G-code commands
+# under this section's name for zero-motion sensor qualification.
+#
+# Safety model derived from upstream 58bd67db load_cell_probe.py. Key differences
+# from upstream documented inline. ContinuousTareFilter is intentionally omitted:
+# our use case is single-shot Z-offset calibration with a fresh tare before each
+# contact, not continuous probing where drift compensation matters. Each touch_probe
+# call performs its own tare via the sample collector, making drift filtering
+# redundant for this application.
+#
+# This file may be distributed under the terms of the GNU GPLv3 license.
+
+import math
+from . import hx71x, load_cell, probe, trigger_analog
+
+# MCU SOS filter scaled to "fractional grams" for consistent sensor precision.
+# Upstream 58bd load_cell_probe.py defines this identically.
+FRAC_GRAMS_CONV = 32768.0
+
+
+class ZOffsetProbe:
+    def __init__(self, config):
+        self._printer = config.get_printer()
+        self._name = config.get_name()
+
+        sensors = {}
+        sensors.update(hx71x.HX71X_SENSOR_TYPES)
+        sensor_class = config.getchoice('sensor_type', sensors)
+        self._sensor = sensor_class(config)
+
+        self._load_cell = load_cell.LoadCell(config, self._sensor)
+
+        self._mcu_trigger_analog = trigger_analog.MCU_trigger_analog(
+            self._sensor)
+        mcu = self._sensor.get_mcu()
+        cmd_queue = self._mcu_trigger_analog.get_dispatch().get_command_queue()
+        sos_filter = trigger_analog.MCU_SosFilter(mcu, cmd_queue, 4)
+        self._mcu_trigger_analog.setup_sos_filter(sos_filter)
+
+        probe.LookupZSteppers(
+            config, self._mcu_trigger_analog.get_dispatch().add_stepper)
+
+        self._z_min_position = probe.lookup_minimum_z(config)
+
+        self._contact_speed = config.getfloat(
+            'contact_speed', default=2.0, minval=0.1, maxval=10.)
+        self._retract_dist = config.getfloat(
+            'retract_dist', default=2.0, minval=0.5, maxval=10.)
+        self._retract_speed = config.getfloat(
+            'retract_speed', default=10.0, minval=1., maxval=50.)
+        self._trigger_force = config.getfloat(
+            'trigger_force', default=75., minval=10., maxval=250.)
+        self._force_safety_limit = config.getfloat(
+            'force_safety_limit', default=2000., minval=100., maxval=10000.)
+        # Collect enough samples to average across mains power noise cycles.
+        # Default 4/60 s covers ~4 cycles at 60 Hz. Actual sample count depends
+        # on the sensor's configured sample rate (e.g. 80 SPS for HX711).
+        self._tare_time = config.getfloat(
+            'tare_time', default=4. / 60., minval=0.01, maxval=1.0)
+
+    def _get_safety_range(self):
+        """Calculate MCU raw ADC safety envelope.
+
+        Upstream 58bd parity: LoadCellProbeConfigHelper.get_safety_range().
+        Centers on reference_tare_counts (calibration baseline), NOT live tare.
+        Validates against sensor ADC range to prevent out-of-range safety bands.
+        """
+        counts_per_gram = self._load_cell.get_counts_per_gram()
+        zero = self._load_cell.get_reference_tare_counts()
+        safety_counts = int(counts_per_gram * self._force_safety_limit)
+        safety_min = int(zero - safety_counts)
+        safety_max = int(zero + safety_counts)
+        sensor_min, sensor_max = self._sensor.get_range()
+        if safety_min <= sensor_min or safety_max >= sensor_max:
+            raise self._printer.command_error(
+                "%s: force_safety_limit exceeds sensor range" % self._name)
+        return safety_min, safety_max
+
+    def _get_grams_per_count(self):
+        """Upstream 58bd parity: LoadCellProbeConfigHelper.get_grams_per_count().
+
+        Validates that counts_per_gram is representable in the MCU filter's
+        fixed-point domain before computing the reciprocal.
+        """
+        counts_per_gram = self._load_cell.get_counts_per_gram()
+        if counts_per_gram >= (1 << 29):
+            raise OverflowError(
+                "%s: counts_per_gram value is too large to filter"
+                % self._name)
+        return 1. / counts_per_gram
+
+    def _tare_and_arm(self):
+        """Tare sensor, compute safety envelope, arm trigger for contact.
+
+        Upstream 58bd parity: LoadCellProbingMove._pause_and_tare() +
+        probing_move() calibration gate.
+        """
+        if not self._load_cell.is_calibrated():
+            raise self._printer.command_error(
+                "%s: load cell not calibrated — run LOAD_CELL_CALIBRATE"
+                " LOAD_CELL=%s to set counts_per_gram and"
+                " reference_tare_counts before contact motion"
+                % (self._name, self._name.split()[-1]))
+
+        toolhead = self._printer.lookup_object('toolhead')
+        print_time = toolhead.get_last_move_time()
+
+        collector = self._load_cell.get_collector()
+        collector.start_collecting(min_time=print_time)
+        sps = self._sensor.get_samples_per_second()
+        num_samples = max(2, math.ceil(sps * self._tare_time))
+        samples, err = collector.collect_min(num_samples)
+        if err:
+            errors, overflows = err
+            raise self._printer.command_error(
+                "%s: sensor errors during tare: %i errors, %i overflows"
+                % (self._name, errors, overflows))
+        if not samples:
+            raise self._printer.command_error(
+                "%s: no samples collected during tare" % self._name)
+
+        tare_counts = sum(s[2] for s in samples) / len(samples)
+        self._load_cell.tare(int(tare_counts))
+
+        safety_min, safety_max = self._get_safety_range()
+        self._mcu_trigger_analog.set_raw_range(safety_min, safety_max)
+
+        gpc = self._get_grams_per_count() * FRAC_GRAMS_CONV
+        sos_filter = self._mcu_trigger_analog.get_sos_filter()
+        sos_filter.set_offset_scale(int(-tare_counts), gpc)
+
+        trigger_frac_grams = int(self._trigger_force * FRAC_GRAMS_CONV)
+        self._mcu_trigger_analog.set_trigger("abs_ge", trigger_frac_grams)
+
+    def touch_probe(self, down_min_z, pro_cnt=1):
+        """Execute Z contact probes and return the averaged Z position.
+
+        Interface contract: matches what z_compensate.py expects.
+        Toolhead must already be at the desired XY and approach height.
+        """
+        toolhead = self._printer.lookup_object('toolhead')
+        phoming = self._printer.lookup_object('homing')
+        z_floor = max(self._z_min_position, down_min_z)
+        results = []
+
+        for i in range(pro_cnt):
+            if i > 0:
+                cur_pos = toolhead.get_position()
+                retract_pos = list(cur_pos)
+                retract_pos[2] = cur_pos[2] + self._retract_dist
+                toolhead.manual_move(retract_pos, self._retract_speed)
+                toolhead.wait_moves()
+
+            self._tare_and_arm()
+
+            pos = list(toolhead.get_position())
+            pos[2] = z_floor
+            epos = phoming.probing_move(
+                self._mcu_trigger_analog, pos, self._contact_speed)
+            results.append(epos[2])
+
+        if not results:
+            raise self._printer.command_error(
+                "%s: no probe results" % self._name)
+
+        return sum(results) / len(results)
+
+    def get_status(self, eventtime):
+        trig_time = self._mcu_trigger_analog.get_last_trigger_time()
+        return {
+            'last_trigger_time': trig_time,
+            'is_calibrated': self._load_cell.is_calibrated(),
+        }
+
+
+def load_config(config):
+    return ZOffsetProbe(config)

@@ -493,6 +493,25 @@ class FakeExtruder:
         self.heater = FakeHeater()
 
 
+class FakeZOffsetProbe:
+    """Stands in for nebulaos_z_offset_probe.ZOffsetProbe. Provides the touch_probe()
+    interface z_compensate.py expects, returning a configurable stub value or raising."""
+
+    def __init__(self, stub_measurement=0.0, stub_raises=None):
+        self._stub_measurement = stub_measurement
+        self._stub_raises = stub_raises
+        self.calls = []
+
+    def touch_probe(self, down_min_z, **kwargs):
+        self.calls.append({'down_min_z': down_min_z, 'kwargs': kwargs})
+        if self._stub_raises is not None:
+            raise self._stub_raises
+        return self._stub_measurement
+
+    def get_status(self, eventtime):
+        return {'last_trigger_time': 0., 'is_calibrated': True}
+
+
 class FakeBLTouchProbe:
     """Stands in for Klipper's real `probe` object (bltouch.py) - z_compensate.py's
     _handle_connect resolves this via lookup_object('probe') but never calls into it
@@ -650,6 +669,7 @@ def build_environment(prtouch_v2_values=None, mesh_min=(5., 10.), mesh_max=(215.
     printer.add_object('toolhead', FakeToolhead(step_dist=0.005))
     printer.add_object('bed_mesh', FakeBedMesh(mesh_min, mesh_max))
     printer.add_object('probe', FakeBLTouchProbe())
+    printer.add_object('nebulaos_z_offset_probe', FakeZOffsetProbe())
     printer.add_object('heater_bed', FakeHeaterBed())
     printer.add_object('extruder', FakeExtruder())
     printer.add_object('heaters', FakePHeaters())

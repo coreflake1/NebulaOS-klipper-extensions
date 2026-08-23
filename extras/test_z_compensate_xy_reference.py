@@ -52,7 +52,8 @@ def _build(homing_params_variables=None, mesh_min=(5., 10.), mesh_max=(215., 215
     fake.connect(printer, mcu)
     prtouch_config.assert_all_consumed()
     zc_config.assert_all_consumed()
-    return printer, mcu, pv2, zc
+    z_offset_probe = printer.lookup_object('nebulaos_z_offset_probe')
+    return printer, mcu, z_offset_probe, zc
 
 
 def _g1_target(zc):
@@ -67,9 +68,9 @@ class CalibrationTargetSourceTest(unittest.TestCase):
     printer's own real [z_compensate] section) -> expected target (110, 138)."""
 
     def test_target_uses_real_homing_params_not_bed_mesh_center(self):
-        _, mcu, pv2, zc = _build(homing_params_variables={'home_x': 110, 'home_y': 111})
+        _, mcu, z_probe, zc = _build(homing_params_variables={'home_x': 110, 'home_y': 111})
         self.assertEqual((zc.home_x, zc.home_y), (110.0, 111.0))
-        pv2.touch_probe = lambda down_min_z, **kw: 0.0
+        z_probe.touch_probe = lambda down_min_z, **kw: 0.0
         zc.cmd_z_offset_calibration(fake.FakeGCmd())
         self.assertIn('X110.000 Y138.000', _g1_target(zc))
 
@@ -77,10 +78,10 @@ class CalibrationTargetSourceTest(unittest.TestCase):
         # Same _HOMING_PARAMS as above, but with [bed_mesh] mesh_min/mesh_max set to wildly
         # different bounds than this printer's own real ones - the target must not move at
         # all, proving [bed_mesh] is no longer consulted once _HOMING_PARAMS is available.
-        _, mcu, pv2, zc = _build(homing_params_variables={'home_x': 110, 'home_y': 111},
+        _, mcu, z_probe, zc = _build(homing_params_variables={'home_x': 110, 'home_y': 111},
                                   mesh_min=(0., 0.), mesh_max=(300., 300.))
         self.assertEqual((zc.home_x, zc.home_y), (110.0, 111.0))
-        pv2.touch_probe = lambda down_min_z, **kw: 0.0
+        z_probe.touch_probe = lambda down_min_z, **kw: 0.0
         zc.cmd_z_offset_calibration(fake.FakeGCmd())
         self.assertIn('X110.000 Y138.000', _g1_target(zc))
 
@@ -88,7 +89,7 @@ class CalibrationTargetSourceTest(unittest.TestCase):
         # int-vs-float coming out of a real gcode_macro's variable_* parsing must not be
         # truncated - a printer whose real home position isn't a whole-number mm value must
         # still resolve exactly.
-        _, mcu, pv2, zc = _build(homing_params_variables={'home_x': 110.25, 'home_y': 111.75})
+        _, mcu, z_probe, zc = _build(homing_params_variables={'home_x': 110.25, 'home_y': 111.75})
         self.assertEqual((zc.home_x, zc.home_y), (110.25, 111.75))
 
 
@@ -98,16 +99,16 @@ class FallbackToBedMeshCenterTest(unittest.TestCase):
     still get a usable - if approximate - calibration target, not a hard failure."""
 
     def test_fallback_when_homing_params_not_registered_at_all(self):
-        _, mcu, pv2, zc = _build(homing_params_variables=None)
+        _, mcu, z_probe, zc = _build(homing_params_variables=None)
         # this printer's own real [bed_mesh] mesh_min=5,10 / mesh_max=215,215 -> center
         # (110.0, 112.5) - the pre-2026-08-14 behavior, kept as the fallback.
         self.assertEqual((zc.home_x, zc.home_y), (110.0, 112.5))
-        pv2.touch_probe = lambda down_min_z, **kw: 0.0
+        z_probe.touch_probe = lambda down_min_z, **kw: 0.0
         zc.cmd_z_offset_calibration(fake.FakeGCmd())
         self.assertIn('X110.000 Y139.500', _g1_target(zc))
 
     def test_fallback_when_homing_params_registered_but_missing_home_xy(self):
-        _, mcu, pv2, zc = _build(homing_params_variables={'safe_z': 5, 'homing_current': 1.5})
+        _, mcu, z_probe, zc = _build(homing_params_variables={'safe_z': 5, 'homing_current': 1.5})
         self.assertEqual((zc.home_x, zc.home_y), (110.0, 112.5))
 
 
