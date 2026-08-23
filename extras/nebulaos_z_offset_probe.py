@@ -21,10 +21,21 @@
 # call performs its own tare via the sample collector, making drift filtering
 # redundant for this application.
 #
+# Contact position accuracy: uses upstream LCBestFit piecewise least-squares
+# analysis on ascent (retract) samples to interpolate the true contact Z,
+# compensating for MCU trigger latency. Reuses LCBestFit, _lookup_z_pos,
+# FIT_MIN_POINTS, and ASCENT_DATA_WINDOW_SECONDS directly from upstream
+# load_cell_probe.py. TappingMove is not reused (coupled to global probe
+# infrastructure); only the minimal ascent-collection and fit-analysis logic
+# is adapted here.
+#
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
+import logging
 import math
 from . import hx71x, load_cell, probe, trigger_analog
+from .load_cell_probe import (LCBestFit, _lookup_z_pos,
+                               FIT_MIN_POINTS, ASCENT_DATA_WINDOW_SECONDS)
 
 # MCU SOS filter scaled to "fractional grams" for consistent sensor precision.
 # Upstream 58bd load_cell_probe.py defines this identically.
@@ -65,19 +76,16 @@ class ZOffsetProbe:
             'trigger_force', default=75., minval=10., maxval=250.)
         self._force_safety_limit = config.getfloat(
             'force_safety_limit', default=2000., minval=100., maxval=10000.)
-        # Collect enough samples to average across mains power noise cycles.
-        # Default 4/60 s covers ~4 cycles at 60 Hz. Actual sample count depends
-        # on the sensor's configured sample rate (e.g. 80 SPS for HX711).
         self._tare_time = config.getfloat(
             'tare_time', default=4. / 60., minval=0.01, maxval=1.0)
 
-    def _get_safety_range(self):
-        """Calculate MCU raw ADC safety envelope.
+        self._best_fit = LCBestFit(self._printer)
 
-        Upstream 58bd parity: LoadCellProbeConfigHelper.get_safety_range().
-        Centers on reference_tare_counts (calibration baseline), NOT live tare.
-        Validates against sensor ADC range to prevent out-of-range safety bands.
-        """
+        self._last_raw_trigger_z = None
+        self._last_fitted_contact_z = None
+        self._last_fit_delta = None
+
+    def _get_safety_range(self):
         counts_per_gram = self._load_cell.get_counts_per_gram()
         zero = self._load_cell.get_reference_tare_counts()
         safety_counts = int(counts_per_gram * self._force_safety_limit)
@@ -90,11 +98,6 @@ class ZOffsetProbe:
         return safety_min, safety_max
 
     def _get_grams_per_count(self):
-        """Upstream 58bd parity: LoadCellProbeConfigHelper.get_grams_per_count().
-
-        Validates that counts_per_gram is representable in the MCU filter's
-        fixed-point domain before computing the reciprocal.
-        """
         counts_per_gram = self._load_cell.get_counts_per_gram()
         if counts_per_gram >= (1 << 29):
             raise OverflowError(
@@ -103,11 +106,6 @@ class ZOffsetProbe:
         return 1. / counts_per_gram
 
     def _tare_and_arm(self):
-        """Tare sensor, compute safety envelope, arm trigger for contact.
-
-        Upstream 58bd parity: LoadCellProbingMove._pause_and_tare() +
-        probing_move() calibration gate.
-        """
         if not self._load_cell.is_calibrated():
             raise self._printer.command_error(
                 "%s: load cell not calibrated — run LOAD_CELL_CALIBRATE"
@@ -145,32 +143,89 @@ class ZOffsetProbe:
         trigger_frac_grams = int(self._trigger_force * FRAC_GRAMS_CONV)
         self._mcu_trigger_analog.set_trigger("abs_ge", trigger_frac_grams)
 
-    def touch_probe(self, down_min_z, pro_cnt=1):
-        """Execute Z contact probes and return the averaged Z position.
+    def _start_fit_collector(self):
+        toolhead = self._printer.lookup_object('toolhead')
+        print_time = toolhead.get_last_move_time()
+        collector = self._load_cell.get_collector()
+        collector.start_collecting(min_time=print_time)
+        return collector
 
-        Interface contract: matches what z_compensate.py expects.
-        Toolhead must already be at the desired XY and approach height.
+    def _fit_contact_z(self, collector, raw_z, toolhead):
+        """Retract while collecting load-cell samples, then fit to find the
+        true contact Z position.
+
+        Upstream 58bd parity: adapts TappingMove._analyze_ascent() +
+        LCBestFit.find_best_fit(). The retract serves as the ascent move
+        whose force-vs-position curve reveals the contact/free-air transition.
         """
+        ascent_start_time = toolhead.get_last_move_time()
+
+        lift_pos = list(toolhead.get_position())
+        lift_pos[2] += self._retract_dist
+        toolhead.manual_move(lift_pos, self._retract_speed)
+
+        move_end = toolhead.get_last_move_time()
+        results = collector.collect_until(move_end)
+        samples, err = results
+        if err:
+            errors, overflows = err
+            raise self._printer.command_error(
+                "%s: sensor errors during ascent: %i errors, %i overflows"
+                % (self._name, errors, overflows))
+
+        data = []
+        for s in samples:
+            if s[0] >= ascent_start_time and \
+               s[0] <= ascent_start_time + ASCENT_DATA_WINDOW_SECONDS:
+                data.append((s[1], _lookup_z_pos(toolhead, s[0])))
+
+        if len(data) < 2 * FIT_MIN_POINTS:
+            raise self._printer.command_error(
+                "%s: insufficient ascent samples (%d total, need >= %d"
+                " each) for piecewise fit"
+                % (self._name, len(data), 2 * FIT_MIN_POINTS))
+
+        z_contact, n_below, n_above, depress_slope = \
+            self._best_fit.find_best_fit(data)
+
+        if n_below < FIT_MIN_POINTS or n_above < FIT_MIN_POINTS:
+            raise self._printer.command_error(
+                "%s: insufficient ascent samples (%d below, %d above,"
+                " need >= %d each) for piecewise fit"
+                % (self._name, n_below, n_above, FIT_MIN_POINTS))
+
+        logging.info(
+            "%s fit: n_below=%d n_above=%d z_contact=%.4f raw=%.4f"
+            " delta=%.4f depress_slope=%.4f",
+            self._name, n_below, n_above, z_contact, raw_z,
+            raw_z - z_contact, depress_slope)
+
+        return z_contact
+
+    def touch_probe(self, down_min_z, pro_cnt=1):
         toolhead = self._printer.lookup_object('toolhead')
         phoming = self._printer.lookup_object('homing')
         z_floor = max(self._z_min_position, down_min_z)
         results = []
 
         for i in range(pro_cnt):
-            if i > 0:
-                cur_pos = toolhead.get_position()
-                retract_pos = list(cur_pos)
-                retract_pos[2] = cur_pos[2] + self._retract_dist
-                toolhead.manual_move(retract_pos, self._retract_speed)
-                toolhead.wait_moves()
-
             self._tare_and_arm()
+
+            collector = self._start_fit_collector()
 
             pos = list(toolhead.get_position())
             pos[2] = z_floor
             epos = phoming.probing_move(
                 self._mcu_trigger_analog, pos, self._contact_speed)
-            results.append(epos[2])
+
+            raw_z = epos[2]
+            fitted_z = self._fit_contact_z(collector, raw_z, toolhead)
+
+            self._last_raw_trigger_z = raw_z
+            self._last_fitted_contact_z = fitted_z
+            self._last_fit_delta = raw_z - fitted_z
+
+            results.append(fitted_z)
 
         if not results:
             raise self._printer.command_error(
@@ -183,6 +238,9 @@ class ZOffsetProbe:
         return {
             'last_trigger_time': trig_time,
             'is_calibrated': self._load_cell.is_calibrated(),
+            'last_raw_trigger_z': self._last_raw_trigger_z,
+            'last_fitted_contact_z': self._last_fitted_contact_z,
+            'last_fit_delta': self._last_fit_delta,
         }
 
 

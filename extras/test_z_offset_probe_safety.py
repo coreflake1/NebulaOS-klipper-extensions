@@ -248,10 +248,13 @@ class MultiTouchSourceTest(unittest.TestCase):
         self.assertGreater(tare_pos, range_pos,
                            "_tare_and_arm must be inside the pro_cnt loop")
 
-    def test_retract_between_touches(self):
-        method = _extract_method(_module_source(), 'touch_probe')
-        self.assertIn('retract_dist', method)
-        self.assertIn('manual_move', method)
+    def test_retract_via_fit(self):
+        """Retract happens inside _fit_contact_z, collecting ascent samples."""
+        fit_method = _extract_method(_module_source(), '_fit_contact_z')
+        self.assertIn('retract_dist', fit_method)
+        self.assertIn('manual_move', fit_method)
+        touch_method = _extract_method(_module_source(), 'touch_probe')
+        self.assertIn('_fit_contact_z(', touch_method)
 
     def test_no_partial_average_on_failure(self):
         """If probing_move raises on touch N, the exception propagates —
@@ -301,14 +304,34 @@ class ArchitectureInvariantsTest(unittest.TestCase):
 
     def test_upstream_only_imports(self):
         source = _module_source()
+        allowed_package_imports = ('hx71x', 'load_cell', 'probe',
+                                   'trigger_analog')
+        allowed_from_imports = {
+            'load_cell_probe': ('LCBestFit', '_lookup_z_pos',
+                                'FIT_MIN_POINTS',
+                                'ASCENT_DATA_WINDOW_SECONDS'),
+        }
         for line in source.splitlines():
-            if line.strip().startswith('from . import'):
+            stripped = line.strip()
+            if stripped.startswith('from . import'):
                 modules = [m.strip() for m in
-                           line.split('from . import')[1].split(',')]
+                           stripped.split('from . import')[1].split(',')]
                 for mod in modules:
-                    self.assertIn(mod, ('hx71x', 'load_cell', 'probe',
-                                        'trigger_analog'),
+                    self.assertIn(mod, allowed_package_imports,
                                   "unexpected import: %s" % mod)
+            elif stripped.startswith('from .') and ' import ' in stripped:
+                parts = stripped.split(' import ', 1)
+                mod_name = parts[0].replace('from .', '').strip()
+                self.assertIn(mod_name, allowed_from_imports,
+                              "unexpected from-import module: %s" % mod_name)
+                symbols = [s.strip().rstrip(')') for s in
+                           parts[1].replace('(', '').split(',')]
+                for sym in symbols:
+                    if sym:
+                        self.assertIn(
+                            sym, allowed_from_imports[mod_name],
+                            "unexpected symbol from %s: %s"
+                            % (mod_name, sym))
 
 
 # ======================================================================
@@ -373,6 +396,12 @@ class Upstream58bdParityTest(unittest.TestCase):
             'FRAC_GRAMS_CONV',
             'get_collector',
             'collect_min',
+            'collect_until',
+            'LCBestFit',
+            '_lookup_z_pos',
+            'FIT_MIN_POINTS',
+            'ASCENT_DATA_WINDOW_SECONDS',
+            'find_best_fit',
         ]
         for sym in required:
             self.assertIn(sym, self.our_source,
@@ -506,6 +535,175 @@ class PinOwnershipTest(unittest.TestCase):
         code = _module_code_lines()
         self.assertIn('sensor_class(config)', code)
         self.assertIn('HX71X_SENSOR_TYPES', code)
+
+
+# ======================================================================
+# CONTACT INTERPOLATION — LCBestFit PARITY
+# ======================================================================
+
+class ContactInterpolationSourceTest(unittest.TestCase):
+    """Verify touch_probe returns fitted contact Z (not raw trigger Z)
+    via upstream LCBestFit analysis on ascent samples."""
+
+    def test_imports_lc_best_fit(self):
+        source = _module_source()
+        self.assertIn('LCBestFit', source)
+        self.assertIn('from .load_cell_probe import', source)
+
+    def test_imports_lookup_z_pos(self):
+        source = _module_source()
+        self.assertIn('_lookup_z_pos', source)
+
+    def test_imports_fit_min_points(self):
+        source = _module_source()
+        self.assertIn('FIT_MIN_POINTS', source)
+
+    def test_imports_ascent_data_window(self):
+        source = _module_source()
+        self.assertIn('ASCENT_DATA_WINDOW_SECONDS', source)
+
+    def test_best_fit_instantiated(self):
+        code = _module_code_lines()
+        self.assertIn('LCBestFit(self._printer)', code)
+
+    def test_find_best_fit_called(self):
+        fit_method = _extract_method(_module_source(), '_fit_contact_z')
+        self.assertIn('find_best_fit(data)', fit_method)
+
+    def test_raw_trigger_z_not_appended_directly(self):
+        """touch_probe must append fitted Z, not raw epos[2]."""
+        touch_method = _extract_method(_module_source(), 'touch_probe')
+        self.assertNotIn('results.append(epos[2])', touch_method)
+        self.assertIn('results.append(fitted_z)', touch_method)
+
+    def test_fit_collector_started_before_probing_move(self):
+        touch_method = _extract_method(_module_source(), 'touch_probe')
+        collector_pos = touch_method.find('_start_fit_collector()')
+        probe_pos = touch_method.find('probing_move(')
+        self.assertGreater(probe_pos, collector_pos,
+                           "fit collector must start BEFORE probing_move")
+
+    def test_ascent_samples_collected(self):
+        fit_method = _extract_method(_module_source(), '_fit_contact_z')
+        self.assertIn('collect_until(', fit_method)
+
+    def test_ascent_window_applied(self):
+        fit_method = _extract_method(_module_source(), '_fit_contact_z')
+        self.assertIn('ASCENT_DATA_WINDOW_SECONDS', fit_method)
+        self.assertIn('ascent_start_time', fit_method)
+
+    def test_z_position_lookup_used(self):
+        fit_method = _extract_method(_module_source(), '_fit_contact_z')
+        self.assertIn('_lookup_z_pos(toolhead', fit_method)
+
+    def test_minimum_sample_guard(self):
+        fit_method = _extract_method(_module_source(), '_fit_contact_z')
+        self.assertIn('2 * FIT_MIN_POINTS', fit_method)
+        self.assertIn('insufficient ascent samples', fit_method)
+
+    def test_below_above_count_guard(self):
+        fit_method = _extract_method(_module_source(), '_fit_contact_z')
+        self.assertIn('n_below < FIT_MIN_POINTS', fit_method)
+        self.assertIn('n_above < FIT_MIN_POINTS', fit_method)
+
+    def test_sensor_errors_checked_during_ascent(self):
+        fit_method = _extract_method(_module_source(), '_fit_contact_z')
+        self.assertIn('sensor errors during ascent', fit_method)
+
+    def test_multitouch_averages_fitted_z(self):
+        """Multi-touch loop appends fitted_z, average is over fitted values."""
+        touch_method = _extract_method(_module_source(), 'touch_probe')
+        self.assertIn('_fit_contact_z(', touch_method)
+        self.assertIn('results.append(fitted_z)', touch_method)
+        self.assertIn('sum(results)', touch_method)
+
+
+class ContactInterpolationDiagnosticsTest(unittest.TestCase):
+    """Verify diagnostic values are preserved for hardware qualification."""
+
+    def test_raw_trigger_z_stored(self):
+        code = _module_code_lines()
+        self.assertIn('_last_raw_trigger_z', code)
+
+    def test_fitted_contact_z_stored(self):
+        code = _module_code_lines()
+        self.assertIn('_last_fitted_contact_z', code)
+
+    def test_fit_delta_stored(self):
+        code = _module_code_lines()
+        self.assertIn('_last_fit_delta', code)
+
+    def test_diagnostics_in_status(self):
+        method = _extract_method(_module_source(), 'get_status')
+        self.assertIn('last_raw_trigger_z', method)
+        self.assertIn('last_fitted_contact_z', method)
+        self.assertIn('last_fit_delta', method)
+
+
+class ContactInterpolationUpstreamParityTest(unittest.TestCase):
+    """Verify our fit implementation matches upstream 58bd TappingMove semantics."""
+
+    @classmethod
+    def setUpClass(cls):
+        ref_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            '..', '..', '..', '..', '_scratch', 'ref-klipper-mainline',
+            'klippy', 'extras', 'load_cell_probe.py')
+        if not os.path.exists(ref_path):
+            raise unittest.SkipTest("upstream reference source not available")
+        with open(ref_path) as f:
+            cls.upstream = f.read()
+        cls.our_source = _module_source()
+
+    def test_upstream_uses_lc_best_fit(self):
+        self.assertIn('LCBestFit', self.upstream)
+
+    def test_upstream_uses_lookup_z_pos(self):
+        self.assertIn('_lookup_z_pos', self.upstream)
+
+    def test_upstream_uses_fit_min_points(self):
+        self.assertIn('FIT_MIN_POINTS', self.upstream)
+
+    def test_upstream_uses_ascent_data_window(self):
+        self.assertIn('ASCENT_DATA_WINDOW_SECONDS', self.upstream)
+
+    def test_upstream_collects_until_move_end(self):
+        self.assertIn('collect_until(', self.upstream)
+
+    def test_upstream_replaces_epos_with_corrected_z(self):
+        self.assertIn('epos[2] = corrected_z', self.upstream)
+
+    def test_our_module_uses_same_fit_constants(self):
+        self.assertIn('FIT_MIN_POINTS', self.our_source)
+        self.assertIn('ASCENT_DATA_WINDOW_SECONDS', self.our_source)
+
+    def test_our_module_returns_fitted_not_raw(self):
+        touch_method = _extract_method(self.our_source, 'touch_probe')
+        self.assertNotIn('results.append(epos[2])', touch_method)
+        self.assertIn('results.append(fitted_z)', touch_method)
+
+
+class FitErrorPropagationBehavioralTest(unittest.TestCase):
+    """Verify that fit errors (insufficient samples, sensor errors during
+    ascent) propagate through z_compensate as calibration errors."""
+
+    def test_fit_error_aborts_calibration(self):
+        _, _, z_probe, zc = _build()
+        z_probe.touch_probe = lambda *a, **kw: (_ for _ in ()).throw(
+            fake.CommandError("insufficient ascent samples"))
+        with self.assertRaises(fake.CommandError) as ctx:
+            zc.cmd_z_offset_calibration(fake.FakeGCmd())
+        self.assertIn("insufficient", str(ctx.exception))
+        self.assertEqual(zc.calibration_state, "error")
+
+    def test_ascent_sensor_error_aborts_calibration(self):
+        _, _, z_probe, zc = _build()
+        z_probe.touch_probe = lambda *a, **kw: (_ for _ in ()).throw(
+            fake.CommandError("sensor errors during ascent"))
+        with self.assertRaises(fake.CommandError) as ctx:
+            zc.cmd_z_offset_calibration(fake.FakeGCmd())
+        self.assertIn("sensor errors", str(ctx.exception))
+        self.assertEqual(zc.calibration_state, "error")
 
 
 # ======================================================================

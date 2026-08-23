@@ -163,14 +163,21 @@ class HostKlipperPristineTest(unittest.TestCase):
 
     def test_upstream_imports_only(self):
         source = _module_source()
+        allowed_package = ('hx71x', 'load_cell', 'probe', 'trigger_analog')
+        allowed_from = {'load_cell_probe'}
         for line in source.splitlines():
-            if line.strip().startswith('from . import'):
+            stripped = line.strip()
+            if stripped.startswith('from . import'):
                 modules = [m.strip() for m in
-                           line.split('from . import')[1].split(',')]
+                           stripped.split('from . import')[1].split(',')]
                 for mod in modules:
-                    self.assertIn(mod, ('hx71x', 'load_cell', 'probe',
-                                        'trigger_analog'),
+                    self.assertIn(mod, allowed_package,
                                   "unexpected import: %s" % mod)
+            elif stripped.startswith('from .') and ' import ' in stripped:
+                mod_name = stripped.split(' import ', 1)[0] \
+                    .replace('from .', '').strip()
+                self.assertIn(mod_name, allowed_from,
+                              "unexpected from-import: %s" % mod_name)
 
 
 class ZCompensateUsesNewBackendTest(unittest.TestCase):
