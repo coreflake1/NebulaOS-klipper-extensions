@@ -62,6 +62,7 @@
     {"path": "extras/calibrate_shaper_config.py", "role": "runtime"},
     {"path": "extras/guppy_config_helper.py", "role": "runtime"},
     {"path": "extras/guppy_module_loader.py", "role": "runtime"},
+    {"path": "extras/nebulaos_z_offset_probe.py", "role": "runtime"},
 
     {"path": "extras/test_nebulaos_compat.py", "role": "test"},
     {"path": "extras/test_nebulaos_temperature_mcu.py", "role": "test"},
@@ -78,7 +79,9 @@
     {"path": "extras/test_z_compensate_offset_safety.py", "role": "test"},
     {"path": "extras/test_z_compensate_reentrancy_guard.py", "role": "test"},
     {"path": "extras/test_z_compensate_xy_reference.py", "role": "test"},
-    {"path": "extras/test_tmcstatus.py", "role": "test"}
+    {"path": "extras/test_tmcstatus.py", "role": "test"},
+    {"path": "extras/test_z_offset_probe_safety.py", "role": "test"},
+    {"path": "extras/test_z_offset_probe_coexistence.py", "role": "test"}
   ],
 
   "sensor_types": [
