@@ -7,7 +7,10 @@ import math
 import random
 import unittest
 
-import prtouch_calibration as cal
+try:
+    from . import prtouch_calibration as cal
+except ImportError:
+    import prtouch_calibration as cal
 
 
 class SelectValidChannelsTest(unittest.TestCase):

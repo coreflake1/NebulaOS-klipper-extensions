@@ -188,9 +188,10 @@ class ZCompensate:
         # v1) - not registering unless something turns out to need it.
 
     def _handle_connect(self):
-        self.prtouch = self.printer.lookup_object('prtouch_v2')
+        self.z_offset_probe = self.printer.lookup_object('nebulaos_z_offset_probe')
+        self.prtouch = self.printer.lookup_object('prtouch_v2', None)
         self.probe = self.printer.lookup_object('probe')
-        self.bed_mesh = self.printer.lookup_object('bed_mesh')
+        self.bed_mesh = self.printer.lookup_object('bed_mesh', None)
         self.home_x, self.home_y = self._resolve_z_home_xy()
 
     @staticmethod
@@ -331,7 +332,14 @@ class ZCompensate:
         """Reads HOT_START_TEMP/HOT_RUB_TEMP/HOT_END_TEMP/BED_ADDTEMP params - matches the real
         call site in custom_macro.py's CX_PRINT_LEVELING_CALIBRATION exactly. Calls
         prtouch_nozzle.clear_nozzle() directly with this section's own config (see module
-        docstring) - NOT PRTouchV2.clear_nozzle(), which is bound to [prtouch_v2]'s config."""
+        docstring) - NOT PRTouchV2.clear_nozzle(), which is bound to [prtouch_v2]'s config.
+
+        Requires [prtouch_v2] to be configured (the nozzle wipe uses PRTouch's probe for Z
+        positioning on the wipe pad). When PRTouch is not loaded (corrected architecture with
+        BLTouch primary + load-cell Z-offset only), this command fails cleanly."""
+        if self.prtouch is None:
+            raise self.printer.command_error(
+                "CRTENSE_NOZZLE_CLEAR requires [prtouch_v2] which is not configured")
         hot_start_temp = gcmd.get_float('HOT_START_TEMP', self.hot_start_temp)
         hot_rub_temp = gcmd.get_float('HOT_RUB_TEMP', self.hot_rub_temp)
         hot_end_temp = gcmd.get_float('HOT_END_TEMP', self.hot_end_temp)
@@ -340,8 +348,6 @@ class ZCompensate:
         bed_target = heater_bed.get_status(self.printer.get_reactor().monotonic())['target']
         toolhead = self.printer.lookup_object('toolhead')
         with self._probe_overrides() as probe:
-            # See the except block in cmd_z_offset_calibration for why this can't just let
-            # PrtouchProbeSafetyError/PrtouchProtocolError propagate unconverted.
             try:
                 prtouch_nozzle.clear_nozzle(
                     probe, toolhead, self.gcode, self.prtouch.heaters, self.clear_nozzle_config,
@@ -408,8 +414,8 @@ class ZCompensate:
                 'G1 F%d X%.3f Y%.3f Z%.3f' % (200 * 60, target[0], target[1], target[2]))
             toolhead.wait_moves()
 
-            with self._probe_overrides():
-                measured_z = self.prtouch.touch_probe(self.down_min_z, pro_cnt=self.pr_probe_cnt)
+            measured_z = self.z_offset_probe.touch_probe(
+                self.down_min_z, pro_cnt=self.pr_probe_cnt)
             measured_z += self.tri_expand_mm
 
             # A NaN/inf measurement can only mean a bug in the calibration math upstream
@@ -435,18 +441,6 @@ class ZCompensate:
             self.calibration_state = "error"
             self.calibration_z_offset = None
             self.calibration_error = _sanitize_calibration_error(e)
-            # 2026-08-12 (live incident, see prtouch_v2.py's _guarded() for the full story):
-            # PrtouchProbeSafetyError/PrtouchProtocolError are plain Exception subclasses, not
-            # self.printer.command_error - letting either escape this handler unconverted (the
-            # bare `raise` this replaces) reaches Klipper's gcode dispatcher as an unrecognized
-            # exception, which triggers a full emergency_stop of every MCU instead of a clean
-            # rejection of just this command. Confirmed live: touch_probe()'s own fail-closed
-            # sensor-trust guard doing exactly its job took the whole printer down. Anything
-            # else (a genuine unexpected bug) still re-raises as-is, so Klipper's own internal-
-            # error/shutdown fail-safe still applies to failure modes this doesn't recognize.
-            if isinstance(e, (prtouch_probe.PrtouchProbeSafetyError,
-                               prtouch_mcu.PrtouchProtocolError)):
-                raise self.printer.command_error(str(e))
             raise
 
         # The calibration itself has now genuinely succeeded - a real measurement was taken
