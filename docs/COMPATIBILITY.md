@@ -178,3 +178,17 @@ Advancing to a newer Klipper is a deliberate act, not a side effect of an update
    `pinned_commit` to match.
 
 Steps 1–3 are automatable. Step 4 is not, and no amount of green tests substitutes for it.
+
+## Python extension reload behaviour
+
+Klipper's `FIRMWARE_RESTART` command resets the MCU firmware and re-reads `printer.cfg`, but
+it does **not** reimport Python modules. The running Klippy process keeps already-loaded
+bytecode in memory. To pick up changes to `.py` extension files, a full service restart is
+required:
+
+    /etc/init.d/S55klipper restart
+
+This affects hardware testing of extension code changes: after editing a `.py` file on the
+device and running `FIRMWARE_RESTART`, the old code is still executing. Discovered during
+Phase 1.8 hardware qualification (gate 11) when a confirmed-correct fix appeared to have no
+effect through multiple `FIRMWARE_RESTART` cycles.

@@ -224,12 +224,12 @@ class TriggerDirectionTest(unittest.TestCase):
 # ======================================================================
 
 class ZFloorTest(unittest.TestCase):
-    """touch_probe must use the stricter of z_min_position (stepper physical
-    limit) and down_min_z (caller-provided floor)."""
+    """touch_probe must negate the positive down_min_z depth to get a Z
+    coordinate, then clamp to stepper position_min."""
 
-    def test_z_floor_uses_max_of_both_limits(self):
+    def test_z_floor_negates_down_min_z(self):
         code = _module_code_lines()
-        self.assertIn('max(self._z_min_position, down_min_z)', code)
+        self.assertIn('max(self._z_min_position, -down_min_z)', code)
 
 
 # ======================================================================

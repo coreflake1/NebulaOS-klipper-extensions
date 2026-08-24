@@ -203,9 +203,11 @@ class ZOffsetProbe:
         return z_contact
 
     def touch_probe(self, down_min_z, pro_cnt=1):
+        # down_min_z: positive depth below Z=0 (e.g. 10 means Z=-10).
+        # Negate to get the target Z coordinate, then clamp to stepper limit.
         toolhead = self._printer.lookup_object('toolhead')
         phoming = self._printer.lookup_object('homing')
-        z_floor = max(self._z_min_position, down_min_z)
+        z_floor = max(self._z_min_position, -down_min_z)
         results = []
 
         for i in range(pro_cnt):
