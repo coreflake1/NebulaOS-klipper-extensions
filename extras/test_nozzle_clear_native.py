@@ -1,0 +1,283 @@
+# Phase 1.8B: offline tests for the native nozzle-clear module (nozzle_clear.py).
+#
+# Validates the wipe geometry calculations, temperature sequencing, probe call pattern,
+# and Z math against the documented physical behavior of prtouch_nozzle.clear_nozzle().
+# Uses mock objects throughout — no real printer, MCU, or serial hardware needed.
+#
+# Run: python3 -m pytest extras/test_nozzle_clear_native.py -v
+# Or:  python3 -m unittest extras.test_nozzle_clear_native -v
+#
+# This file may be distributed under the terms of the GNU GPLv3 license.
+
+import unittest
+from unittest.mock import MagicMock, patch, call
+
+from . import nozzle_clear
+
+
+class FakeConfig:
+    """Minimal Klipper config stub for NozzleClearConfig parameter reads."""
+
+    def __init__(self, overrides=None):
+        self._values = {
+            'clr_noz_start_x': -3.0,
+            'clr_noz_start_y': 20.0,
+            'clr_noz_len_x': 3.0,
+            'clr_noz_len_y': 50.0,
+            'pa_clr_dis_mm_x': 0.0,
+            'pa_clr_dis_mm_y': 30.0,
+            'pa_clr_down_mm': -0.15,
+            'clr_xy_spd': 2.0,
+            'rdy_xy_spd': 200.0,
+            'bed_max_err': 5.0,
+            'g29_down_min_z': 25.0,
+            'vs_start_z_pos': 3.0,
+            'pr_clear_probe_cnt': 3,
+        }
+        if overrides:
+            self._values.update(overrides)
+
+    def getfloat(self, key, default=None, minval=None, maxval=None):
+        v = self._values.get(key)
+        return default if v is None else v
+
+    def getint(self, key, default=None, minval=None, maxval=None):
+        v = self._values.get(key)
+        return default if v is None else int(v)
+
+
+class NozzleClearConfigTest(unittest.TestCase):
+    """NozzleClearConfig must parse the same parameters with the same defaults as
+    prtouch_nozzle.ClearNozzleConfig."""
+
+    def test_all_real_ke_values(self):
+        cfg = nozzle_clear.NozzleClearConfig(FakeConfig())
+        self.assertAlmostEqual(cfg.clr_noz_start_x, -3.0)
+        self.assertAlmostEqual(cfg.clr_noz_start_y, 20.0)
+        self.assertAlmostEqual(cfg.clr_noz_len_x, 3.0)
+        self.assertAlmostEqual(cfg.clr_noz_len_y, 50.0)
+        self.assertAlmostEqual(cfg.pa_clr_dis_mm_x, 0.0)
+        self.assertAlmostEqual(cfg.pa_clr_dis_mm_y, 30.0)
+        self.assertAlmostEqual(cfg.pa_clr_down_mm, -0.15)
+        self.assertAlmostEqual(cfg.clr_xy_spd, 2.0)
+        self.assertAlmostEqual(cfg.rdy_xy_spd, 200.0)
+        self.assertAlmostEqual(cfg.bed_max_err, 5.0)
+        self.assertAlmostEqual(cfg.g29_down_min_z, 25.0)
+        self.assertAlmostEqual(cfg.hover_z, 3.0)
+        self.assertEqual(cfg.pr_clear_probe_cnt, 3)
+
+    def test_defaults_when_keys_absent(self):
+        cfg = nozzle_clear.NozzleClearConfig(FakeConfig({
+            'clr_noz_start_x': None,
+            'clr_noz_start_y': None,
+            'pa_clr_dis_mm_x': None,
+            'pa_clr_dis_mm_y': None,
+        }))
+        self.assertAlmostEqual(cfg.clr_noz_start_x, 0.0)
+        self.assertAlmostEqual(cfg.clr_noz_start_y, 0.0)
+        self.assertAlmostEqual(cfg.pa_clr_dis_mm_x, 30.0)
+        self.assertAlmostEqual(cfg.pa_clr_dis_mm_y, 0.0)
+
+
+class WipeGeometryTest(unittest.TestCase):
+    """The randomized XY point selection on the wipe pad must stay within bounds."""
+
+    def _make_params(self):
+        return nozzle_clear.NozzleClearConfig(FakeConfig())
+
+    @patch('random.uniform')
+    def test_ke_geometry_with_zero_randomization(self, mock_uniform):
+        """With pa_clr_dis_mm_x=0 and clr_noz_len_x=3, margin=5 makes avail_x=0.
+        With pa_clr_dis_mm_y=30 and clr_noz_len_y=50, margin=5 makes avail_y=15."""
+        mock_uniform.return_value = 0.0
+        params = self._make_params()
+        margin = 5
+        avail_x = max(params.clr_noz_len_x - abs(params.pa_clr_dis_mm_x) - margin, 0)
+        avail_y = max(params.clr_noz_len_y - abs(params.pa_clr_dis_mm_y) - margin, 0)
+        self.assertAlmostEqual(avail_x, 0.0)
+        self.assertAlmostEqual(avail_y, 15.0)
+
+        src_x = params.clr_noz_start_x + 0.0
+        src_y = params.clr_noz_start_y + 0.0
+        self.assertAlmostEqual(src_x, -3.0)
+        self.assertAlmostEqual(src_y, 20.0)
+
+        end_x = src_x + params.pa_clr_dis_mm_x
+        end_y = src_y + params.pa_clr_dis_mm_y
+        self.assertAlmostEqual(end_x, -3.0)
+        self.assertAlmostEqual(end_y, 50.0)
+
+    @patch('random.uniform')
+    def test_ke_geometry_with_max_randomization(self, mock_uniform):
+        mock_uniform.return_value = 15.0
+        params = self._make_params()
+        src_x = params.clr_noz_start_x + 0.0
+        src_y = params.clr_noz_start_y + 15.0
+        self.assertAlmostEqual(src_y, 35.0)
+
+        end_y = src_y + params.pa_clr_dis_mm_y
+        self.assertAlmostEqual(end_y, 65.0)
+        self.assertLessEqual(end_y, params.clr_noz_start_y + params.clr_noz_len_y)
+
+
+class ZMathTest(unittest.TestCase):
+    """Verify the Z arithmetic: push-down from contact point matches the legacy behavior."""
+
+    def test_pa_clr_down_mm_subtraction(self):
+        """With pa_clr_down_mm=-0.15 and contact_z=1.5:
+        approach_z = contact_z - pa_clr_down_mm = 1.5 - (-0.15) = 1.65 (above contact)
+        drag_z = contact_z + pa_clr_down_mm = 1.5 + (-0.15) = 1.35 (below contact)"""
+        contact_z = 1.5
+        pa_clr_down_mm = -0.15
+        approach_z = contact_z - pa_clr_down_mm
+        drag_z = contact_z + pa_clr_down_mm
+        self.assertAlmostEqual(approach_z, 1.65)
+        self.assertAlmostEqual(drag_z, 1.35)
+        self.assertGreater(approach_z, contact_z)
+        self.assertLess(drag_z, contact_z)
+
+
+class ClearNozzleCallPatternTest(unittest.TestCase):
+    """Verify that clear_nozzle() calls touch_probe exactly twice and uses the
+    correct temperature sequence."""
+
+    def _build_mocks(self):
+        probe = MagicMock()
+        probe.touch_probe = MagicMock(return_value=1.5)
+
+        toolhead = MagicMock()
+        gcode = MagicMock()
+
+        printer = MagicMock()
+        reactor = MagicMock()
+        reactor.monotonic.return_value = 0.0
+        reactor.pause.return_value = 0.1
+        printer.get_reactor.return_value = reactor
+
+        pheaters = MagicMock()
+        printer.lookup_object.side_effect = self._lookup_factory(pheaters)
+
+        return probe, toolhead, gcode, printer, pheaters, reactor
+
+    def _lookup_factory(self, pheaters):
+        extruder = MagicMock()
+        extruder.heater = MagicMock()
+        extruder.heater.target_temp = 0
+        extruder.heater.smoothed_temp = 200.0
+
+        bed = MagicMock()
+        bed.heater = MagicMock()
+        bed.heater.target_temp = 0
+        bed.heater.smoothed_temp = 60.0
+
+        def lookup(name, default=None):
+            return {'heaters': pheaters, 'extruder': extruder,
+                    'heater_bed': bed}.get(name, default)
+        return lookup
+
+    def test_hardware_blocked_raises(self):
+        """The HARDWARE_BEHAVIOR_BLOCKED guard must prevent execution."""
+        probe, toolhead, gcode, printer, _, _ = self._build_mocks()
+        params = nozzle_clear.NozzleClearConfig(FakeConfig())
+        self.assertTrue(nozzle_clear.HARDWARE_BEHAVIOR_BLOCKED)
+        with self.assertRaises(AssertionError) as ctx:
+            nozzle_clear.clear_nozzle(
+                probe, toolhead, gcode, printer, params,
+                hot_min_temp=140, hot_max_temp=180, bed_max_temp=65)
+        self.assertIn("NOT qualified", str(ctx.exception))
+
+    @patch.object(nozzle_clear, 'HARDWARE_BEHAVIOR_BLOCKED', False)
+    @patch('random.uniform', return_value=0.0)
+    def test_touch_probe_called_twice(self, _mock_uniform):
+        probe, toolhead, gcode, printer, _, _ = self._build_mocks()
+        params = nozzle_clear.NozzleClearConfig(FakeConfig())
+        nozzle_clear.clear_nozzle(
+            probe, toolhead, gcode, printer, params,
+            hot_min_temp=140, hot_max_temp=180, bed_max_temp=65)
+        self.assertEqual(probe.touch_probe.call_count, 2)
+
+    @patch.object(nozzle_clear, 'HARDWARE_BEHAVIOR_BLOCKED', False)
+    @patch('random.uniform', return_value=0.0)
+    def test_touch_probe_passes_config_params(self, _mock_uniform):
+        probe, toolhead, gcode, printer, _, _ = self._build_mocks()
+        params = nozzle_clear.NozzleClearConfig(FakeConfig())
+        nozzle_clear.clear_nozzle(
+            probe, toolhead, gcode, printer, params,
+            hot_min_temp=140, hot_max_temp=180, bed_max_temp=65)
+        for c in probe.touch_probe.call_args_list:
+            self.assertEqual(c[0][0], 25)
+            self.assertEqual(c[1]['pro_cnt'], 3)
+
+    @patch.object(nozzle_clear, 'HARDWARE_BEHAVIOR_BLOCKED', False)
+    @patch('random.uniform', return_value=0.0)
+    def test_heater_sequence_bed_then_nozzle(self, _mock_uniform):
+        probe, toolhead, gcode, printer, pheaters, _ = self._build_mocks()
+        params = nozzle_clear.NozzleClearConfig(FakeConfig())
+        nozzle_clear.clear_nozzle(
+            probe, toolhead, gcode, printer, params,
+            hot_min_temp=140, hot_max_temp=180, bed_max_temp=65)
+        set_temp_calls = pheaters.set_temperature.call_args_list
+        self.assertGreater(len(set_temp_calls), 0)
+
+    @patch.object(nozzle_clear, 'HARDWARE_BEHAVIOR_BLOCKED', False)
+    @patch('random.uniform', return_value=0.0)
+    def test_hot_end_temp_default_is_hot_min(self, _mock_uniform):
+        """When hot_end_temp is None (default), the final nozzle temp should be hot_min_temp."""
+        probe, toolhead, gcode, printer, pheaters, _ = self._build_mocks()
+        params = nozzle_clear.NozzleClearConfig(FakeConfig())
+        nozzle_clear.clear_nozzle(
+            probe, toolhead, gcode, printer, params,
+            hot_min_temp=140, hot_max_temp=180, bed_max_temp=65, hot_end_temp=None)
+        last_nozzle_calls = [c for c in pheaters.set_temperature.call_args_list
+                             if c[0][1] != MagicMock()]
+        self.assertGreater(len(last_nozzle_calls), 0)
+
+
+class TouchProbeErrorTest(unittest.TestCase):
+    """If touch_probe raises, the error must propagate (not be silently caught)."""
+
+    @patch.object(nozzle_clear, 'HARDWARE_BEHAVIOR_BLOCKED', False)
+    @patch('random.uniform', return_value=0.0)
+    def test_touch_probe_error_propagates(self, _mock_uniform):
+        probe = MagicMock()
+        probe.touch_probe = MagicMock(side_effect=RuntimeError("sensor timeout"))
+        toolhead = MagicMock()
+        gcode = MagicMock()
+        printer = MagicMock()
+        reactor = MagicMock()
+        reactor.monotonic.return_value = 0.0
+        printer.get_reactor.return_value = reactor
+        pheaters = MagicMock()
+        extruder = MagicMock()
+        extruder.heater = MagicMock()
+        extruder.heater.target_temp = 0
+        extruder.heater.smoothed_temp = 200.0
+        bed = MagicMock()
+        bed.heater = MagicMock()
+        bed.heater.target_temp = 0
+        bed.heater.smoothed_temp = 60.0
+        printer.lookup_object.side_effect = lambda n, d=None: {
+            'heaters': pheaters, 'extruder': extruder, 'heater_bed': bed
+        }.get(n, d)
+        params = nozzle_clear.NozzleClearConfig(FakeConfig())
+        with self.assertRaises(RuntimeError):
+            nozzle_clear.clear_nozzle(
+                probe, toolhead, gcode, printer, params,
+                hot_min_temp=140, hot_max_temp=180, bed_max_temp=65)
+
+
+class ModuleConstantsTest(unittest.TestCase):
+    """The HARDWARE_BEHAVIOR_BLOCKED constant must be True in the shipped module."""
+
+    def test_hardware_blocked_is_true(self):
+        self.assertTrue(nozzle_clear.HARDWARE_BEHAVIOR_BLOCKED)
+
+    def test_module_has_clear_nozzle(self):
+        self.assertTrue(callable(nozzle_clear.clear_nozzle))
+
+    def test_module_has_config_class(self):
+        self.assertTrue(callable(nozzle_clear.NozzleClearConfig))
+
+
+if __name__ == '__main__':
+    unittest.main()

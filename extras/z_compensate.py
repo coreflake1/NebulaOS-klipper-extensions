@@ -44,6 +44,11 @@ from . import prtouch_mcu
 from . import prtouch_nozzle
 from . import prtouch_probe
 
+# Phase 1.8B: native nozzle-clear replacement (NOT YET QUALIFIED FOR HARDWARE USE).
+# When hardware-qualified, this import replaces the prtouch_nozzle dependency for
+# CRTENSE_NOZZLE_CLEAR. See extras/nozzle_clear.py and extras/PRTOUCH_REMOVAL_PLAN.md.
+# from . import nozzle_clear
+
 #: Structured status contract, version 1 - see docs/z_compensate_status_api.md. Consumed by
 #: GuppyScreen's recalibration wizard via printer.objects.subscribe, replacing its previous
 #: dependence on parsing this module's human-readable gcode response text (the "z_offset:"/
@@ -83,6 +88,13 @@ class ZCompensate:
         # ClearNozzleConfig docstring (confirmed live 2026-08-05: a lazy config.get*() read
         # inside a gcode-command handler is too late, Klipper hard-errors at startup instead).
         self.clear_nozzle_config = prtouch_nozzle.ClearNozzleConfig(config)
+
+        # Phase 1.8B: native nozzle-clear config (NOT YET QUALIFIED).
+        # When the native path is hardware-qualified, uncomment this and switch
+        # cmd_nozzle_clear() to use nozzle_clear.clear_nozzle() instead of
+        # prtouch_nozzle.clear_nozzle(). NozzleClearConfig reads the same config keys
+        # with the same defaults, so no printer.cfg changes are needed.
+        # self.native_clear_nozzle_config = nozzle_clear.NozzleClearConfig(config)
         self.prtouch = None
         self.probe = None
         self.bed_mesh = None
@@ -336,7 +348,41 @@ class ZCompensate:
 
         Requires [prtouch_v2] to be configured (the nozzle wipe uses PRTouch's probe for Z
         positioning on the wipe pad). When PRTouch is not loaded (corrected architecture with
-        BLTouch primary + load-cell Z-offset only), this command fails cleanly."""
+        BLTouch primary + load-cell Z-offset only), this command fails cleanly.
+
+        Phase 1.8B replacement plan: when nozzle_clear.py is hardware-qualified, the native
+        path below replaces the PRTouch path. The native path uses
+        nebulaos_z_offset_probe.touch_probe() (upstream Klipper's HX711/LoadCell/trigger_analog)
+        instead of PRTouch's custom MCU commands. Same physical wipe sequence, same config keys.
+        Once switched:
+          - [prtouch_v2] is no longer required for this command
+          - The _probe_overrides() context manager is no longer needed
+          - prtouch_mcu/prtouch_probe/prtouch_nozzle imports can be removed
+        See extras/nozzle_clear.py and extras/PRTOUCH_REMOVAL_PLAN.md."""
+
+        # ---- Phase 1.8B: native nozzle-clear path (NOT YET QUALIFIED) ----
+        # When hardware-qualified, uncomment this block and remove the PRTouch path below.
+        # The native path eliminates the [prtouch_v2] requirement entirely.
+        #
+        # if nozzle_clear.HARDWARE_BEHAVIOR_BLOCKED:
+        #     raise self.printer.command_error(
+        #         "CRTENSE_NOZZLE_CLEAR native path is not yet hardware-qualified")
+        # hot_start_temp = gcmd.get_float('HOT_START_TEMP', self.hot_start_temp)
+        # hot_rub_temp = gcmd.get_float('HOT_RUB_TEMP', self.hot_rub_temp)
+        # hot_end_temp = gcmd.get_float('HOT_END_TEMP', self.hot_end_temp)
+        # bed_add_temp = gcmd.get_float('BED_ADDTEMP', self.bed_add_temp)
+        # heater_bed = self.printer.lookup_object('heater_bed')
+        # bed_target = heater_bed.get_status(
+        #     self.printer.get_reactor().monotonic())['target']
+        # toolhead = self.printer.lookup_object('toolhead')
+        # nozzle_clear.clear_nozzle(
+        #     self.z_offset_probe, toolhead, self.gcode, self.printer,
+        #     self.native_clear_nozzle_config,
+        #     hot_start_temp, hot_rub_temp, bed_target + bed_add_temp,
+        #     hot_end_temp=hot_end_temp)
+        # return
+        # ---- end native path ----
+
         if self.prtouch is None:
             raise self.printer.command_error(
                 "CRTENSE_NOZZLE_CLEAR requires [prtouch_v2] which is not configured")
