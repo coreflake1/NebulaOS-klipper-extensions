@@ -16,7 +16,6 @@
 import unittest
 
 from . import prtouch_test_support as fake
-from . import prtouch_v2
 from . import z_compensate
 
 
@@ -37,10 +36,7 @@ def _build(homing_params_variables=None, mesh_min=(5., 10.), mesh_max=(215., 215
     macro); a dict registers it with exactly those variables, matching either a real
     home_x/home_y-defining macro or one that (like a bare _HOMING_PARAMS with unrelated
     variables) doesn't."""
-    printer, mcu, pins, values = fake.build_environment(mesh_min=mesh_min, mesh_max=mesh_max)
-    prtouch_config = fake.make_prtouch_v2_config(printer, pins, values)
-    pv2 = prtouch_v2.PRTouchV2(prtouch_config)
-    printer.add_object('prtouch_v2', pv2)
+    printer, mcu, _pins, _values = fake.build_environment(mesh_min=mesh_min, mesh_max=mesh_max)
 
     if homing_params_variables is not None:
         printer.add_object('gcode_macro _HOMING_PARAMS',
@@ -50,7 +46,6 @@ def _build(homing_params_variables=None, mesh_min=(5., 10.), mesh_max=(215., 215
     zc = z_compensate.ZCompensate(zc_config)
 
     fake.connect(printer, mcu)
-    prtouch_config.assert_all_consumed()
     zc_config.assert_all_consumed()
     z_offset_probe = printer.lookup_object('nebulaos_z_offset_probe')
     return printer, mcu, z_offset_probe, zc
@@ -161,9 +156,7 @@ class ConfiguredMeshBoundsSourceTest(unittest.TestCase):
         # No _HOMING_PARAMS macro and no [bed_mesh] section: there is no source at all for a
         # calibration target, so this must raise with an actionable message rather than
         # silently calibrating against (0, 0).
-        printer, mcu, pins, values = fake.build_environment()
-        prtouch_config = fake.make_prtouch_v2_config(printer, pins, values)
-        printer.add_object('prtouch_v2', prtouch_v2.PRTouchV2(prtouch_config))
+        printer, mcu, _pins, _values = fake.build_environment()
         zc_config = fake.make_z_compensate_config(
             printer, dict(fake.REAL_Z_COMPENSATE_CONFIG), bed_mesh_values={})
         zc = z_compensate.ZCompensate(zc_config)
