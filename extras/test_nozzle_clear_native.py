@@ -175,11 +175,15 @@ class ClearNozzleCallPatternTest(unittest.TestCase):
                     'heater_bed': bed}.get(name, default)
         return lookup
 
+    @patch.object(nozzle_clear, 'HARDWARE_BEHAVIOR_BLOCKED', True)
     def test_hardware_blocked_raises(self):
-        """The HARDWARE_BEHAVIOR_BLOCKED guard must prevent execution."""
+        """The HARDWARE_BEHAVIOR_BLOCKED guard must prevent execution whenever it's True -
+        tested here with an explicit patch rather than the module's own current value,
+        since the Phase 1.8B integration candidate intentionally ships this flag as False
+        (source-level activation, pending owner-attended hardware qualification - see
+        ModuleConstantsTest.test_hardware_behavior_activated_for_integration_candidate)."""
         probe, toolhead, gcode, printer, _, _ = self._build_mocks()
         params = nozzle_clear.NozzleClearConfig(FakeConfig())
-        self.assertTrue(nozzle_clear.HARDWARE_BEHAVIOR_BLOCKED)
         with self.assertRaises(AssertionError) as ctx:
             nozzle_clear.clear_nozzle(
                 probe, toolhead, gcode, printer, params,
@@ -267,10 +271,13 @@ class TouchProbeErrorTest(unittest.TestCase):
 
 
 class ModuleConstantsTest(unittest.TestCase):
-    """The HARDWARE_BEHAVIOR_BLOCKED constant must be True in the shipped module."""
+    """Phase 1.8B integration candidate: HARDWARE_BEHAVIOR_BLOCKED is intentionally False
+    in the shipped module (source-level activation - see nozzle_clear.py's own module
+    docstring). This is NOT a claim that hardware qualification has happened; it's the
+    prerequisite source state for the owner-attended hardware gate to be run at all."""
 
-    def test_hardware_blocked_is_true(self):
-        self.assertTrue(nozzle_clear.HARDWARE_BEHAVIOR_BLOCKED)
+    def test_hardware_behavior_activated_for_integration_candidate(self):
+        self.assertFalse(nozzle_clear.HARDWARE_BEHAVIOR_BLOCKED)
 
     def test_module_has_clear_nozzle(self):
         self.assertTrue(callable(nozzle_clear.clear_nozzle))
@@ -294,7 +301,6 @@ class ModuleConstantsTest(unittest.TestCase):
             "clear_nozzle() must not gate hardware use with a bare `assert` statement - "
             "assert is stripped under python -O/-OO, silently disabling this safety gate")
         self.assertIn('raise AssertionError', source)
-        self.assertTrue(nozzle_clear.HARDWARE_BEHAVIOR_BLOCKED)
 
 
 class BedMeshSuspensionTest(unittest.TestCase):
