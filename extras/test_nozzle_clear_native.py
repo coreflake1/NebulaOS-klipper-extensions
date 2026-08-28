@@ -278,6 +278,133 @@ class ModuleConstantsTest(unittest.TestCase):
     def test_module_has_config_class(self):
         self.assertTrue(callable(nozzle_clear.NozzleClearConfig))
 
+    def test_hardware_gate_is_not_a_bare_assert(self):
+        """Offline-review regression test (2026-08-28): the HARDWARE_BEHAVIOR_BLOCKED gate
+        at the top of clear_nozzle() must not rely on a bare `assert` statement, because
+        CPython strips every `assert` when run with -O/-OO or PYTHONOPTIMIZE set, which
+        would silently disable this hardware-safety gate. Checked at the source level
+        (bytecode inspection would be Python-version-fragile): the function's source must
+        not contain a bare `assert` on HARDWARE_BEHAVIOR_BLOCKED, and must instead use an
+        explicit, unconditionally-evaluated `if: raise` that a real `-O` run cannot strip.
+        """
+        import inspect
+        source = inspect.getsource(nozzle_clear.clear_nozzle)
+        self.assertNotIn(
+            'assert not HARDWARE_BEHAVIOR_BLOCKED', source,
+            "clear_nozzle() must not gate hardware use with a bare `assert` statement - "
+            "assert is stripped under python -O/-OO, silently disabling this safety gate")
+        self.assertIn('raise AssertionError', source)
+        self.assertTrue(nozzle_clear.HARDWARE_BEHAVIOR_BLOCKED)
+
+
+class BedMeshSuspensionTest(unittest.TestCase):
+    """Offline-review regression test (2026-08-28): clear_nozzle()'s two wipe-pad touch
+    probes must suspend any active bed mesh for the duration of each touch_probe() call,
+    matching prtouch_probe.PrtouchProbe.touch_probe()'s own behavior - a loaded mesh
+    applies a Z-compensation transform to every toolhead move, which would skew a raw
+    touch-probe reading taken at the wipe pad's own XY point."""
+
+    def _build_mocks(self, bed_mesh=None):
+        probe = MagicMock()
+        probe.touch_probe = MagicMock(return_value=1.5)
+
+        toolhead = MagicMock()
+        gcode = MagicMock()
+
+        printer = MagicMock()
+        reactor = MagicMock()
+        reactor.monotonic.return_value = 0.0
+        reactor.pause.return_value = 0.1
+        printer.get_reactor.return_value = reactor
+
+        pheaters = MagicMock()
+        extruder = MagicMock()
+        extruder.heater = MagicMock()
+        extruder.heater.target_temp = 0
+        extruder.heater.smoothed_temp = 200.0
+
+        bed = MagicMock()
+        bed.heater = MagicMock()
+        bed.heater.target_temp = 0
+        bed.heater.smoothed_temp = 60.0
+
+        def lookup(name, default=None):
+            return {'heaters': pheaters, 'extruder': extruder,
+                    'heater_bed': bed, 'bed_mesh': bed_mesh}.get(name, default)
+        printer.lookup_object.side_effect = lookup
+
+        return probe, toolhead, gcode, printer
+
+    @patch.object(nozzle_clear, 'HARDWARE_BEHAVIOR_BLOCKED', False)
+    @patch('random.uniform', return_value=0.0)
+    def test_no_bed_mesh_configured_is_a_no_op(self, _mock_uniform):
+        """When [bed_mesh] isn't configured at all (lookup_object returns None), the
+        routine must run without touching any mesh API - nothing to suspend/restore."""
+        probe, toolhead, gcode, printer = self._build_mocks(bed_mesh=None)
+        params = nozzle_clear.NozzleClearConfig(FakeConfig())
+        nozzle_clear.clear_nozzle(
+            probe, toolhead, gcode, printer, params,
+            hot_min_temp=140, hot_max_temp=180, bed_max_temp=65)
+        self.assertEqual(probe.touch_probe.call_count, 2)
+
+    @patch.object(nozzle_clear, 'HARDWARE_BEHAVIOR_BLOCKED', False)
+    @patch('random.uniform', return_value=0.0)
+    def test_active_mesh_is_suspended_around_each_touch_probe(self, _mock_uniform):
+        bed_mesh = MagicMock()
+        saved = object()  # sentinel identifying "the mesh that was active on entry"
+        bed_mesh.get_mesh.return_value = saved
+
+        probe, toolhead, gcode, printer = self._build_mocks(bed_mesh=bed_mesh)
+        params = nozzle_clear.NozzleClearConfig(FakeConfig())
+        nozzle_clear.clear_nozzle(
+            probe, toolhead, gcode, printer, params,
+            hot_min_temp=140, hot_max_temp=180, bed_max_temp=65)
+
+        # Suspended (set_mesh(None)) and restored (set_mesh(saved)) once per touch_probe
+        # call - two touches this routine makes.
+        self.assertEqual(bed_mesh.set_mesh.call_args_list,
+                          [call(None), call(saved), call(None), call(saved)])
+        self.assertEqual(probe.touch_probe.call_count, 2)
+
+    @patch.object(nozzle_clear, 'HARDWARE_BEHAVIOR_BLOCKED', False)
+    @patch('random.uniform', return_value=0.0)
+    def test_mesh_restored_even_if_touch_probe_raises(self, _mock_uniform):
+        """The mesh must be restored on the error exit path too, not just on success -
+        otherwise a failed wipe-pad touch would silently leave the mesh disabled for
+        every subsequent print move."""
+        bed_mesh = MagicMock()
+        saved = object()
+        bed_mesh.get_mesh.return_value = saved
+
+        probe, toolhead, gcode, printer = self._build_mocks(bed_mesh=bed_mesh)
+        probe.touch_probe = MagicMock(side_effect=RuntimeError("sensor timeout"))
+        params = nozzle_clear.NozzleClearConfig(FakeConfig())
+        with self.assertRaises(RuntimeError):
+            nozzle_clear.clear_nozzle(
+                probe, toolhead, gcode, printer, params,
+                hot_min_temp=140, hot_max_temp=180, bed_max_temp=65)
+
+        # One attempted touch_probe call, one suspend, one restore - the mesh must not be
+        # left disabled after the exception propagates.
+        self.assertEqual(bed_mesh.set_mesh.call_args_list, [call(None), call(saved)])
+
+    @patch.object(nozzle_clear, 'HARDWARE_BEHAVIOR_BLOCKED', False)
+    @patch('random.uniform', return_value=0.0)
+    def test_no_mesh_currently_loaded_does_not_call_set_mesh(self, _mock_uniform):
+        """[bed_mesh] is configured but no mesh is currently loaded (get_mesh() returns
+        None, e.g. before the first BED_MESH_CALIBRATE of a session) - nothing to
+        suspend, so set_mesh() should never be called at all."""
+        bed_mesh = MagicMock()
+        bed_mesh.get_mesh.return_value = None
+
+        probe, toolhead, gcode, printer = self._build_mocks(bed_mesh=bed_mesh)
+        params = nozzle_clear.NozzleClearConfig(FakeConfig())
+        nozzle_clear.clear_nozzle(
+            probe, toolhead, gcode, printer, params,
+            hot_min_temp=140, hot_max_temp=180, bed_max_temp=65)
+
+        bed_mesh.set_mesh.assert_not_called()
+
 
 if __name__ == '__main__':
     unittest.main()

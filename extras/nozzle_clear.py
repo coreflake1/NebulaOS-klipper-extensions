@@ -129,16 +129,52 @@ def clear_nozzle(z_offset_probe, toolhead, gcode, printer, params,
     `hot_end_temp`: final nozzle temp to settle at once the wipe finishes, defaulting to
     hot_min_temp when omitted (matching prtouch_nozzle.clear_nozzle's behavior)."""
 
-    assert not HARDWARE_BEHAVIOR_BLOCKED, (
-        "nozzle_clear.clear_nozzle() is NOT qualified for hardware use. "
-        "HARDWARE_BEHAVIOR_BLOCKED must be set to False after hardware qualification "
-        "before this code path can be activated.")
+    # Offline-review fix (2026-08-28): this used to be a bare `assert`. A bare assert is
+    # NOT a reliable hardware-safety gate - CPython strips every `assert` statement
+    # whenever the interpreter runs with -O/-OO (or PYTHONOPTIMIZE is set), which would
+    # silently turn this into a no-op and let an unqualified probe pipeline drive real
+    # hardware with no gate at all. Rewritten as an explicit, unconditionally-evaluated
+    # check that raises the same AssertionError/message (so existing callers/tests that
+    # match on AssertionError keep working) without depending on assert-stripping being
+    # disabled somewhere upstream.
+    if HARDWARE_BEHAVIOR_BLOCKED:
+        raise AssertionError(
+            "nozzle_clear.clear_nozzle() is NOT qualified for hardware use. "
+            "HARDWARE_BEHAVIOR_BLOCKED must be set to False after hardware qualification "
+            "before this code path can be activated.")
 
     # Look up heater objects directly from the printer
     reactor = printer.get_reactor()
     pheaters = printer.lookup_object('heaters')
     extruder_heater = printer.lookup_object('extruder').heater
     bed_heater = printer.lookup_object('heater_bed').heater
+
+    # Offline-review fix (2026-08-28): prtouch_probe.PrtouchProbe.touch_probe() suspends
+    # any active bed mesh for the duration of each raw probe descent (see its own
+    # docstring: "a loaded mesh applies a Z-compensation transform to every toolhead
+    # move, which would skew a raw touch-probe reading taken at a specific mesh-relative
+    # point"). nebulaos_z_offset_probe.ZOffsetProbe.touch_probe() has no equivalent - it
+    # was hardware-qualified (Phase 1.8/1.8A) only for Z_OFFSET_CALIBRATION's own probe
+    # point (self.home_x/home_y, inside the homed/meshed area), not for this module's two
+    # wipe-pad points, which sit off the print area (e.g. clr_noz_start_x=-3) and are
+    # exactly the case a stale/active mesh from a previous print could still be loaded
+    # for. Reproducing the same suspend/restore here - around each touch_probe() call
+    # only, matching PRTouch's own per-call scope, not the whole clear_nozzle() sequence
+    # (the wipe drag moves below still go through the ordinary gcode move transform in
+    # both the old and new backends, so that part stays intentionally at parity) - closes
+    # this gap without touching nebulaos_z_offset_probe.py itself, which stays exactly as
+    # already hardware-qualified for its other caller.
+    bed_mesh = printer.lookup_object('bed_mesh', None)
+
+    def _touch_probe_no_mesh(down_min_z, pro_cnt):
+        saved_mesh = bed_mesh.get_mesh() if bed_mesh is not None else None
+        if saved_mesh is not None:
+            bed_mesh.set_mesh(None)
+        try:
+            return z_offset_probe.touch_probe(down_min_z, pro_cnt=pro_cnt)
+        finally:
+            if saved_mesh is not None:
+                bed_mesh.set_mesh(saved_mesh)
 
     # Unpack config params (same set as prtouch_nozzle.clear_nozzle)
     clr_noz_start_x = params.clr_noz_start_x
@@ -174,13 +210,11 @@ def clear_nozzle(z_offset_probe, toolhead, gcode, printer, params,
 
     # Step 4: move to src point, touch-probe Z
     _move(gcode, toolhead, src_pos, rdy_xy_spd)
-    src_pos[2] = z_offset_probe.touch_probe(g29_down_min_z,
-                                             pro_cnt=pr_clear_probe_cnt)
+    src_pos[2] = _touch_probe_no_mesh(g29_down_min_z, pr_clear_probe_cnt)
 
     # Step 5: move to end point, touch-probe Z
     _move(gcode, toolhead, end_pos, rdy_xy_spd)
-    end_pos[2] = z_offset_probe.touch_probe(g29_down_min_z,
-                                             pro_cnt=pr_clear_probe_cnt)
+    end_pos[2] = _touch_probe_no_mesh(g29_down_min_z, pr_clear_probe_cnt)
 
     # Step 6: return to src at hover height, then lower to wipe approach position
     # (contact_z - pa_clr_down_mm: with pa_clr_down_mm=-0.15, this is contact_z + 0.15,
