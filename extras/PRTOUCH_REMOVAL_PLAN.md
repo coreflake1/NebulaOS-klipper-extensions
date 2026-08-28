@@ -3,6 +3,75 @@
 Phase 1.8B Workstream D: dependency analysis and removal sequence for the
 Creality PRTouch custom MCU protocol from NebulaOS.
 
+## STATUS: REMOVAL COMPLETE (source level) — 2026-08-28
+
+All PRTouch production modules and their dedicated test files have been
+deleted from this repository. `prtouch_test_support.py` was kept (contrary
+to this document's original Step 6 below) because it turned out to be
+shared, generic offline test infrastructure for several non-PRTouch test
+files (`test_z_offset_probe_safety.py`, `test_z_compensate_offset_safety.py`,
+`test_z_compensate_reentrancy_guard.py`, `test_z_compensate_xy_reference.py`,
+`test_z_offset_probe_coexistence.py`) that this plan's original dependency
+table did not account for — see "Corrections to the original analysis"
+below.
+
+**This was a source-level removal, not a hardware-qualified one.** This
+plan's original Step 1 ("Qualify nozzle_clear.py on hardware... Set
+HARDWARE_BEHAVIOR_BLOCKED=False") was NOT followed as gate-before-removal.
+Instead, per the Phase 1.8B integration-candidate decision record
+(`_project/missions/phase1.8b-pre-build-review.md` and its follow-up in the
+NebulaOS workspace), `HARDWARE_BEHAVIOR_BLOCKED` was flipped to `False` as a
+source-activation-only step, and PRTouch was removed on the strength of that
+plus full offline test coverage — real physical wipe-pad hardware
+qualification of `nozzle_clear.py` has still NOT happened as of this
+removal. This is a known, accepted, and explicitly documented risk (see
+`extras/nozzle_clear.py`'s own module docstring), not an oversight.
+
+### Corrections to the original analysis
+
+The dependency table below ("PRTouch modules") undercounted
+`prtouch_test_support.py`'s reach: it is not only used by
+`test_prtouch_*.py`, but is also imported as generic offline
+Klipper-fake infrastructure by five test files with no PRTouch subject
+matter of their own. Those five files each also happened to instantiate a
+real `prtouch_v2.PRTouchV2` object in their own local `_build()` helpers —
+purely incidental leftover from when `z_compensate.py` used to look up
+`prtouch_v2` at `klippy:connect`, which it no longer does since the prior
+commit on this branch. All five were fixed (import and instantiation
+removed) before PRTouch's production modules were deleted, and
+`prtouch_test_support.py`'s own last functional dependency on real PRTouch
+code (`from . import prtouch_mcu`, used only for three async-response format
+constants) was replaced with the equivalent literal strings inlined
+directly, verified against `prtouch_mcu.py`'s exact values before deletion.
+
+### Files deleted (production)
+`prtouch_v2.py`, `prtouch_probe.py`, `prtouch_mcu.py`, `prtouch_nozzle.py`,
+`prtouch_calibration.py`, `prtouch_units.py`, `prtouch_safety_guard.py`
+(this last one had zero production callers even before this removal, only
+its own dedicated test — confirmed again at removal time).
+
+### Files deleted (dedicated tests)
+`test_prtouch_calibration.py`, `test_prtouch_config.py`,
+`test_prtouch_orchestration.py`, `test_prtouch_probe_safety_hardening.py`,
+`test_prtouch_protocol.py`, `test_prtouch_raw_op_guard.py`,
+`test_prtouch_safety_guard.py`, `test_prtouch_serial_response.py`,
+`test_prtouch_units.py`.
+
+### Files kept
+`prtouch_test_support.py` — decoupled from real PRTouch code (see above),
+still used by the five shared test files named above.
+
+### Not addressed by this removal (separate scope)
+- `NebulaOS-firmware/scripts/build/overlay/etc/nebulaos/klipper/prtouch.cfg`
+  and the commented-out `[prtouch_v2]` include in that repo's printer.cfg —
+  a different repository, out of scope for this change.
+- `NebulaOS-firmware/klippy_extras/` still mirrors the (now-deleted) PRTouch
+  files as of this removal — that mirror is documented as a "reviewable
+  mirror, NOT the real build input" (`manifests/dependencies.conf` in that
+  repo) and needs its own follow-up PR in that repo to stay in sync.
+
+## Original analysis (historical, kept for reference below)
+
 ## Current state
 
 PRTouch is **inactive for probing** (BLTouch is the global Klipper probe;
