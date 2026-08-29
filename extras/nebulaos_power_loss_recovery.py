@@ -341,6 +341,34 @@ def build_resume_gcode_lines(state):
 # Klipper glue.
 # ---------------------------------------------------------------------------
 
+class Candidate(object):
+    """A snapshot of PLR state taken at a specific point in the gcode
+    stream, not yet known to be durable. See the module-level "Checkpoint
+    execution semantics" note above _tick_printing() for why this exists -
+    in short, virtual_sdcard.file_position only proves motion has been
+    QUEUED, not physically executed, so every checkpoint must pass through
+    this pending stage before it is trusted."""
+    __slots__ = ('file_position', 'file_info', 'gm_status', 'th_status',
+                 'extruder_status', 'bed_mesh_status',
+                 'exclude_object_status', 'fan_status', 'fr_status',
+                 'taken_at', 'target_print_time')
+
+    def __init__(self, file_position, file_info, gm_status, th_status,
+                 extruder_status, bed_mesh_status, exclude_object_status,
+                 fan_status, fr_status, taken_at):
+        self.file_position = file_position
+        self.file_info = file_info
+        self.gm_status = gm_status
+        self.th_status = th_status
+        self.extruder_status = extruder_status
+        self.bed_mesh_status = bed_mesh_status
+        self.exclude_object_status = exclude_object_status
+        self.fan_status = fan_status
+        self.fr_status = fr_status
+        self.taken_at = taken_at
+        self.target_print_time = None  # set once toolhead confirms timing
+
+
 class NebulaOSPowerLossRecovery:
     def __init__(self, config):
         self.config = config
@@ -365,6 +393,7 @@ class NebulaOSPowerLossRecovery:
         self._checkpoint_in_flight = False
         self._resume_in_progress = False
         self._have_active_session = False
+        self._pending_candidate = None  # a Candidate not yet proven durable
 
         self.printer.register_event_handler("klippy:ready", self._handle_ready)
         self.printer.register_event_handler("virtual_sdcard:reset_file",
@@ -385,6 +414,7 @@ class NebulaOSPowerLossRecovery:
     def _handle_ready(self):
         self.gcode_move = self.printer.lookup_object('gcode_move')
         self.toolhead = self.printer.lookup_object('toolhead')
+        self.mcu = self.printer.lookup_object('mcu')
         self.print_stats = self.printer.lookup_object('print_stats')
         self.virtual_sdcard = self.printer.lookup_object('virtual_sdcard')
         self.exclude_object = self.printer.lookup_object('exclude_object', None)
@@ -449,13 +479,25 @@ class NebulaOSPowerLossRecovery:
         ps_status = self.print_stats.get_status(eventtime)
         state = ps_status.get('state')
 
+        # A candidate already taken may still be promotable even outside
+        # the 'printing' state (e.g. the print just paused, but motion
+        # queued before the pause is still physically executing) - always
+        # check promotion first, regardless of state, then decide whether
+        # this state permits taking a NEW candidate or requires
+        # invalidating everything instead.
+        if self._pending_candidate is not None:
+            self._maybe_promote_candidate(eventtime)
+
         if state == 'printing':
             self._tick_printing(eventtime, ps_status)
         elif state in ('complete', 'cancelled'):
+            self._pending_candidate = None
             if self._have_active_session:
                 self._tombstone_session("print_%s" % state)
-        # paused / error / standby: preserve the latest checkpoint, take no
-        # further action (no new writes, no tombstone).
+        elif state == 'error':
+            self._pending_candidate = None
+        # paused / standby: preserve the latest durable checkpoint and any
+        # still-pending candidate, take no new candidate.
 
     def _tick_printing(self, eventtime, ps_status):
         vsd_status = self.virtual_sdcard.get_status(eventtime)
@@ -470,14 +512,27 @@ class NebulaOSPowerLossRecovery:
         if not self._have_active_session:
             return  # _start_session may decline (e.g. hash failure)
 
-        if eventtime - self._last_checkpoint_time < self.checkpoint_interval:
-            return
         if self._checkpoint_in_flight:
-            logging.info(
-                "nebulaos_power_loss_recovery: checkpoint already in "
-                "flight, skipping this interval rather than queueing")
             return
-        self._checkpoint(eventtime, ps_status, vsd_status, th_status)
+        self._maybe_take_candidate(eventtime, vsd_status)
+
+    def _maybe_take_candidate(self, eventtime, vsd_status):
+        """Decides whether to snapshot a new Candidate now. A candidate
+        already pending is superseded (replaced, not persisted twice) once
+        it has had a full checkpoint_interval to become promotable and a
+        strictly newer file_position is available - this is what keeps a
+        stalled candidate (e.g. one whose associated move sits unflushed
+        for an unusually long time) from blocking all future progress
+        forever, per the mission's "superseded candidate" requirement."""
+        if self._pending_candidate is None:
+            if eventtime - self._last_checkpoint_time < self.checkpoint_interval:
+                return
+        else:
+            if eventtime - self._pending_candidate.taken_at < self.checkpoint_interval:
+                return
+            if vsd_status.get('file_position', 0) <= self._pending_candidate.file_position:
+                return  # no real progress since the pending candidate - not worth superseding
+        self._take_candidate(eventtime, vsd_status)
 
     def _start_session(self, vsd_status, eventtime):
         file_path = vsd_status.get('file_path')
@@ -497,7 +552,7 @@ class NebulaOSPowerLossRecovery:
             "sha256": sha256,
         }
         self._have_active_session = True
-        # Force the very first checkpoint to be immediately due, regardless
+        # Force the very first candidate to be taken immediately, regardless
         # of how large `eventtime` (reactor uptime, not wall-clock) already
         # is at session-start time.
         self._last_checkpoint_time = eventtime - self.checkpoint_interval
@@ -509,8 +564,43 @@ class NebulaOSPowerLossRecovery:
             return rel
         return file_path
 
-    def _checkpoint(self, eventtime, ps_status, vsd_status, th_status):
+    # -- checkpoint execution semantics --------------------------------
+    #
+    # virtual_sdcard.file_position only proves gcode has been fully
+    # DISPATCHED (confirmed against the exact pinned Klipper source,
+    # klippy/extras/virtual_sdcard.py's work_handler(): self.file_position
+    # is advanced to next_file_position only AFTER self.gcode.run_script(
+    # line) returns for that line - so it never runs ahead of what has been
+    # queued into the toolhead). Dispatched is NOT the same as physically
+    # executed: Klipper deliberately buffers commands up to BUFFER_TIME_HIGH
+    # (1.0s, toolhead.py) ahead of real time, so file_position can - and
+    # normally does - reflect gcode whose motion is still sitting in the
+    # trapq, not yet run.
+    #
+    # toolhead.register_lookahead_callback(cb) (toolhead.py) attaches cb to
+    # the LAST move currently in the lookahead queue; cb fires with that
+    # move's print_time once _process_lookahead() converts it into
+    # scheduled trapq commands - this proves "queued with known timing", not
+    # "physically executed". The actual physical-completion proof, used by
+    # M400's own wait_moves(), is comparing that print_time against
+    # mcu.estimated_print_time(reactor.monotonic()): print_time is
+    # Klipper's internal monotonically-non-decreasing scheduling clock,
+    # estimated_print_time() converts a real host time into the
+    # corresponding point on that same clock, and motion is physically
+    # complete once estimated_print_time(now) >= print_time. wait_moves()
+    # busy-waits for this via reactor.pause() - unacceptable here (would
+    # stall the whole reactor once every checkpoint), so this module polls
+    # the same comparison non-blockingly from its own timer instead.
+    #
+    # This is why every checkpoint here passes through a two-stage
+    # Candidate -> durable pipeline: a Candidate's file_position/state is
+    # snapshotted immediately, but only ever written to the sidecar/EEPROM
+    # once _maybe_promote_candidate() proves its associated motion has
+    # actually finished, not merely been scheduled.
+
+    def _take_candidate(self, eventtime, vsd_status):
         gm_status = self.gcode_move.get_status(eventtime)
+        th_status = self.toolhead.get_status(eventtime)
         # "extruder_status" doubles as the thermal snapshot: extruder's own
         # get_status() already merges the heater's 'target' key with
         # pressure_advance/smooth_time (kinematics/extruder.py), and
@@ -530,38 +620,64 @@ class NebulaOSPowerLossRecovery:
         fr_status = self.firmware_retraction.get_status(eventtime) \
             if self.firmware_retraction is not None else None
 
-        file_position = vsd_status.get('file_position', 0)
+        candidate = Candidate(
+            vsd_status.get('file_position', 0), self._session_file_info,
+            gm_status, th_status, extruder_status, bed_mesh_status,
+            exclude_object_status, fan_status, fr_status, eventtime)
+        self._pending_candidate = candidate
+        # Synchronous, on the reactor thread, immediately after reading
+        # file_position above - nothing else can advance the gcode stream
+        # in between (Klipper's reactor only runs one callback at a time),
+        # so this candidate's file_position and "the last move currently
+        # queued" are guaranteed to describe the same point in the print.
+        self.toolhead.register_lookahead_callback(
+            lambda print_time: self._on_candidate_timing_known(
+                candidate, print_time))
 
+    def _on_candidate_timing_known(self, candidate, print_time):
+        # May fire synchronously (empty queue) or later, once the
+        # associated move is flushed into the trapq. If this candidate was
+        # already superseded/discarded in the meantime, its target_print_
+        # time is simply never consulted again - harmless.
+        candidate.target_print_time = print_time
+
+    def _maybe_promote_candidate(self, eventtime):
+        candidate = self._pending_candidate
+        if candidate.target_print_time is None:
+            return  # toolhead hasn't finalized this candidate's timing yet
+        estimated = self.mcu.estimated_print_time(eventtime)
+        if estimated < candidate.target_print_time:
+            return  # motion scheduled but not yet physically executed
+        if self._checkpoint_in_flight:
+            return
         self._checkpoint_in_flight = True
         try:
-            self.executor.submit(
-                self._perform_checkpoint_blocking,
-                self._session_file_info, file_position, gm_status,
-                th_status, extruder_status, bed_mesh_status,
-                exclude_object_status, fan_status, fr_status)
+            self.executor.submit(self._perform_checkpoint_blocking, candidate)
             self._last_checkpoint_time = eventtime
+            self._pending_candidate = None
         except Exception:
             logging.exception(
                 "nebulaos_power_loss_recovery: checkpoint failed")
         finally:
             self._checkpoint_in_flight = False
 
-    def _perform_checkpoint_blocking(self, file_info, file_position,
-                                      gm_status, th_status, extruder_status,
-                                      bed_mesh_status, exclude_object_status,
-                                      fan_status, fr_status):
-        """Runs on the aio_executor background thread. Implements the
-        checkpoint transaction's full 7-step ordering: build the sidecar
-        payload, durably write+rename it, fsync the directory, and ONLY
-        THEN write+verify the EEPROM record."""
+    def _perform_checkpoint_blocking(self, candidate):
+        """Runs on the aio_executor background thread, only once
+        _maybe_promote_candidate() has already proven candidate's motion
+        physically completed. Implements the checkpoint transaction's full
+        7-step ordering: build the sidecar payload, durably write+rename
+        it, fsync the directory, and ONLY THEN write+verify the EEPROM
+        record."""
         with self._open_eeprom() as eeprom:
             current = journal.scan_journal(eeprom)
             _, next_generation = journal.next_commit_target(current)
 
             state = build_sidecar_state(
-                next_generation, file_info, file_position, gm_status,
-                th_status, extruder_status, bed_mesh_status,
-                exclude_object_status, fan_status, fr_status)
+                next_generation, candidate.file_info, candidate.file_position,
+                candidate.gm_status, candidate.th_status,
+                candidate.extruder_status, candidate.bed_mesh_status,
+                candidate.exclude_object_status, candidate.fan_status,
+                candidate.fr_status)
 
             final_path = sidecar_path_for_generation(self.sidecar_dir,
                                                       next_generation)
@@ -571,7 +687,7 @@ class NebulaOSPowerLossRecovery:
             # so a crash between the two never leaves the EEPROM pointing
             # at a generation whose sidecar was never actually written.
             atomic_write_json(tmp_path, final_path, state)
-            journal.commit_checkpoint(eeprom, file_position)
+            journal.commit_checkpoint(eeprom, candidate.file_position)
 
     def _tombstone_session(self, reason):
         try:
@@ -582,6 +698,7 @@ class NebulaOSPowerLossRecovery:
                 "nebulaos_power_loss_recovery: tombstone (%s) failed", reason)
         self._have_active_session = False
         self._session_file_info = None
+        self._pending_candidate = None
 
     def _handle_reset_file(self):
         if self._resume_in_progress:
@@ -686,6 +803,7 @@ class NebulaOSPowerLossRecovery:
         return {
             "active_session": self._have_active_session,
             "resume_in_progress": self._resume_in_progress,
+            "candidate_pending": self._pending_candidate is not None,
         }
 
 

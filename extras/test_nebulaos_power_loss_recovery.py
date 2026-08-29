@@ -528,6 +528,36 @@ class _FakeStatusObject(object):
         return self._status
 
 
+class _FakeMcu(object):
+    """estimated_print_time() is the real-time side of the physical-
+    completion proof (see the module's own "Checkpoint execution
+    semantics" comment) - tests drive it directly rather than simulating
+    an actual MCU clock."""
+    def __init__(self):
+        self.current_estimated_print_time = 0.0
+
+    def estimated_print_time(self, eventtime=None):
+        return self.current_estimated_print_time
+
+
+class _FakeToolhead(_FakeStatusObject):
+    """register_lookahead_callback() here does NOT fire immediately (a
+    real, empty-queue Klipper toolhead would) - tests fire callbacks
+    explicitly via fire_pending_callbacks() so the two-stage candidate ->
+    durable timing can be driven precisely and deterministically."""
+    def __init__(self, status):
+        super(_FakeToolhead, self).__init__(status)
+        self.pending_callbacks = []
+
+    def register_lookahead_callback(self, callback):
+        self.pending_callbacks.append(callback)
+
+    def fire_pending_callbacks(self, print_time):
+        callbacks, self.pending_callbacks = self.pending_callbacks, []
+        for callback in callbacks:
+            callback(print_time)
+
+
 class ExtensionStateMachineTests(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
@@ -547,7 +577,8 @@ class ExtensionStateMachineTests(unittest.TestCase):
         self.objects = {
             'gcode': _FakeGCode(),
             'gcode_move': _FakeStatusObject(gcode_move_status),
-            'toolhead': _FakeStatusObject(toolhead_status),
+            'toolhead': _FakeToolhead(toolhead_status),
+            'mcu': _FakeMcu(),
             'print_stats': _FakeStatusObject(self.print_stats_status),
             'virtual_sdcard': type('VSD', (_FakeStatusObject,), {
                 'sdcard_dirname': self.tmpdir})(self.vsd_status),
@@ -579,14 +610,35 @@ class ExtensionStateMachineTests(unittest.TestCase):
         with open(self.eeprom_path, 'r+b') as handle:
             return journal.read_recovery_state(handle)
 
+    def _eeprom_scan(self):
+        # Unlike _eeprom_record()/read_recovery_state(), this returns the
+        # newest record even if it's a tombstone - for asserting "a
+        # tombstone was actually written" rather than just "no recovery is
+        # available" (which is also true of e.g. total EEPROM corruption).
+        with open(self.eeprom_path, 'r+b') as handle:
+            return journal.scan_journal(handle)
+
+    def _tick_and_settle(self, eventtime):
+        """Ticks once (which may take a new Candidate), then simulates
+        "motion completes instantly" (fire any pending toolhead timing
+        callback with a low print_time, advance the fake mcu's estimated
+        real time far ahead of it) and ticks again so any candidate taken
+        this round is promoted to durable immediately. For tests that
+        aren't specifically exercising the two-stage candidate timing
+        itself - see CandidatePromotionTests for those."""
+        self.ext._tick(eventtime)
+        self.objects['toolhead'].fire_pending_callbacks(0.0)
+        self.objects['mcu'].current_estimated_print_time = 1e9
+        self.ext._tick(eventtime)
+
     def test_meaningful_progress_gate_blocks_session_start(self):
         self.objects['toolhead']._status = _toolhead_status(z=0.1)
-        self.ext._tick(1.0)
+        self._tick_and_settle(1.0)
         self.assertFalse(self.ext._have_active_session)
         self.assertIsNone(self._eeprom_record())
 
     def test_session_starts_and_first_checkpoint_commits(self):
-        self.ext._tick(1.0)
+        self._tick_and_settle(1.0)
         self.assertTrue(self.ext._have_active_session)
         record = self._eeprom_record()
         self.assertIsNotNone(record)
@@ -594,76 +646,76 @@ class ExtensionStateMachineTests(unittest.TestCase):
                           self.vsd_status['file_position'])
 
     def test_checkpoint_5s_rate_limit(self):
-        self.ext._tick(1.0)
+        self._tick_and_settle(1.0)
         first = self._eeprom_record()
         self.vsd_status['file_position'] = 2000
-        self.ext._tick(1.5)  # well under 5s later - must NOT checkpoint again
+        self._tick_and_settle(1.5)  # well under 5s later - must NOT checkpoint again
         second = self._eeprom_record()
         self.assertEqual(first.generation, second.generation)
-        self.ext._tick(6.5)  # now past the 5s interval
+        self._tick_and_settle(6.5)  # now past the 5s interval
         third = self._eeprom_record()
         self.assertGreater(third.generation, second.generation)
         self.assertEqual(third.file_position, 2000)
 
     def test_checkpoint_in_flight_guard_skips_rather_than_queues(self):
-        self.ext._tick(1.0)
+        self._tick_and_settle(1.0)
         self.ext._checkpoint_in_flight = True
         before = self._eeprom_record()
-        self.ext._tick(10.0)  # due for a checkpoint, but marked in-flight
+        self._tick_and_settle(10.0)  # due for a checkpoint, but marked in-flight
         after = self._eeprom_record()
         self.assertEqual(before.generation, after.generation)
 
     def test_pause_preserves_checkpoint_no_new_writes(self):
-        self.ext._tick(1.0)
+        self._tick_and_settle(1.0)
         before = self._eeprom_record()
         self.print_stats_status['state'] = 'paused'
-        self.ext._tick(10.0)
+        self._tick_and_settle(10.0)
         after = self._eeprom_record()
         self.assertEqual(before.generation, after.generation)
         self.assertTrue(self.ext._have_active_session)
 
     def test_resume_after_pause_continues_checkpointing(self):
-        self.ext._tick(1.0)
+        self._tick_and_settle(1.0)
         self.print_stats_status['state'] = 'paused'
-        self.ext._tick(2.0)
+        self._tick_and_settle(2.0)
         self.print_stats_status['state'] = 'printing'
         self.vsd_status['file_position'] = 3000
-        self.ext._tick(10.0)
+        self._tick_and_settle(10.0)
         record = self._eeprom_record()
         self.assertEqual(record.file_position, 3000)
 
     def test_complete_triggers_immediate_tombstone(self):
-        self.ext._tick(1.0)
+        self._tick_and_settle(1.0)
         self.assertTrue(self.ext._have_active_session)
         self.print_stats_status['state'] = 'complete'
-        self.ext._tick(2.0)
+        self._tick_and_settle(2.0)
         self.assertFalse(self.ext._have_active_session)
         self.assertIsNone(self._eeprom_record())
 
     def test_cancelled_triggers_immediate_tombstone(self):
-        self.ext._tick(1.0)
+        self._tick_and_settle(1.0)
         self.print_stats_status['state'] = 'cancelled'
-        self.ext._tick(2.0)
+        self._tick_and_settle(2.0)
         self.assertIsNone(self._eeprom_record())
 
     def test_error_preserves_checkpoint_no_tombstone(self):
-        self.ext._tick(1.0)
+        self._tick_and_settle(1.0)
         before = self._eeprom_record()
         self.print_stats_status['state'] = 'error'
-        self.ext._tick(2.0)
+        self._tick_and_settle(2.0)
         after = self._eeprom_record()
         self.assertEqual(before.generation, after.generation)
         self.assertFalse(after.is_tombstone)
 
     def test_virtual_sdcard_reset_during_active_session_invalidates_plr(self):
-        self.ext._tick(1.0)
+        self._tick_and_settle(1.0)
         self.assertTrue(self.ext._have_active_session)
         self.printer.send_event("virtual_sdcard:reset_file")
         self.assertFalse(self.ext._have_active_session)
         self.assertIsNone(self._eeprom_record())
 
     def test_resume_in_progress_guard_ignores_own_reset_file(self):
-        self.ext._tick(1.0)
+        self._tick_and_settle(1.0)
         self.assertTrue(self.ext._have_active_session)
         self.ext._resume_in_progress = True
         self.printer.send_event("virtual_sdcard:reset_file")
@@ -673,21 +725,21 @@ class ExtensionStateMachineTests(unittest.TestCase):
         self.assertIsNotNone(self._eeprom_record())
 
     def test_manual_discard_tombstones(self):
-        self.ext._tick(1.0)
+        self._tick_and_settle(1.0)
         gcmd = _FakeGCmd()
         self.ext.cmd_NEBULAOS_PLR_DISCARD(gcmd)
         self.assertIsNone(self._eeprom_record())
         self.assertFalse(self.ext._have_active_session)
 
     def test_resume_refuses_without_allow_unsafe(self):
-        self.ext._tick(1.0)
+        self._tick_and_settle(1.0)
         gcmd = _FakeGCmd({'ALLOW_UNSAFE': 0})
         with self.assertRaises(Exception):
             self.ext.cmd_NEBULAOS_PLR_RESUME(gcmd)
         self.assertEqual(self.objects['gcode'].run_lines, [])
 
     def test_resume_one_time_allow_unsafe_succeeds_and_restores_state(self):
-        self.ext._tick(1.0)
+        self._tick_and_settle(1.0)
         gcmd = _FakeGCmd({'ALLOW_UNSAFE': 1})
         self.ext.cmd_NEBULAOS_PLR_RESUME(gcmd)
         lines = self.objects['gcode'].run_lines
@@ -696,7 +748,7 @@ class ExtensionStateMachineTests(unittest.TestCase):
         self.assertFalse(self.ext._resume_in_progress)  # cleared afterward
 
     def test_resume_allow_unsafe_cannot_bypass_integrity_failure(self):
-        self.ext._tick(1.0)
+        self._tick_and_settle(1.0)
         # Corrupt the on-disk gcode file so its hash no longer matches what
         # was recorded at session start.
         with open(self.vsd_status['file_path'], 'ab') as handle:
@@ -707,7 +759,7 @@ class ExtensionStateMachineTests(unittest.TestCase):
         self.assertEqual(self.objects['gcode'].run_lines, [])
 
     def test_status_command_reports_available_recovery(self):
-        self.ext._tick(1.0)
+        self._tick_and_settle(1.0)
         gcmd = _FakeGCmd()
         self.ext.cmd_NEBULAOS_PLR_STATUS(gcmd)
         self.assertTrue(any('recovery available' in m for m in gcmd.messages))
@@ -716,6 +768,149 @@ class ExtensionStateMachineTests(unittest.TestCase):
         gcmd = _FakeGCmd()
         self.ext.cmd_NEBULAOS_PLR_STATUS(gcmd)
         self.assertTrue(any('no recovery available' in m for m in gcmd.messages))
+
+
+class CandidatePromotionTests(ExtensionStateMachineTests):
+    """The two-stage candidate -> durable pipeline (see the module's own
+    "Checkpoint execution semantics" comment): file_position proves gcode
+    was DISPATCHED, not physically executed. These tests drive the fake
+    toolhead's register_lookahead_callback()/the fake mcu's
+    estimated_print_time() directly, deliberately WITHOUT the
+    _tick_and_settle() convenience helper the other test class uses, so
+    each stage of the real mechanism is exercised explicitly."""
+
+    def test_file_position_ahead_of_physical_queue_not_yet_durable(self):
+        # A candidate is taken (file_position snapshotted), but its
+        # associated motion has not been reported complete at all yet -
+        # nothing may be written to the EEPROM/sidecar.
+        self.ext._tick(1.0)
+        self.assertIsNotNone(self.ext._pending_candidate)
+        self.assertIsNone(self._eeprom_record())
+
+    def test_candidate_not_promoted_while_timing_unknown(self):
+        self.ext._tick(1.0)
+        # Real time "catches up" to an arbitrarily high print_time, but
+        # the toolhead has not yet confirmed ANY target_print_time for
+        # this candidate (its move sits unflushed) - still not durable.
+        self.objects['mcu'].current_estimated_print_time = 1e9
+        self.ext._tick(1.5)
+        self.assertIsNone(self._eeprom_record())
+
+    def test_candidate_not_promoted_while_motion_still_scheduled(self):
+        self.ext._tick(1.0)
+        self.objects['toolhead'].fire_pending_callbacks(500.0)
+        # Real time has NOT yet caught up to the scheduled print_time -
+        # the motion is queued but not physically finished.
+        self.objects['mcu'].current_estimated_print_time = 100.0
+        self.ext._tick(1.5)
+        self.assertIsNone(self._eeprom_record())
+
+    def test_motion_completion_promotes_candidate(self):
+        self.ext._tick(1.0)
+        self.objects['toolhead'].fire_pending_callbacks(500.0)
+        self.objects['mcu'].current_estimated_print_time = 500.0  # exactly caught up
+        self.ext._tick(1.5)
+        record = self._eeprom_record()
+        self.assertIsNotNone(record)
+        self.assertEqual(record.file_position, self.vsd_status['file_position'])
+        self.assertIsNone(self.ext._pending_candidate)
+
+    def test_power_loss_before_promotion_leaves_previous_durable_generation(self):
+        self._tick_and_settle(1.0)
+        first = self._eeprom_record()
+        self.assertIsNotNone(first)
+
+        # A new candidate is taken (more progress), but power is "lost"
+        # before its motion is ever reported complete - simulated simply
+        # by never firing its callback / never advancing mcu time, i.e.
+        # never calling anything that would promote it.
+        self.vsd_status['file_position'] = 9999
+        self.ext._tick(6.5)
+        self.assertIsNotNone(self.ext._pending_candidate)
+
+        # The EEPROM must still show the PREVIOUS durable generation,
+        # untouched - a pending candidate is never trusted.
+        after = self._eeprom_record()
+        self.assertEqual(after.generation, first.generation)
+        self.assertEqual(after.file_position, first.file_position)
+
+    def test_superseded_candidate_uses_newest_file_position(self):
+        self.ext._tick(1.0)
+        stale_position = self.vsd_status['file_position']
+        self.assertEqual(self.ext._pending_candidate.file_position, stale_position)
+
+        # The stale candidate's motion never gets reported complete, but
+        # real progress keeps happening in the gcode stream and a full
+        # checkpoint_interval elapses - the candidate must be superseded
+        # by a fresh one at the newer file_position, not persisted stale
+        # forever once it does eventually complete.
+        self.vsd_status['file_position'] = stale_position + 500
+        self.ext._tick(6.5)
+        self.assertEqual(self.ext._pending_candidate.file_position,
+                          stale_position + 500)
+
+        self.objects['toolhead'].fire_pending_callbacks(0.0)
+        self.objects['mcu'].current_estimated_print_time = 1e9
+        self.ext._tick(7.0)
+        record = self._eeprom_record()
+        self.assertEqual(record.file_position, stale_position + 500)
+
+    def test_pause_during_pending_candidate_still_promotable_later(self):
+        self.ext._tick(1.0)
+        self.assertIsNotNone(self.ext._pending_candidate)
+
+        self.print_stats_status['state'] = 'paused'
+        self.objects['toolhead'].fire_pending_callbacks(0.0)
+        self.objects['mcu'].current_estimated_print_time = 1e9
+        self.ext._tick(1.5)  # promotion check runs regardless of print state
+
+        record = self._eeprom_record()
+        self.assertIsNotNone(record)
+        self.assertIsNone(self.ext._pending_candidate)
+
+    def test_cancel_during_pending_candidate_discards_it(self):
+        self.ext._tick(1.0)
+        candidate = self.ext._pending_candidate
+        self.assertIsNotNone(candidate)
+
+        self.print_stats_status['state'] = 'cancelled'
+        self.ext._tick(1.5)
+        self.assertIsNone(self.ext._pending_candidate)
+
+        # Even if the discarded candidate's own callback fires later (a
+        # genuine race in real Klipper - the trapq flush doesn't know or
+        # care that PLR gave up on it), it must never resurrect a
+        # commit - there is no pending candidate left to promote.
+        self.objects['toolhead'].fire_pending_callbacks(0.0)
+        self.objects['mcu'].current_estimated_print_time = 1e9
+        self.ext._tick(2.0)
+        record = self._eeprom_scan()
+        self.assertIsNotNone(record)
+        self.assertTrue(record.is_tombstone)
+
+    def test_complete_during_pending_candidate_discards_it(self):
+        self.ext._tick(1.0)
+        self.assertIsNotNone(self.ext._pending_candidate)
+
+        self.print_stats_status['state'] = 'complete'
+        self.ext._tick(1.5)
+        self.assertIsNone(self.ext._pending_candidate)
+        record = self._eeprom_scan()
+        self.assertIsNotNone(record)
+        self.assertTrue(record.is_tombstone)
+
+    def test_no_duplicate_or_skipped_generation_ordering(self):
+        seen_generations = []
+        eventtime = 1.0
+        for i in range(4):
+            self.vsd_status['file_position'] = 1000 + i * 100
+            self._tick_and_settle(eventtime)
+            record = self._eeprom_record()
+            seen_generations.append(record.generation)
+            eventtime += self.ext.checkpoint_interval + 0.5
+        self.assertEqual(seen_generations,
+                          list(range(seen_generations[0],
+                                     seen_generations[0] + 4)))
 
 
 if __name__ == '__main__':
