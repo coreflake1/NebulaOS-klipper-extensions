@@ -57,6 +57,7 @@
     {"path": "extras/guppy_module_loader.py", "role": "runtime"},
     {"path": "extras/nebulaos_z_offset_probe.py", "role": "runtime"},
     {"path": "extras/nozzle_clear.py", "role": "runtime"},
+    {"path": "extras/bl24c16f.py", "role": "runtime"},
 
     {"path": "extras/test_nebulaos_compat.py", "role": "test"},
     {"path": "extras/test_nebulaos_temperature_mcu.py", "role": "test"},

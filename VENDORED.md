@@ -23,6 +23,7 @@ table, are authoritative for the file they appear in.
 | `extras/guppy_module_loader.py` | ballaswag, © 2024 | `ballaswag/guppyscreen` | **absent upstream — added** | header only |
 | `extras/tmcstatus.py` | ballaswag, © 2024 | `ballaswag/guppyscreen` | **absent upstream — added** | header, plus a `klippy:connect` deferral fix |
 | `extras/nebulaos_temperature_mcu.py` | Kevin O'Connor © 2020-2024 (base), NebulaOS © 2026 (GD32 curves) | `Klipper3d/klipper` | derived, both credited | subclass + three GD32 calibration curves |
+| `extras/bl24c16f.py` | Eric Callahan, © 2020 | community Klipper extra, shipped by Creality in the KE's stock firmware | present upstream, preserved | none — byte-identical to the copy pulled from the printer's own stock rootfs partition |
 
 Everything else in `extras/` — the nine `prtouch_*`/`z_compensate` modules, `nebulaos_version`,
 `nebulaos_compat`, and the test suite — is NebulaOS's own work.
@@ -112,29 +113,58 @@ Upstream contribution is worth doing independently of this repository: the curve
 lines and mechanically identical in form to the entries mainline already carries. If
 `Klipper3d/klipper` accepts them, this module can go away entirely.
 
+### `bl24c16f.py` — Eric Callahan, © 2020
+
+I2C EEPROM driver for the BL24C16F chip (8 selectable I2C sub-addresses, 256-byte pages each,
+2KB total) wired directly to this printer's SoC. GPLv3 header present in the original and
+preserved verbatim.
+
+Not in mainline Klipper (checked directly against the `Klipper3d/klipper` tree at our own
+pinned commit — absent). Pulled read-only from the KE's own stock firmware
+(`/usr/share/klipper/klippy/extras/bl24c16f.py` on the inactive stock rootfs partition), not
+from any upstream Klipper PR or fork — Creality ships this file, but did not author it, and did
+not patch it: byte-for-byte identical to Eric Callahan's original, confirmed by diff.
+
+Phase 1.9A vendors this purely as the generic hardware driver (`EEPROM_READ`/`EEPROM_WRITE_*`/
+`EEPROM_DEBUG_*` gcode commands, `read_reg`/`write_reg`). The class also carries a handful of
+methods with power-loss-recovery-shaped names (`eepromReadHeader`, `eepromReadBody`,
+`setEepromDisable`, `checkEepromFirstEnable`) that are part of the original author's own file,
+not a NebulaOS addition — they are vendored as-is because "verbatim" is the safer choice than
+selectively stripping methods from a community-authored driver, but nothing in Phase 1.9A calls
+them. Power-loss recovery itself (a periodic checkpoint writer, a boot-time resume flow) is
+explicitly out of scope for this phase and lives in a later one; see
+`_project/missions/phase1.9-host-mcu-accelerometer-plr-analysis.md` for that design.
+
 ## Why vendor these at all
 
-Every one of these six modules is absent from mainline Klipper, so none of them can be dropped
-by waiting for upstream, and each is live in the shipped configuration or invoked from
-GuppyScreen's compiled code.
+Every one of these seven modules is absent from mainline Klipper, so none of them can be
+dropped by waiting for upstream, and each is live in the shipped configuration, invoked from
+GuppyScreen's compiled code, or (bl24c16f.py) needed to talk to real, physically-present
+hardware.
 
 Pinning "the original author's repository" instead would be fiction for four of them: their
 real source is GuppyScreen, whose copies already ship duplicated inside
 `NebulaOS-guppyscreen/k1/k1_mods/`. And `gcode_shell_command.py` carries a deliberate
 one-line lineage delta that must be preserved knowingly rather than inherited by accident.
+`bl24c16f.py`'s real source is neither GuppyScreen nor a Klipper PR we can point at — it was
+pulled from the printer's own stock firmware, the only place NebulaOS actually has it.
 Vendoring with explicit provenance is the honest version of a situation that already existed.
 
 ## Filename collision risk
 
 The vendored names are kept as-is for now — `gcode_shell_command`, `virtual_pins`,
-`calibrate_shaper_config`, `guppy_config_helper`, `guppy_module_loader`. GuppyScreen's
-compiled C++ hardcodes several of the gcode commands they register, so renaming them is a
-coordinated change across repositories, not a free rename.
+`calibrate_shaper_config`, `guppy_config_helper`, `guppy_module_loader`, `bl24c16f`.
+GuppyScreen's compiled C++ hardcodes several of the gcode commands the first five register, so
+renaming those is a coordinated change across repositories, not a free rename; `bl24c16f`'s own
+name is dictated by the physical chip it drives and by `printer.cfg`'s `[bl24c16f]` section.
 
 That leaves a real, if unlikely, hazard: if mainline Klipper ever ships a file at one of these
 paths, git will silently replace NebulaOS's symlink with upstream's regular file, and the
 vendored module is shadowed with no error anywhere. `gcode_shell_command` and `virtual_pins`
-are exactly the kind of module mainline could adopt.
+are exactly the kind of module mainline could adopt — and `bl24c16f` arguably more so than
+either: its real author, Eric Callahan, is an active Klipper maintainer, and this is a
+plausible file for `Klipper3d/klipper` to accept directly someday, at which point this vendored
+copy should simply be deleted in favor of upstream's.
 
 The mitigation is mandatory and lives in the platform layer, not here: the composition step
 must verify that every managed destination path is still a symlink resolving inside this
