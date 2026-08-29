@@ -15,7 +15,6 @@ import re
 import unittest
 
 from . import prtouch_test_support as fake
-from . import prtouch_v2
 from . import z_compensate
 
 
@@ -33,10 +32,7 @@ def _module_code_lines():
 
 
 def _build(stub_measurement=0.0):
-    printer, mcu, pins, values = fake.build_environment()
-    prtouch_config = fake.make_prtouch_v2_config(printer, pins, values)
-    pv2 = prtouch_v2.PRTouchV2(prtouch_config)
-    printer.add_object('prtouch_v2', pv2)
+    printer, mcu, _pins, _values = fake.build_environment()
     zc_config = fake.make_z_compensate_config(printer, dict(fake.REAL_Z_COMPENSATE_CONFIG))
     zc = z_compensate.ZCompensate(zc_config)
     fake.connect(printer, mcu)

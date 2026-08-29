@@ -1,24 +1,28 @@
-# Shared, offline test-only fakes for the prtouch_v2/z_compensate module set.
+# Shared, offline test-only fakes for the z_compensate/nebulaos_z_offset_probe module set.
 #
-# Built to exercise the REAL production code (PrtouchMCU, PrtouchProbe, PRTouchV2,
-# ZCompensate) against a deterministic fake MCU/config/printer, not to reimplement or
-# mirror that code's own logic. Every fake here models one real Klipper API surface
-# (ConfigWrapper, MCU/CommandWrapper, ppins, toolhead, reactor) closely enough that the
-# production modules can be instantiated and driven exactly as klippy.py would, with zero
-# physical hardware and zero real time elapsed (FakeReactor's clock is a plain float the
-# test controls directly - no time.sleep anywhere in this file).
+# Originally built to exercise the REAL production code of PRTouch (PrtouchMCU, PrtouchProbe,
+# PRTouchV2) alongside ZCompensate, against a deterministic fake MCU/config/printer, not to
+# reimplement or mirror that code's own logic. PRTouch itself has since been removed entirely
+# (Phase 1.8B - see extras/PRTOUCH_REMOVAL_PLAN.md); this file survives as generic offline
+# test infrastructure for the test files that remain (z_compensate.py,
+# nebulaos_z_offset_probe.py, and their own dedicated test modules), decoupled from any real
+# PRTouch runtime code. Every fake here models one real Klipper API surface (ConfigWrapper,
+# MCU/CommandWrapper, ppins, toolhead, reactor) closely enough that the production modules can
+# be instantiated and driven exactly as klippy.py would, with zero physical hardware and zero
+# real time elapsed (FakeReactor's clock is a plain float the test controls directly - no
+# time.sleep anywhere in this file).
 #
-# Deliberately NOT a full Klipper reimplementation: only the surface prtouch_v2/z_compensate
-# actually calls is modeled. Extend as new call sites are exercised, don't pre-build unused
-# surface.
+# Deliberately NOT a full Klipper reimplementation: only the surface these modules actually
+# call is modeled. Extend as new call sites are exercised, don't pre-build unused surface.
+#
+# A handful of prtouch_v2-shaped helpers below (make_prtouch_v2_config, REAL_PRTOUCH_V2_CONFIG,
+# make_step_result/make_pres_result/make_read_pres_result) are no longer called by any
+# surviving test after the Phase 1.8B PRTouch removal - kept in place rather than pulled out,
+# since removing them was out of scope for that removal (it only required decoupling this
+# file's own `prtouch_mcu` import below) and they don't import any deleted module.
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import re
-
-# Imported for its async-response format tables only, so FakeMCU's default fake dictionary
-# stays in lockstep with the formats the production module actually asks for. prtouch_mcu
-# imports nothing from this module, so there is no import cycle.
-from . import prtouch_mcu
 
 
 class ConfigError(Exception):
@@ -282,13 +286,23 @@ class FakeMCU:
         self.query_responses = {}
         self.response_handlers = {}  # name -> {oid: handler}
         self.registered_response_formats = {}  # name -> format actually registered
-        # Default fake MCU dictionary: the first (best-evidence) candidate format for each of
-        # prtouch_mcu.py's three async subscriptions. Kept as a set of exact strings so it
-        # models mainline msgproto.lookup_command()'s exact-string match, not a fuzzy one.
-        self.valid_response_formats = set(
-            sub[1][0] for sub in (prtouch_mcu.RESULT_RUN_STEP_PRTOUCH,
-                                  prtouch_mcu.RESULT_RUN_PRES_PRTOUCH,
-                                  prtouch_mcu.RESULT_READ_PRES_PRTOUCH))
+        # Default fake MCU dictionary: literal copies of the first (best-evidence) candidate
+        # format for each of the now-deleted prtouch_mcu.py's three async subscriptions
+        # (RESULT_RUN_STEP_PRTOUCH / RESULT_RUN_PRES_PRTOUCH / RESULT_READ_PRES_PRTOUCH,
+        # each sub[1][0]) - inlined here, verified against that module's exact values before
+        # its removal (Phase 1.8B - see extras/PRTOUCH_REMOVAL_PLAN.md), rather than imported,
+        # so this file has no runtime dependency on real PRTouch code any more. Kept as a set
+        # of exact strings so it models mainline msgproto.lookup_command()'s exact-string
+        # match, not a fuzzy one.
+        self.valid_response_formats = {
+            'result_run_step_prtouch oid=%c index=%c tri_time=%u'
+            ' tick0=%u tick1=%u tick2=%u tick3=%u'
+            ' step0=%u step1=%u step2=%u step3=%u',
+            'result_run_pres_prtouch oid=%c index=%c tri_time=%u tri_chs=%c buf_cnt=%u'
+            ' tick_0=%u ch0_0=%i ch1_0=%i ch2_0=%i ch3_0=%i'
+            ' tick_1=%u ch0_1=%i ch1_1=%i ch2_1=%i ch3_1=%i',
+            'result_read_pres_prtouch oid=%c tick=%u ch0=%i ch1=%i ch2=%i ch3=%i',
+        }
 
     def get_name(self):
         return self.name

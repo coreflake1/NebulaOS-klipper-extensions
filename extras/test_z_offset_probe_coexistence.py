@@ -5,6 +5,14 @@
 # and the nozzle load cell is used ONLY for per-print Z-offset calibration via
 # z_compensate.py's Z_OFFSET_CALIBRATION command.
 #
+# Phase 1.8B update: PRTouch has since been removed entirely (see
+# extras/PRTOUCH_REMOVAL_PLAN.md) - CRTENSE_NOZZLE_CLEAR (extras/nozzle_clear.py) now also
+# runs on the native load-cell backend unconditionally, with no PRTouch fallback or
+# dependency of any kind. This file's own fixtures used to incidentally instantiate a real
+# prtouch_v2.PRTouchV2 object and register it as 'prtouch_v2' purely because
+# z_compensate.py used to look it up at klippy:connect - it no longer does, so that
+# instantiation has been removed from every fixture here.
+#
 # Source-inspection tests read the .py file directly to avoid importing
 # nebulaos_z_offset_probe at module level — that module's top-level imports pull in upstream
 # Klipper extras (hx71x, load_cell, probe, trigger_analog) which are not present in the
@@ -15,10 +23,10 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import os
+import re
 import unittest
 
 from . import prtouch_test_support as fake
-from . import prtouch_v2
 from . import z_compensate
 
 
@@ -38,16 +46,12 @@ def _module_code_lines():
 
 
 def _build(stub_measurement=0.0):
-    printer, mcu, pins, values = fake.build_environment()
-    prtouch_config = fake.make_prtouch_v2_config(printer, pins, values)
-    pv2 = prtouch_v2.PRTouchV2(prtouch_config)
-    printer.add_object('prtouch_v2', pv2)
+    printer, mcu, _pins, _values = fake.build_environment()
 
     zc_config = fake.make_z_compensate_config(printer, dict(fake.REAL_Z_COMPENSATE_CONFIG))
     zc = z_compensate.ZCompensate(zc_config)
 
     fake.connect(printer, mcu)
-    prtouch_config.assert_all_consumed()
     zc_config.assert_all_consumed()
 
     z_offset_probe = printer.lookup_object('nebulaos_z_offset_probe')
@@ -187,13 +191,18 @@ class ZCompensateUsesNewBackendTest(unittest.TestCase):
         _, _, z_probe, zc = _build()
         self.assertIs(zc.z_offset_probe, z_probe)
 
-    def test_prtouch_is_optional(self):
-        printer, mcu, pins, values = fake.build_environment()
+    def test_prtouch_is_never_referenced_at_all(self):
+        """Phase 1.8B: PRTouch isn't merely optional here any more, it's gone entirely -
+        z_compensate.py no longer has a `self.prtouch` attribute of any kind (not even a
+        None placeholder), and this constructs cleanly with no [prtouch_v2] object
+        registered in the fake printer at all."""
+        printer, mcu, _pins, _values = fake.build_environment()
         zc_config = fake.make_z_compensate_config(
             printer, dict(fake.REAL_Z_COMPENSATE_CONFIG))
         zc = z_compensate.ZCompensate(zc_config)
         fake.connect(printer, mcu)
-        self.assertIsNone(zc.prtouch)
+        self.assertIsNone(printer.lookup_object('prtouch_v2', None))
+        self.assertFalse(hasattr(zc, 'prtouch'))
 
     def test_calibration_calls_z_offset_probe_touch_probe(self):
         _, _, z_probe, zc = _build(stub_measurement=0.05)
@@ -220,23 +229,70 @@ class NoGlobalProbeRegistrationTest(unittest.TestCase):
         self.assertNotIn('start_probe_session', code)
 
 
-class NozzleClearRequiresPRTouchTest(unittest.TestCase):
-    """CRTENSE_NOZZLE_CLEAR fails cleanly when prtouch_v2 is not configured."""
+class NozzleClearUsesNativeBackendRegardlessOfPRTouchTest(unittest.TestCase):
+    """Supersedes the old NozzleClearRequiresPRTouchTest, which asserted the OPPOSITE
+    contract: that CRTENSE_NOZZLE_CLEAR hard-failed with a "requires [prtouch_v2]" error
+    when PRTouch wasn't configured, and that zc.prtouch existed when it was. Neither half
+    of that contract exists any more (Phase 1.8B) - nozzle_clear.py's native load-cell
+    backend is now the ONLY implementation of CRTENSE_NOZZLE_CLEAR, unconditionally, with
+    no PRTouch dependency, fallback, or optionality of any kind. See
+    extras/PRTOUCH_REMOVAL_PLAN.md for the full removal accounting.
 
-    def test_nozzle_clear_without_prtouch_raises_clear_error(self):
-        printer, mcu, pins, values = fake.build_environment()
-        zc_config = fake.make_z_compensate_config(
-            printer, dict(fake.REAL_Z_COMPENSATE_CONFIG))
-        zc = z_compensate.ZCompensate(zc_config)
-        fake.connect(printer, mcu)
+    test_nozzle_clear_runs_end_to_end_via_the_native_backend below is the strong form of
+    this proof: it actually calls zc.cmd_nozzle_clear() through the same _build()-style
+    fixture as ZCompensateUsesNewBackendTest.test_calibration_calls_z_offset_probe_touch_probe
+    and confirms it completes without ever touching a prtouch_v2 object (there isn't one
+    registered in the fake printer at all) or a `zc.prtouch` attribute (there isn't one on
+    zc at all). test_z_compensate_source_has_no_functional_prtouch_reference is a second,
+    independent grep-level proof, deliberately narrower than a blind substring search:
+    z_compensate.py itself is off-limits to edit as part of this test-file cleanup, and its
+    comments/docstrings legitimately still name prtouch_v2/prtouch_nozzle/prtouch_calibration
+    in past tense while explaining what was removed and why (see e.g. its cmd_nozzle_clear
+    docstring) - a plain `assertNotIn('prtouch_v2', source)` would fail on that historical
+    prose despite there being zero functional (import/lookup_object/attribute) references
+    left. The regexes below check only for those three functional shapes."""
+
+    def test_nozzle_clear_runs_end_to_end_via_the_native_backend(self):
+        printer, _, z_probe, zc = _build()
+        self.assertIsNone(printer.lookup_object('prtouch_v2', None))
+        self.assertFalse(hasattr(zc, 'prtouch'))
+
+        calls = []
+
+        def tracking_touch_probe(down_min_z, **kwargs):
+            calls.append({'down_min_z': down_min_z, 'kwargs': kwargs})
+            return 0.0
+
+        z_probe.touch_probe = tracking_touch_probe
         gcmd = fake.FakeGCmd()
-        with self.assertRaises(fake.CommandError) as ctx:
-            zc.cmd_nozzle_clear(gcmd)
-        self.assertIn("prtouch_v2", str(ctx.exception))
+        zc.cmd_nozzle_clear(gcmd)  # must not raise
+        # Real behavioral evidence the native wipe sequence actually ran (nozzle_clear.py's
+        # clear_nozzle(): two touch-probes on the wipe pad, then G1 drag/lift moves) - not
+        # just an absence of exceptions.
+        self.assertGreaterEqual(len(calls), 2,
+                                 "clear_nozzle() must touch-probe both wipe-pad points")
+        self.assertTrue(any(s.startswith('G1 ') for s in zc.gcode.scripts_run),
+                         "clear_nozzle() must have driven real toolhead moves")
 
-    def test_nozzle_clear_with_prtouch_does_not_raise_prtouch_missing(self):
-        printer, _, _, zc = _build()
-        self.assertIsNotNone(zc.prtouch)
+    def test_z_compensate_source_has_no_functional_prtouch_reference(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(here, 'z_compensate.py')) as f:
+            source = f.read()
+        # Comment/docstring lines are excluded before matching - see this class's own
+        # docstring for why a blind whole-source substring search isn't the right tool here
+        # (z_compensate.py legitimately still narrates the PRTouch removal in prose).
+        code_lines = '\n'.join(
+            line for line in source.splitlines()
+            if line.strip() and not line.strip().startswith('#'))
+        self.assertIsNone(
+            re.search(r'^\s*(from \.\s*import|import)\s+prtouch', code_lines, re.MULTILINE),
+            "z_compensate.py must not import any prtouch_* module")
+        self.assertIsNone(
+            re.search(r'lookup_object\(\s*[\'"]prtouch', code_lines),
+            "z_compensate.py must not look up any prtouch_* printer object")
+        self.assertIsNone(
+            re.search(r'self\.prtouch\b', code_lines),
+            "z_compensate.py must not carry a self.prtouch attribute of any kind")
 
 
 if __name__ == '__main__':

@@ -10,18 +10,12 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import unittest
 
-from . import prtouch_mcu
-from . import prtouch_probe
 from . import prtouch_test_support as fake
-from . import prtouch_v2
 from . import z_compensate
 
 
 def _build(zcompensate_overrides=None, stub_measurement=0.0, stub_raises=None):
-    printer, mcu, pins, values = fake.build_environment()
-    prtouch_config = fake.make_prtouch_v2_config(printer, pins, values)
-    pv2 = prtouch_v2.PRTouchV2(prtouch_config)
-    printer.add_object('prtouch_v2', pv2)
+    printer, mcu, _pins, _values = fake.build_environment()
 
     zc_values = dict(fake.REAL_Z_COMPENSATE_CONFIG)
     if zcompensate_overrides:
@@ -30,7 +24,6 @@ def _build(zcompensate_overrides=None, stub_measurement=0.0, stub_raises=None):
     zc = z_compensate.ZCompensate(zc_config)
 
     fake.connect(printer, mcu)
-    prtouch_config.assert_all_consumed()
     zc_config.assert_all_consumed()
 
     calls = []
