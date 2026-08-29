@@ -1,6 +1,6 @@
 {
   "compat_schema_version": 1,
-  "extensions_version": "1.1.0-phase1.8-qual1",
+  "extensions_version": "1.2.0-phase1.9b-plr",
   "nebulaos_api_level": 1,
 
   "klipper": {
@@ -27,6 +27,8 @@
     "toolhead:ToolHead.get_position",
     "toolhead:ToolHead.set_position",
     "toolhead:ToolHead.wait_moves",
+    "extras.aio_executor:Dispatcher.allocate_executor",
+    "extras.aio_executor:Executor.submit",
     "gcode:GCodeDispatch.register_command",
     "gcode:GCodeDispatch.run_script_from_command",
     "pins:PrinterPins.setup_pin"
@@ -58,8 +60,12 @@
     {"path": "extras/nebulaos_z_offset_probe.py", "role": "runtime"},
     {"path": "extras/nozzle_clear.py", "role": "runtime"},
     {"path": "extras/bl24c16f.py", "role": "runtime"},
+    {"path": "extras/nebulaos_plr_journal.py", "role": "runtime"},
+    {"path": "extras/nebulaos_power_loss_recovery.py", "role": "runtime"},
 
     {"path": "extras/test_nebulaos_compat.py", "role": "test"},
+    {"path": "extras/test_nebulaos_plr_journal.py", "role": "test"},
+    {"path": "extras/test_nebulaos_power_loss_recovery.py", "role": "test"},
     {"path": "extras/test_nebulaos_temperature_mcu.py", "role": "test"},
     {"path": "extras/test_nebulaos_version.py", "role": "test"},
     {"path": "extras/test_z_compensate_offset_safety.py", "role": "test"},
