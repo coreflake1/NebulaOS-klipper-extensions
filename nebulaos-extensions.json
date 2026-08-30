@@ -74,6 +74,7 @@
     {"path": "extras/test_tmcstatus.py", "role": "test"},
     {"path": "extras/test_z_offset_probe_safety.py", "role": "test"},
     {"path": "extras/test_z_offset_probe_coexistence.py", "role": "test"},
+    {"path": "extras/test_z_offset_probe_down_min_z.py", "role": "test"},
     {"path": "extras/test_nozzle_clear_native.py", "role": "test"}
   ],
 
