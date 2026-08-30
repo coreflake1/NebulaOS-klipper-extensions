@@ -203,10 +203,49 @@ class ZCompensate:
         # v1) - not registering unless something turns out to need it.
 
     def _handle_connect(self):
-        self.z_offset_probe = self.printer.lookup_object('nebulaos_z_offset_probe')
+        # Phase 2 calibration-framework mission: this used to be an
+        # unconditional lookup_object() with no default, which made
+        # [nebulaos_z_offset_probe]'s mere ABSENCE from the composed config
+        # a hard klippy:connect failure - the whole printer would refuse to
+        # reach `ready` on any build/config that didn't happen to include
+        # it, regardless of whether anyone had ever tried to use
+        # Z_OFFSET_CALIBRATION or CRTENSE_NOZZLE_CLEAR at all. Load-cell
+        # availability (and, separately, load-cell CALIBRATION - see
+        # ZOffsetProbe.get_status()'s is_calibrated field) is now a
+        # per-command preflight condition instead, exactly like the
+        # existing "LOAD_CELL_CALIBRATE must have run" check one layer
+        # down in nebulaos_z_offset_probe.py's own _tare_and_arm(). A
+        # printer with no load cell configured at all, or one that has
+        # never run LOAD_CELL_CALIBRATE, now still reaches `ready` cleanly;
+        # it simply cannot use either of this module's two commands until
+        # that changes - see _require_load_cell() below for the exact,
+        # explicit error each of them raises in that case.
+        self.z_offset_probe = self.printer.lookup_object(
+            'nebulaos_z_offset_probe', None)
         self.probe = self.printer.lookup_object('probe')
         self.bed_mesh = self.printer.lookup_object('bed_mesh', None)
         self.home_x, self.home_y = self._resolve_z_home_xy()
+
+    def _require_load_cell(self, command_name):
+        """Preflight check for the one thing every command in this module
+        actually needs: a configured nebulaos_z_offset_probe object.
+        Deliberately does NOT check is_calibrated() here too - that check
+        already lives, correctly, in ZOffsetProbe._tare_and_arm() itself
+        (nebulaos_z_offset_probe.py), the one place that can give a precise
+        "run LOAD_CELL_CALIBRATE LOAD_CELL=<name>" message naming the real
+        section. Duplicating it here would risk the two messages drifting
+        apart. This layer only ever needs to distinguish "the load cell
+        section does not exist in this config at all" (a real, currently
+        LOAD_CELL-only-primitive gap - no error message that only makes
+        sense once a load cell exists would apply) from "it exists" (defer
+        entirely to touch_probe()'s own calibration check)."""
+        if self.z_offset_probe is None:
+            raise self.printer.command_error(
+                "%s: no [nebulaos_z_offset_probe] is configured on this "
+                "printer - this command has no METHOD=MANUAL fallback of "
+                "its own; use stock PROBE_CALIBRATE directly for a manual "
+                "Z-offset, or add [nebulaos_z_offset_probe] to printer.cfg "
+                "to enable this command" % (command_name,))
 
     @staticmethod
     def _read_configured_mesh_bounds(config):
@@ -329,6 +368,7 @@ class ZCompensate:
         PRTouch's custom MCU commands entirely - [prtouch_v2] is no longer a dependency of this
         command, or of this module at all. See extras/nozzle_clear.py and
         extras/PRTOUCH_REMOVAL_PLAN.md for the full parity review and removal accounting."""
+        self._require_load_cell('CRTENSE_NOZZLE_CLEAR')
         hot_start_temp = gcmd.get_float('HOT_START_TEMP', self.hot_start_temp)
         hot_rub_temp = gcmd.get_float('HOT_RUB_TEMP', self.hot_rub_temp)
         hot_end_temp = gcmd.get_float('HOT_END_TEMP', self.hot_end_temp)
@@ -382,6 +422,7 @@ class ZCompensate:
         if self.calibration_state == "running":
             raise self.printer.command_error(
                 "Z_OFFSET_CALIBRATION: a calibration is already in progress")
+        self._require_load_cell('Z_OFFSET_CALIBRATION')
 
         # Structured status: a new attempt always gets a new id and clears any previous
         # result before doing anything else - a caller polling get_status() must never see a
