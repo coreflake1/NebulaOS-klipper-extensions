@@ -583,6 +583,15 @@ class FakeGCmd:
         value = int(self._params[name]) if name in self._params else default
         return self._checked(name, value, **kwargs)
 
+    def get(self, name, default=None, **kwargs):
+        # Phase 2 calibration-framework mission: plain string param getter,
+        # matching real Klipper's GCodeCommand.get() - added for
+        # nebulaos_calibration.py's METHOD=/PROFILE= params. Purely
+        # additive; every existing caller of get_float()/get_int() is
+        # unaffected.
+        value = self._params[name] if name in self._params else default
+        return value
+
     def respond_info(self, msg):
         self.responses.append(msg)
 

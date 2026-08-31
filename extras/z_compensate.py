@@ -196,6 +196,15 @@ class ZCompensate:
 
         self.gcode.register_command('CRTENSE_NOZZLE_CLEAR', self.cmd_nozzle_clear,
                                      desc=self.cmd_nozzle_clear_help)
+        # Phase 2 calibration-framework mission: NEBULAOS_NOZZLE_CLEAN is
+        # the new canonical name for the exact same command -
+        # CRTENSE_NOZZLE_CLEAR is kept, unchanged, as a compatibility
+        # alias because GuppyScreen's RecalibrationWizardPanel already
+        # calls it by that name (see docs/NEBULAOS_CALIBRATION_PUBLIC_API.md).
+        # Both names share one handler/help string on purpose - there is
+        # exactly one implementation, never two to keep in sync.
+        self.gcode.register_command('NEBULAOS_NOZZLE_CLEAN', self.cmd_nozzle_clear,
+                                     desc=self.cmd_nozzle_clear_help)
         self.gcode.register_command('Z_OFFSET_CALIBRATION', self.cmd_z_offset_calibration,
                                      desc=self.cmd_z_offset_calibration_help)
         # Z_OFFSET_AUTO: registered by the real z_compensate_wrapper.so but never actually

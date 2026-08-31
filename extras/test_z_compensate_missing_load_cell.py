@@ -119,5 +119,35 @@ class WithLoadCellConfiguredBehaviorIsUnchanged(unittest.TestCase):
         self.assertEqual(zc.calibration_state, 'complete')
 
 
+class NozzleCleanCanonicalAliasTest(unittest.TestCase):
+    """Phase 2 calibration-framework mission: NEBULAOS_NOZZLE_CLEAN is the
+    canonical name; CRTENSE_NOZZLE_CLEAR must keep working unchanged
+    because GuppyScreen's RecalibrationWizardPanel already calls it."""
+
+    def test_both_names_are_registered_to_the_same_handler(self):
+        printer, mcu, _pins, _values = fake.build_environment()
+        zc_config = fake.make_z_compensate_config(printer, dict(fake.REAL_Z_COMPENSATE_CONFIG))
+        zc = z_compensate.ZCompensate(zc_config)
+        fake.connect(printer, mcu)
+        gcode = printer.lookup_object('gcode')
+        self.assertIn('CRTENSE_NOZZLE_CLEAR', gcode.commands)
+        self.assertIn('NEBULAOS_NOZZLE_CLEAN', gcode.commands)
+        # Two freshly-created bound-method objects for the SAME underlying
+        # function/instance are never `is`-identical in Python (each
+        # attribute access makes a new bound-method wrapper) - compare the
+        # underlying function and instance instead, which is what actually
+        # matters here: one implementation, two registered names.
+        a = gcode.commands['CRTENSE_NOZZLE_CLEAR']
+        b = gcode.commands['NEBULAOS_NOZZLE_CLEAN']
+        self.assertIs(a.__func__, b.__func__)
+        self.assertIs(a.__self__, b.__self__)
+
+    def test_canonical_name_raises_the_same_preflight_error_without_a_load_cell(self):
+        _, _, zc = _build_without_load_cell()
+        with self.assertRaises(fake.CommandError) as ctx:
+            zc.cmd_nozzle_clear(fake.FakeGCmd())
+        self.assertIn('CRTENSE_NOZZLE_CLEAR', str(ctx.exception))
+
+
 if __name__ == '__main__':
     unittest.main()
