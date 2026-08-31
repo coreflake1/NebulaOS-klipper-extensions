@@ -80,7 +80,8 @@
     {"path": "extras/test_nozzle_clear_native.py", "role": "test"},
     {"path": "extras/test_z_compensate_missing_load_cell.py", "role": "test"},
     {"path": "extras/test_nebulaos_probe_pair.py", "role": "test"},
-    {"path": "extras/test_nebulaos_calibration.py", "role": "test"}
+    {"path": "extras/test_nebulaos_calibration.py", "role": "test"},
+    {"path": "extras/test_nebulaos_axis_twist.py", "role": "test"}
   ],
 
   "sensor_types": [
