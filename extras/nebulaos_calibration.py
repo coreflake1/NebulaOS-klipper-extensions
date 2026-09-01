@@ -1,11 +1,10 @@
 # NebulaOS calibration coordinator (Phase 2 calibration-framework mission;
-# contact-safety stabilization rewrite).
+# contact-safety stabilization rewrite, corrected).
 #
 # The single [nebulaos_calibration] object that owns the canonical
 # NEBULAOS_* public calibration API. Slices implemented so far: standalone
-# NEBULAOS_Z_OFFSET_CALIBRATE (METHOD=LOAD_CELL|MANUAL, bounded-descent
-# envelope + measurement-quality/repeatability gating), thin delegating
-# wrappers for PID/bed-mesh, and NEBULAOS_AXIS_TWIST_CALIBRATE
+# NEBULAOS_Z_OFFSET_CALIBRATE (LOAD_CELL only, bounded-descent envelope +
+# measurement-quality/repeatability gating) and NEBULAOS_AXIS_TWIST_CALIBRATE
 # (AXIS=X|Y|BOTH - see "Axis Twist" section below: HARD BLOCKED pending
 # remote load-cell contact hardware qualification). NEBULAOS_AUTO_CALIBRATE,
 # the guided Input Shaper/E-Steps workflows, NEBULAOS_CALIBRATION_CONTINUE/
@@ -15,17 +14,29 @@
 # ---------------------------------------------------------------------
 # Upstream-first cleanup (Overnight Contact-Safety Stabilization mission)
 # ---------------------------------------------------------------------
-# Manual Axis Twist is NO LONGER wrapped here at all. There is exactly one
-# way to run it: call pristine upstream's own
-# AXIS_TWIST_COMPENSATION_CALIBRATE AXIS=X|Y directly (also its own
-# interactive TESTZ/ACCEPT/ABORT workflow) - this module used to offer a
-# thin METHOD=MANUAL passthrough (`_axis_twist_calibrate_manual`), which
-# added a second name for the exact same upstream command with no product
-# value, and has been removed. klippy/extras/axis_twist_compensation.py
-# (58bd67db..., NOT modified, NOT shadowed, NOT monkeypatched - see
-# docs/NEBULAOS_PRISTINE_KLIPPER.md) remains fully authoritative for X/Y
-# compensation data, interpolation, and runtime correction, exactly as
-# before.
+# Manual Axis Twist and manual Z-offset are NO LONGER wrapped here at all.
+# There is exactly one way to run each: call pristine upstream's own
+# AXIS_TWIST_COMPENSATION_CALIBRATE AXIS=X|Y or PROBE_CALIBRATE directly
+# (both their own interactive TESTZ/ACCEPT/ABORT workflows) - this module
+# used to offer thin METHOD=MANUAL passthroughs for both, which added a
+# second name for the exact same upstream command with no product value,
+# and both have been removed. klippy/extras/axis_twist_compensation.py and
+# probe.py (58bd67db..., NOT modified, NOT shadowed, NOT monkeypatched -
+# see docs/NEBULAOS_PRISTINE_KLIPPER.md) remain fully authoritative,
+# exactly as before.
+#
+# The PID-default-target and bed-mesh-named-profile Python wrappers
+# (NEBULAOS_PID_CALIBRATE_BED/_HOTEND, NEBULAOS_BED_MESH_CALIBRATE) are
+# also removed. The bed-mesh one was a real duplication, not just a
+# convenience: pinned upstream bed_mesh.py's own cmd_BED_MESH_CALIBRATE
+# already reads `gcmd.get('PROFILE', "default")` and saves under it
+# directly (confirmed against the pinned source, not assumed) - so
+# `BED_MESH_CALIBRATE PROFILE=<name>` alone is the exact upstream
+# equivalent of what this module's own wrapper did in two commands. PID's
+# default-target convenience has no upstream equivalent (TARGET is
+# required, no default), but that is a firmware-config concern, not a
+# reason to keep Python in this repository - see NebulaOS-firmware's own
+# gcode_macro convenience wrappers instead.
 #
 # ---------------------------------------------------------------------
 # Axis Twist: automatic (LOAD_CELL) path is HARD BLOCKED
@@ -214,6 +225,35 @@ class NebulaOSCalibration:
         # these two options still works exactly as before.
         self.reference_x = config.getfloat('reference_x', default=None)
         self.reference_y = config.getfloat('reference_y', default=None)
+        # Nozzle-contact safety envelope constants (corrected) - see
+        # nebulaos_probe_pair.py's own header for the exact two formulas.
+        # Deliberately no invented production defaults for either; exactly
+        # one is required per run, depending on whether the CURRENT live
+        # probe z_offset is a credible physical prior (ESTABLISHED) or not
+        # (BOOTSTRAP/virgin, e.g. the real factory default of 0.000).
+        #
+        # established_contact_margin_mm: how much FURTHER than the
+        # predicted nozzle-contact plane (raw_probe_trigger_z -
+        # CURRENT probe z_offset) the nozzle may still be commanded to
+        # travel. Deliberately does NOT also carry the probe's own Z
+        # offset the way an earlier, incorrect version of this envelope
+        # (anchored to the raw probe trigger Z directly) accidentally did
+        # - on this printer's real captured hardware state that offset is
+        # ~1.795mm, far larger than any sane margin, which is exactly the
+        # bug this rename and re-derivation fixes.
+        self.established_contact_margin_mm = config.getfloat(
+            'established_contact_margin_mm', default=None,
+            minval=0.01, maxval=5.)
+        # bootstrap_contact_envelope_mm: how far below the nozzle's own
+        # actual, known, currently-measured starting Z a BOOTSTRAP/virgin
+        # calibration run (no credible prior) may blindly search. A
+        # SEPARATE value from down_min_z - never silently reused as one -
+        # requiring its own explicit hardware qualification before a
+        # virgin printer's first automatic Z-offset calibration can run
+        # at all.
+        self.bootstrap_contact_envelope_mm = config.getfloat(
+            'bootstrap_contact_envelope_mm', default=None,
+            minval=0.5, maxval=30.)
         # Measurement-quality and repeatability acceptance bounds (§7/§9/
         # §10) - deliberately no invented production defaults. Left unset
         # (None) until real hardware qualification establishes them;
@@ -228,12 +268,6 @@ class NebulaOSCalibration:
             'max_repeatability_range', default=None, minval=0.001, maxval=10.)
         self.max_repeatability_stddev = config.getfloat(
             'max_repeatability_stddev', default=None, minval=0.001, maxval=10.)
-        self.default_bed_pid_target = config.getfloat(
-            'default_bed_pid_target', default=65., above=0.)
-        self.default_hotend_pid_target = config.getfloat(
-            'default_hotend_pid_target', default=230., above=0.)
-        self.bed_mesh_profile_name = config.get(
-            'bed_mesh_profile_name', default='nebulaos_calibration')
         self.axis_twist_sample_count = config.getint(
             'axis_twist_sample_count', default=_DEFAULT_AXIS_TWIST_SAMPLE_COUNT,
             minval=2)
@@ -248,7 +282,8 @@ class NebulaOSCalibration:
         # comment on why that stays out of normal status).
         self.z_offset_physical_x = None
         self.z_offset_physical_y = None
-        self.z_offset_predicted_surface_z = None
+        self.z_offset_contact_mode = None
+        self.z_offset_predicted_nozzle_contact_z = None
         self.z_offset_commanded_floor_z = None
         self.z_offset_raw_probe_trigger_z = None
         self.z_offset_sample_count = None
@@ -278,15 +313,6 @@ class NebulaOSCalibration:
         self.gcode.register_command(
             'NEBULAOS_Z_OFFSET_CALIBRATE', self.cmd_z_offset_calibrate,
             desc=self.cmd_z_offset_calibrate_help)
-        self.gcode.register_command(
-            'NEBULAOS_PID_CALIBRATE_BED', self.cmd_pid_calibrate_bed,
-            desc=self.cmd_pid_calibrate_bed_help)
-        self.gcode.register_command(
-            'NEBULAOS_PID_CALIBRATE_HOTEND', self.cmd_pid_calibrate_hotend,
-            desc=self.cmd_pid_calibrate_hotend_help)
-        self.gcode.register_command(
-            'NEBULAOS_BED_MESH_CALIBRATE', self.cmd_bed_mesh_calibrate,
-            desc=self.cmd_bed_mesh_calibrate_help)
         self.gcode.register_command(
             'NEBULAOS_CALIBRATION_STATUS', self.cmd_calibration_status,
             desc=self.cmd_calibration_status_help)
@@ -339,7 +365,8 @@ class NebulaOSCalibration:
             'z_offset_error': self.z_offset_error,
             'z_offset_physical_x': self.z_offset_physical_x,
             'z_offset_physical_y': self.z_offset_physical_y,
-            'z_offset_predicted_surface_z': self.z_offset_predicted_surface_z,
+            'z_offset_contact_mode': self.z_offset_contact_mode,
+            'z_offset_predicted_nozzle_contact_z': self.z_offset_predicted_nozzle_contact_z,
             'z_offset_commanded_floor_z': self.z_offset_commanded_floor_z,
             'z_offset_raw_probe_trigger_z': self.z_offset_raw_probe_trigger_z,
             'z_offset_sample_count': self.z_offset_sample_count,
@@ -363,50 +390,29 @@ class NebulaOSCalibration:
     # NEBULAOS_Z_OFFSET_CALIBRATE
     # ------------------------------------------------------------------
     cmd_z_offset_calibrate_help = (
-        "Calibrate the BLTouch Z-offset (METHOD=LOAD_CELL|MANUAL)")
+        "Calibrate the BLTouch Z-offset via the local secondary load cell "
+        "- for a manual calibration, use pristine upstream PROBE_CALIBRATE "
+        "directly")
 
     def cmd_z_offset_calibrate(self, gcmd):
-        method = gcmd.get('METHOD', 'LOAD_CELL').upper()
-        if method == 'MANUAL':
-            self._z_offset_calibrate_manual(gcmd)
-        elif method == 'LOAD_CELL':
-            self._z_offset_calibrate_load_cell(gcmd)
-        else:
-            raise self.printer.command_error(
-                "NEBULAOS_Z_OFFSET_CALIBRATE: unknown METHOD='%s' - "
-                "expected LOAD_CELL or MANUAL" % (method,))
-
-    def _z_offset_calibrate_manual(self, gcmd):
-        """No duplicate paper-test implementation - delegates straight to
-        stock PROBE_CALIBRATE, which already does exactly the "normal
-        probe measurement + upstream Klipper manual nozzle reference"
-        sequence this mode calls for (automatic BLTouch probe, move nozzle
-        over that point, ManualProbeHelper's TESTZ/ACCEPT/ABORT, then its
-        own configfile.set()). This call only starts that interactive
-        session; the user continues it with TESTZ/ACCEPT/ABORT exactly as
-        they would after calling PROBE_CALIBRATE directly."""
-        self.gcode.respond_info(
-            "NEBULAOS_Z_OFFSET_CALIBRATE: starting a manual Z-offset "
-            "calibration via stock PROBE_CALIBRATE - continue with TESTZ/"
-            "ACCEPT/ABORT.")
-        self.gcode.run_script_from_command('PROBE_CALIBRATE')
-
-    def _z_offset_calibrate_load_cell(self, gcmd):
+        """LOAD_CELL only - there is no METHOD=MANUAL passthrough any more
+        (see this module's own header comment: call pristine upstream
+        PROBE_CALIBRATE directly for a manual run, it needs no wrapper)."""
         z_offset_probe = self.printer.lookup_object('nebulaos_z_offset_probe', None)
         if z_offset_probe is None:
             raise self.printer.command_error(
                 "NEBULAOS_Z_OFFSET_CALIBRATE: no [nebulaos_z_offset_probe] "
-                "is configured on this printer - use METHOD=MANUAL instead, "
-                "or add [nebulaos_z_offset_probe] to printer.cfg")
+                "is configured on this printer - use stock PROBE_CALIBRATE "
+                "instead, or add [nebulaos_z_offset_probe] to printer.cfg")
         if not z_offset_probe.get_status(self.reactor.monotonic())['is_calibrated']:
             raise self.printer.command_error(
                 "NEBULAOS_Z_OFFSET_CALIBRATE: the load cell has not been "
                 "calibrated yet - run LOAD_CELL_CALIBRATE first, or use "
-                "METHOD=MANUAL")
+                "stock PROBE_CALIBRATE instead")
 
         x, y = self._resolve_reference_xy(gcmd)
         probe_obj = self.printer.lookup_object('probe')
-        probe_x_offset, probe_y_offset, _z_offset = probe_obj.get_offsets()
+        probe_x_offset, probe_y_offset, probe_z_offset = probe_obj.get_offsets()
 
         self.z_offset_id += 1
         self.z_offset_state = 'running'
@@ -416,24 +422,31 @@ class NebulaOSCalibration:
         self.z_offset_physical_y = y
 
         try:
-            # Bounded-descent envelope, measurement-quality gates, and
-            # repeatability aggregation all live inside this call now
-            # (§5-§10) - measure_probe_nozzle_pair() fails closed with
-            # CONTACT_SAFETY_LIMIT_UNQUALIFIED before any nozzle contact
-            # motion if max_contact_descent_mm/max_abs_fit_delta/the
-            # repeatability bounds are not configured (not yet hardware-
-            # qualified). See nebulaos_probe_pair.py's own header.
+            # Bounded-descent envelope (ESTABLISHED vs BOOTSTRAP, derived
+            # from the CURRENT live probe_z_offset), measurement-quality
+            # gates, and repeatability aggregation all live inside this
+            # call now (§5-§10, corrected) - measure_probe_nozzle_pair()
+            # fails closed with CONTACT_SAFETY_LIMIT_UNQUALIFIED before any
+            # nozzle contact motion if the envelope constant this run
+            # needs (established_contact_margin_mm or bootstrap_contact_
+            # envelope_mm), max_abs_fit_delta, or the repeatability bounds
+            # are not configured (not yet hardware-qualified). See
+            # nebulaos_probe_pair.py's own header for the exact formulas.
             measurement = nebulaos_probe_pair.measure_probe_nozzle_pair(
                 self.printer, x, y, probe_x_offset, probe_y_offset,
+                probe_z_offset,
                 self.horizontal_move_z, z_offset_probe, self.down_min_z,
                 pro_cnt=self.pro_cnt, travel_speed=self.travel_speed,
                 probe_lift_speed=self.probe_lift_speed,
+                established_contact_margin_mm=self.established_contact_margin_mm,
+                bootstrap_contact_envelope_mm=self.bootstrap_contact_envelope_mm,
                 max_abs_fit_delta=self.max_abs_fit_delta,
                 min_accepted_samples=self.min_accepted_samples,
                 max_repeatability_range=self.max_repeatability_range,
                 max_repeatability_stddev=self.max_repeatability_stddev)
 
-            self.z_offset_predicted_surface_z = measurement.predicted_surface_z
+            self.z_offset_contact_mode = measurement.contact_mode
+            self.z_offset_predicted_nozzle_contact_z = measurement.predicted_nozzle_contact_z
             self.z_offset_commanded_floor_z = measurement.commanded_floor_z
             self.z_offset_raw_probe_trigger_z = measurement.raw_probe_trigger_z
             self.z_offset_sample_count = measurement.repeatability.sample_count
@@ -581,32 +594,6 @@ class NebulaOSCalibration:
             self.axis_twist_y_state = state
             self.axis_twist_y_result = result
             self.axis_twist_y_error = error
-
-    # ------------------------------------------------------------------
-    # Thin delegating wrappers (real logic stays entirely upstream)
-    # ------------------------------------------------------------------
-    cmd_pid_calibrate_bed_help = "Calibrate bed heater PID (stock PID_CALIBRATE)"
-
-    def cmd_pid_calibrate_bed(self, gcmd):
-        target = gcmd.get_float('TARGET', self.default_bed_pid_target)
-        self.gcode.run_script_from_command(
-            'PID_CALIBRATE HEATER=heater_bed TARGET=%.2f' % (target,))
-
-    cmd_pid_calibrate_hotend_help = "Calibrate hotend PID (stock PID_CALIBRATE)"
-
-    def cmd_pid_calibrate_hotend(self, gcmd):
-        target = gcmd.get_float('TARGET', self.default_hotend_pid_target)
-        self.gcode.run_script_from_command(
-            'PID_CALIBRATE HEATER=extruder TARGET=%.2f' % (target,))
-
-    cmd_bed_mesh_calibrate_help = (
-        "Full reference bed mesh, saved under a named profile (stock BED_MESH_CALIBRATE)")
-
-    def cmd_bed_mesh_calibrate(self, gcmd):
-        profile = gcmd.get('PROFILE', self.bed_mesh_profile_name)
-        self.gcode.run_script_from_command('BED_MESH_CALIBRATE')
-        self.gcode.run_script_from_command(
-            'BED_MESH_PROFILE SAVE="%s"' % (profile,))
 
     # ------------------------------------------------------------------
     # NEBULAOS_CALIBRATION_STATUS
