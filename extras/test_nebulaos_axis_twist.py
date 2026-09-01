@@ -1,23 +1,35 @@
 # Tests for NEBULAOS_AXIS_TWIST_CALIBRATE (extras/nebulaos_calibration.py,
-# Phase 2 calibration-framework mission).
+# Phase 2 calibration-framework mission; contact-safety stabilization
+# rewrite).
 #
-# Two layers, matching the confidence levels the project's own rules ask
-# for:
-#   1. Fast orchestration tests against FakeAxisTwistCompensation/
-#      FakeCalibrater - a hand-written stand-in that mirrors the real
-#      upstream _finalize_calibration() algorithm exactly (mean-center),
-#      used to test THIS module's own preflight/sequencing/state/error
-#      logic without needing the real pinned Klipper source on disk.
-#   2. RealUpstreamParityTest - imports the REAL pinned
-#      axis_twist_compensation.py directly (klippy/extras/, 58bd67db...)
-#      and drives this module's own coordinator against the REAL
-#      AxisTwistCompensation/Calibrater objects, proving the fake in layer
-#      1 is not merely self-consistent but actually matches upstream.
+# Automatic (LOAD_CELL) Axis Twist is now HARD BLOCKED pending hardware
+# qualification of remote HX711 nozzle contact (see nebulaos_calibration.py's
+# own header comment and the real safety incident this whole mission is
+# built on: _evidence/overnight-hx711-investigation-20260831-233518/
+# REPORT.md). Manual Axis Twist is no longer wrapped at all - call pristine
+# upstream AXIS_TWIST_COMPENSATION_CALIBRATE directly.
+#
+# Three layers:
+#   1. BedPointGenerationTest - axis_twist_bed_points() is pure point-
+#      generation math, unaffected by the hard block, still exercised as
+#      before.
+#   2. GeometryPreflightTest - axis_twist_geometry_preflight(), the
+#      CORRECTED (subtraction-based) pure geometry check a future
+#      qualification mission will wire back in. NOT reachable from
+#      cmd_axis_twist_calibrate() today (see HardBlockTest below) - tested
+#      standalone so it is ready and proven correct in advance.
+#   3. HardBlockTest/StatusTest - proves the live command performs ZERO
+#      motion and ZERO hardware object lookups for every AXIS value.
+#   4. RealUpstreamParityTest - imports the REAL pinned
+#      axis_twist_compensation.py (58bd67db...) directly and proves the
+#      real object's own _finalize_calibration() math matches what a
+#      future re-activation of the LOAD_CELL path would rely on - kept as
+#      a pinned-compatibility proof even though this project's own
+#      coordinator does not call it today.
 #
 # Run from klippy/: python3 -m unittest extras.test_nebulaos_axis_twist -v
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import math
 import os
 import sys
 import types
@@ -31,11 +43,10 @@ if 'extras.probe' not in sys.modules:
     sys.modules['extras.probe'] = _placeholder
 
 from . import nebulaos_calibration
-from . import nebulaos_probe_pair
 
 
 # ---------------------------------------------------------------------
-# Layer 1 fakes
+# Fakes
 # ---------------------------------------------------------------------
 
 class FakeCalibrater:
@@ -43,7 +54,9 @@ class FakeCalibrater:
     algorithm (58bd67db..., axis_twist_compensation.py) exactly - mean-
     center the raw results, stage per-axis config fields, activate the
     live compensation array. RealUpstreamParityTest below proves this
-    mirroring is accurate, not just self-consistent."""
+    mirroring is accurate, not just self-consistent. Kept even though
+    nothing in this project's live command path calls it any more - a
+    future re-activation of the LOAD_CELL path will."""
 
     def __init__(self, compensation):
         self.compensation = compensation
@@ -81,7 +94,6 @@ class FakeAxisTwistCompensation:
         self.calibrater = FakeCalibrater(self)
 
     def clear_compensations(self, axis=None):
-        # Mirrors real upstream exactly: per-axis-only clearing.
         self.clear_calls.append(axis)
         if axis is None:
             self.z_compensations = []
@@ -132,10 +144,15 @@ class FakeConfigFile:
 
 def _build(axis_twist=None, z_offset_probe=None, probe_obj=None,
            config_overrides=None):
+    """Deliberately allows building a coordinator with NO
+    axis_twist_compensation/z_offset_probe/probe objects registered at all
+    (all three default to None/absent) - HardBlockTest relies on this to
+    prove cmd_axis_twist_calibrate() never looks any of them up."""
     printer = fake.FakePrinter()
     gcode = fake.FakeGCode()
     printer.add_object('gcode', gcode)
-    printer.add_object('probe', probe_obj if probe_obj is not None else FakeProbeObj())
+    if probe_obj is not None:
+        printer.add_object('probe', probe_obj)
     printer.add_object('configfile', FakeConfigFile())
     if axis_twist is not None:
         printer.add_object('axis_twist_compensation', axis_twist)
@@ -149,62 +166,18 @@ def _build(axis_twist=None, z_offset_probe=None, probe_obj=None,
     return printer, gcode, coordinator
 
 
-def _constant_measurements(value, count):
-    """Every sample reports the identical raw (probe_trigger, contact)
-    pair - the canonical "flat bed" case: normalized compensations must
-    all be exactly zero."""
-    seq = [value] * count
-    return _measurement_sequence(seq)
-
-
-def _measurement_sequence(probe_minus_contact_values):
-    """Builds a stub for nebulaos_probe_pair.measure_probe_nozzle_pair that
-    returns, in order, one PairedMeasurement per call whose
-    probe_z_offset equals the given value (raw_probe_trigger_z fixed at
-    that value, raw_nozzle_contact_z fixed at 0 - the specific split
-    between the two doesn't matter, only the difference does, per this
-    module's own parity note)."""
-    calls = []
-
-    def stub(printer, x, y, probe_x_offset, probe_y_offset, horizontal_move_z,
-              z_offset_probe, down_min_z, pro_cnt=1, travel_speed=None,
-              probe_lift_speed=None):
-        i = len(calls)
-        calls.append((x, y))
-        value = probe_minus_contact_values[i]
-        return nebulaos_probe_pair.PairedMeasurement(
-            x=x, y=y, raw_probe_trigger_z=value, raw_nozzle_contact_z=0.0,
-            probe_z_offset=value)
-    stub.calls = calls
-    return stub
-
-
-class _StubbedPairMixin:
-    def _run_with_stub(self, coordinator, gcmd, stub):
-        orig = nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair
-        nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = stub
-        try:
-            coordinator.cmd_axis_twist_calibrate(gcmd)
-        finally:
-            nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = orig
-
-
 # ---------------------------------------------------------------------
-# Geometry / point generation
+# Geometry / point generation (unaffected by the hard block)
 # ---------------------------------------------------------------------
 
 class BedPointGenerationTest(unittest.TestCase):
     def test_x_axis_three_points_matches_hand_computed_upstream_formula(self):
-        # Upstream: x_axis_range = end - start; interval = range/(n-1);
-        # x_i = start + i*interval; y constant = calibrate_y.
-        # start=20, end=200 -> range=180, n=3 -> interval=90.
         comp = FakeAxisTwistCompensation(calibrate_start_x=20., calibrate_end_x=200.,
                                           calibrate_y=117.5)
         points = nebulaos_calibration.axis_twist_bed_points(comp, 'X', 3)
         self.assertEqual(points, [(20.0, 117.5), (110.0, 117.5), (200.0, 117.5)])
 
     def test_y_axis_three_points_matches_hand_computed_upstream_formula(self):
-        # start=40, end=200 -> range=160, n=3 -> interval=80.
         comp = FakeAxisTwistCompensation(calibrate_start_y=40., calibrate_end_y=200.,
                                           calibrate_x=117.5)
         points = nebulaos_calibration.axis_twist_bed_points(comp, 'Y', 3)
@@ -238,11 +211,6 @@ class BedPointGenerationTest(unittest.TestCase):
             nebulaos_calibration.axis_twist_bed_points(comp, 'Y', 3)
 
     def test_probe_offset_applied_by_the_shared_primitive_not_here(self):
-        # axis_twist_bed_points() returns NOZZLE-target bed points -
-        # exactly like upstream's own bed_points list. The probe-side
-        # offset subtraction is nebulaos_probe_pair's job (already proven
-        # in test_nebulaos_probe_pair.py) - this test only guards against
-        # a future accidental double-application.
         comp = FakeAxisTwistCompensation(calibrate_start_x=20., calibrate_end_x=200.,
                                           calibrate_y=117.5)
         points = nebulaos_calibration.axis_twist_bed_points(comp, 'X', 3)
@@ -250,160 +218,144 @@ class BedPointGenerationTest(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------
-# Math / normalization parity (sign-regression focus)
+# Corrected geometry preflight (§15/§16) - subtraction-based transform
 # ---------------------------------------------------------------------
 
-class NormalizationMathTest(unittest.TestCase, _StubbedPairMixin):
-    def test_constant_measurements_normalize_to_all_zeros(self):
-        axis_twist = FakeAxisTwistCompensation()
-        z_probe = FakeZOffsetProbe(True)
-        printer, gcode, coord = _build(axis_twist, z_probe)
-        stub = _constant_measurements(1.234, 3)
-        self._run_with_stub(coord, fake.FakeGCmd({'AXIS': 'X', 'METHOD': 'LOAD_CELL'}), stub)
-        self.assertEqual(axis_twist.z_compensations, [0.0, 0.0, 0.0])
+class GeometryPreflightTest(unittest.TestCase):
+    """The corrected (subtraction-based) preflight math. An earlier
+    session's live-patched version of this exact check used ADDITION
+    (probe_target = point + offset) and wrongly concluded the real,
+    hardware-tested config (calibrate_end_y=200, probe y_offset=+27,
+    axis_maximum=223) was unsafe - a negative test built on that wrong
+    conclusion then ran a real, unbounded physical touch on the printer
+    (see nebulaos-klipper-loadcell-architecture-history.md /
+    the overnight investigation report). The correct transform, proven
+    directly against nebulaos_probe_pair.py's own real, hardware-
+    qualified code, is SUBTRACTION - this file's own required test cases,
+    per the mission, include the exact point that earlier mistake flagged
+    as unsafe, now proven safe."""
 
-    def test_positive_gradient_produces_expected_symmetric_pattern(self):
-        # Raw values 0, 1, 2 -> avg=1 -> compensations = [1, 0, -1].
-        axis_twist = FakeAxisTwistCompensation()
-        z_probe = FakeZOffsetProbe(True)
-        printer, gcode, coord = _build(axis_twist, z_probe)
-        stub = _measurement_sequence([0.0, 1.0, 2.0])
-        self._run_with_stub(coord, fake.FakeGCmd({'AXIS': 'X', 'METHOD': 'LOAD_CELL'}), stub)
-        self.assertEqual(axis_twist.z_compensations, [1.0, 0.0, -1.0])
+    def test_current_x_geometry_passes(self):
+        comp = FakeAxisTwistCompensation(calibrate_start_x=20., calibrate_end_x=200.,
+                                          calibrate_y=117.5)
+        points = nebulaos_calibration.axis_twist_bed_points(comp, 'X', 3)
+        result = nebulaos_calibration.axis_twist_geometry_preflight(
+            'X', points, probe_x_offset=0., probe_y_offset=27.,
+            axis_minimum=0., axis_maximum=235.)
+        self.assertEqual(len(result), 3)
 
-    def test_negative_gradient_produces_sign_flipped_pattern(self):
-        # Raw values 2, 1, 0 -> avg=1 -> compensations = [-1, 0, 1] - the
-        # exact sign-mirror of the positive-gradient case; proves the
-        # formula isn't accidentally using abs() or a fixed sign.
-        axis_twist = FakeAxisTwistCompensation()
-        z_probe = FakeZOffsetProbe(True)
-        printer, gcode, coord = _build(axis_twist, z_probe)
-        stub = _measurement_sequence([2.0, 1.0, 0.0])
-        self._run_with_stub(coord, fake.FakeGCmd({'AXIS': 'X', 'METHOD': 'LOAD_CELL'}), stub)
-        self.assertEqual(axis_twist.z_compensations, [-1.0, 0.0, 1.0])
+    def test_y_200_passes_the_real_hardware_tested_config(self):
+        # The exact point an earlier session's WRONG (addition-based)
+        # preflight incorrectly rejected. axis_maximum=223 (real KE Y
+        # limit), probe y_offset=+27: nozzle target Y=200 (binding
+        # constraint, no offset), probe target Y=173 - both comfortably
+        # inside [0, 223].
+        comp = FakeAxisTwistCompensation(calibrate_start_y=40., calibrate_end_y=200.,
+                                          calibrate_x=117.5)
+        points = nebulaos_calibration.axis_twist_bed_points(comp, 'Y', 3)
+        result = nebulaos_calibration.axis_twist_geometry_preflight(
+            'Y', points, probe_x_offset=0., probe_y_offset=27.,
+            axis_minimum=0., axis_maximum=223.)
+        nozzle_target, probe_target = result[-1]
+        self.assertEqual(nozzle_target, (117.5, 200.0))
+        self.assertEqual(probe_target, (117.5, 173.0))
 
-    def test_y_axis_uses_zy_compensations_not_z_compensations(self):
-        axis_twist = FakeAxisTwistCompensation()
-        z_probe = FakeZOffsetProbe(True)
-        printer, gcode, coord = _build(axis_twist, z_probe)
-        stub = _measurement_sequence([0.0, 1.0, 2.0])
-        self._run_with_stub(coord, fake.FakeGCmd({'AXIS': 'Y', 'METHOD': 'LOAD_CELL'}), stub)
-        self.assertEqual(axis_twist.zy_compensations, [1.0, 0.0, -1.0])
-        self.assertEqual(axis_twist.z_compensations, [])  # X untouched
+    def test_nozzle_only_invalid_point_rejects(self):
+        # Nozzle target itself (no offset) exceeds axis_maximum - the
+        # binding constraint per the mission's own corrected geometry.
+        points = [(117.5, 300.0)]
+        with self.assertRaises(ValueError) as ctx:
+            nebulaos_calibration.axis_twist_geometry_preflight(
+                'Y', points, probe_x_offset=0., probe_y_offset=27.,
+                axis_minimum=0., axis_maximum=223.)
+        self.assertIn('nozzle carriage target', str(ctx.exception))
 
-    def test_asymmetric_five_point_gradient(self):
-        axis_twist = FakeAxisTwistCompensation()
-        z_probe = FakeZOffsetProbe(True)
-        printer, gcode, coord = _build(axis_twist, z_probe)
-        raw = [0.0, 0.5, 1.5, 1.0, 2.0]
-        avg = sum(raw) / len(raw)
-        expected = [avg - r for r in raw]
-        stub = _measurement_sequence(raw)
-        self._run_with_stub(
-            coord, fake.FakeGCmd({'AXIS': 'X', 'METHOD': 'LOAD_CELL', 'SAMPLE_COUNT': '5'}),
-            stub)
-        for got, want in zip(axis_twist.z_compensations, expected):
-            self.assertAlmostEqual(got, want, places=9)
+    def test_probe_only_invalid_point_rejects(self):
+        # Nozzle target (50) is fine, but a LARGE positive offset pushes
+        # the probe target negative, out of bounds - proves both targets
+        # are independently checked, not just the nozzle one.
+        points = [(50.0, 50.0)]
+        with self.assertRaises(ValueError) as ctx:
+            nebulaos_calibration.axis_twist_geometry_preflight(
+                'X', points, probe_x_offset=100., probe_y_offset=0.,
+                axis_minimum=0., axis_maximum=235.)
+        self.assertIn('probe carriage target', str(ctx.exception))
 
+    def test_positive_offset(self):
+        points = [(100.0, 100.0)]
+        result = nebulaos_calibration.axis_twist_geometry_preflight(
+            'X', points, probe_x_offset=27., probe_y_offset=0.,
+            axis_minimum=0., axis_maximum=235.)
+        self.assertEqual(result[0][1], (73.0, 100.0))
 
-# ---------------------------------------------------------------------
-# State application: X/Y independence
-# ---------------------------------------------------------------------
+    def test_negative_offset(self):
+        points = [(100.0, 100.0)]
+        result = nebulaos_calibration.axis_twist_geometry_preflight(
+            'X', points, probe_x_offset=-27., probe_y_offset=0.,
+            axis_minimum=0., axis_maximum=235.)
+        self.assertEqual(result[0][1], (127.0, 100.0))
 
-class StateApplicationTest(unittest.TestCase, _StubbedPairMixin):
-    def test_x_calibration_updates_x_only(self):
-        axis_twist = FakeAxisTwistCompensation()
-        printer, gcode, coord = _build(axis_twist, FakeZOffsetProbe(True))
-        self._run_with_stub(coord, fake.FakeGCmd({'AXIS': 'X'}),
-                             _measurement_sequence([0.0, 1.0, 2.0]))
-        self.assertEqual(coord.axis_twist_x_state, 'complete')
-        self.assertEqual(coord.axis_twist_y_state, 'idle')
-        self.assertIsNotNone(coord.axis_twist_x_result)
-        self.assertIsNone(coord.axis_twist_y_result)
+    def test_zero_offset_means_nozzle_and_probe_targets_are_identical(self):
+        points = [(100.0, 100.0)]
+        result = nebulaos_calibration.axis_twist_geometry_preflight(
+            'X', points, probe_x_offset=0., probe_y_offset=0.,
+            axis_minimum=0., axis_maximum=235.)
+        self.assertEqual(result[0][0], result[0][1])
 
-    def test_y_calibration_updates_y_only(self):
-        axis_twist = FakeAxisTwistCompensation()
-        printer, gcode, coord = _build(axis_twist, FakeZOffsetProbe(True))
-        self._run_with_stub(coord, fake.FakeGCmd({'AXIS': 'Y'}),
-                             _measurement_sequence([0.0, 1.0, 2.0]))
-        self.assertEqual(coord.axis_twist_y_state, 'complete')
-        self.assertEqual(coord.axis_twist_x_state, 'idle')
+    def test_limit_boundary_exactly_at_maximum_passes(self):
+        points = [(235.0, 100.0)]
+        result = nebulaos_calibration.axis_twist_geometry_preflight(
+            'X', points, probe_x_offset=0., probe_y_offset=0.,
+            axis_minimum=0., axis_maximum=235.)
+        self.assertEqual(len(result), 1)
 
-    def test_both_leaves_x_and_y_active_concurrently(self):
-        axis_twist = FakeAxisTwistCompensation()
-        printer, gcode, coord = _build(axis_twist, FakeZOffsetProbe(True))
-        self._run_with_stub(
-            coord, fake.FakeGCmd({'AXIS': 'BOTH'}),
-            _measurement_sequence([0.0, 1.0, 2.0, 0.0, 1.0, 2.0]))
-        self.assertEqual(coord.axis_twist_x_state, 'complete')
-        self.assertEqual(coord.axis_twist_y_state, 'complete')
-        self.assertEqual(axis_twist.z_compensations, [1.0, 0.0, -1.0])
-        self.assertEqual(axis_twist.zy_compensations, [1.0, 0.0, -1.0])
+    def test_limit_boundary_just_over_maximum_rejects(self):
+        points = [(235.001, 100.0)]
+        with self.assertRaises(ValueError):
+            nebulaos_calibration.axis_twist_geometry_preflight(
+                'X', points, probe_x_offset=0., probe_y_offset=0.,
+                axis_minimum=0., axis_maximum=235.)
 
-    def test_recalibrate_x_preserves_existing_y(self):
-        axis_twist = FakeAxisTwistCompensation()
-        printer, gcode, coord = _build(axis_twist, FakeZOffsetProbe(True))
-        self._run_with_stub(coord, fake.FakeGCmd({'AXIS': 'Y'}),
-                             _measurement_sequence([0.0, 1.0, 2.0]))
-        y_before = list(axis_twist.zy_compensations)
-        self._run_with_stub(coord, fake.FakeGCmd({'AXIS': 'X'}),
-                             _measurement_sequence([5.0, 6.0, 7.0]))
-        self.assertEqual(axis_twist.zy_compensations, y_before)
-        self.assertEqual(axis_twist.z_compensations, [1.0, 0.0, -1.0])
+    def test_configurable_safety_margin_shrinks_the_valid_range(self):
+        # Passes with no margin, rejects once a 1mm margin is applied.
+        points = [(234.5, 100.0)]
+        nebulaos_calibration.axis_twist_geometry_preflight(
+            'X', points, probe_x_offset=0., probe_y_offset=0.,
+            axis_minimum=0., axis_maximum=235., safety_margin_mm=0.0)
+        with self.assertRaises(ValueError):
+            nebulaos_calibration.axis_twist_geometry_preflight(
+                'X', points, probe_x_offset=0., probe_y_offset=0.,
+                axis_minimum=0., axis_maximum=235., safety_margin_mm=1.0)
 
-    def test_recalibrate_y_preserves_existing_x(self):
-        axis_twist = FakeAxisTwistCompensation()
-        printer, gcode, coord = _build(axis_twist, FakeZOffsetProbe(True))
-        self._run_with_stub(coord, fake.FakeGCmd({'AXIS': 'X'}),
-                             _measurement_sequence([0.0, 1.0, 2.0]))
-        x_before = list(axis_twist.z_compensations)
-        self._run_with_stub(coord, fake.FakeGCmd({'AXIS': 'Y'}),
-                             _measurement_sequence([5.0, 6.0, 7.0]))
-        self.assertEqual(axis_twist.z_compensations, x_before)
-        self.assertEqual(axis_twist.zy_compensations, [1.0, 0.0, -1.0])
+    def test_first_invalid_point_identified_not_a_later_one(self):
+        points = [(300.0, 100.0), (100.0, 100.0), (300.0, 100.0)]
+        with self.assertRaises(ValueError) as ctx:
+            nebulaos_calibration.axis_twist_geometry_preflight(
+                'X', points, probe_x_offset=0., probe_y_offset=0.,
+                axis_minimum=0., axis_maximum=235.)
+        self.assertIn('point 1/3', str(ctx.exception))
 
-    def test_clear_compensations_called_with_only_the_target_axis(self):
-        axis_twist = FakeAxisTwistCompensation()
-        printer, gcode, coord = _build(axis_twist, FakeZOffsetProbe(True))
-        self._run_with_stub(coord, fake.FakeGCmd({'AXIS': 'X'}),
-                             _measurement_sequence([0.0, 1.0, 2.0]))
-        self.assertEqual(axis_twist.clear_calls, ['X'])
+    def test_no_toolhead_parameter_at_all_proves_zero_movement(self):
+        # The function signature itself has no printer/toolhead argument -
+        # it is structurally impossible for this call to move anything.
+        import inspect
+        sig = inspect.signature(nebulaos_calibration.axis_twist_geometry_preflight)
+        for name in sig.parameters:
+            self.assertNotIn('printer', name.lower())
+            self.assertNotIn('toolhead', name.lower())
 
-    def test_both_clears_x_then_y_separately_not_both_at_once(self):
-        axis_twist = FakeAxisTwistCompensation()
-        printer, gcode, coord = _build(axis_twist, FakeZOffsetProbe(True))
-        self._run_with_stub(
-            coord, fake.FakeGCmd({'AXIS': 'BOTH'}),
-            _measurement_sequence([0.0, 1.0, 2.0, 0.0, 1.0, 2.0]))
-        self.assertEqual(axis_twist.clear_calls, ['X', 'Y'])
-
-
-# ---------------------------------------------------------------------
-# Persistence staging
-# ---------------------------------------------------------------------
-
-class PersistenceStagingTest(unittest.TestCase, _StubbedPairMixin):
-    def test_no_save_config_call_anywhere(self):
-        axis_twist = FakeAxisTwistCompensation()
-        printer, gcode, coord = _build(axis_twist, FakeZOffsetProbe(True))
-        self._run_with_stub(coord, fake.FakeGCmd({'AXIS': 'BOTH'}),
-                             _measurement_sequence([0.0, 1.0, 2.0, 0.0, 1.0, 2.0]))
-        self.assertNotIn('SAVE_CONFIG', gcode.scripts_run)
-
-    def test_no_restart_script_run(self):
-        axis_twist = FakeAxisTwistCompensation()
-        printer, gcode, coord = _build(axis_twist, FakeZOffsetProbe(True))
-        self._run_with_stub(coord, fake.FakeGCmd({'AXIS': 'X'}),
-                             _measurement_sequence([0.0, 1.0, 2.0]))
-        for s in gcode.scripts_run:
-            self.assertNotIn('RESTART', s.upper())
+    def test_unknown_axis_rejected(self):
+        with self.assertRaises(ValueError):
+            nebulaos_calibration.axis_twist_geometry_preflight(
+                'Z', [(1.0, 1.0)], probe_x_offset=0., probe_y_offset=0.,
+                axis_minimum=0., axis_maximum=235.)
 
 
 # ---------------------------------------------------------------------
-# Preflight / failure behavior
+# Hard block: zero motion, zero hardware object lookups, for every AXIS
 # ---------------------------------------------------------------------
 
-class PreflightTest(unittest.TestCase):
+class HardBlockTest(unittest.TestCase):
     def test_axis_required_no_default(self):
         printer, gcode, coord = _build()
         with self.assertRaises(fake.CommandError) as ctx:
@@ -415,182 +367,102 @@ class PreflightTest(unittest.TestCase):
         with self.assertRaises(fake.CommandError):
             coord.cmd_axis_twist_calibrate(fake.FakeGCmd({'AXIS': 'Z'}))
 
-    def test_unknown_method_rejected(self):
+    def test_axis_x_raises_remote_load_cell_contact_unqualified(self):
         printer, gcode, coord = _build()
+        with self.assertRaises(fake.CommandError) as ctx:
+            coord.cmd_axis_twist_calibrate(fake.FakeGCmd({'AXIS': 'X'}))
+        self.assertIn('REMOTE_LOAD_CELL_CONTACT_UNQUALIFIED', str(ctx.exception))
+
+    def test_axis_y_raises_remote_load_cell_contact_unqualified(self):
+        printer, gcode, coord = _build()
+        with self.assertRaises(fake.CommandError) as ctx:
+            coord.cmd_axis_twist_calibrate(fake.FakeGCmd({'AXIS': 'Y'}))
+        self.assertIn('REMOTE_LOAD_CELL_CONTACT_UNQUALIFIED', str(ctx.exception))
+
+    def test_axis_both_raises_remote_load_cell_contact_unqualified(self):
+        printer, gcode, coord = _build()
+        with self.assertRaises(fake.CommandError) as ctx:
+            coord.cmd_axis_twist_calibrate(fake.FakeGCmd({'AXIS': 'BOTH'}))
+        self.assertIn('REMOTE_LOAD_CELL_CONTACT_UNQUALIFIED', str(ctx.exception))
+
+    def test_no_axis_twist_compensation_object_needed(self):
+        # No [axis_twist_compensation] object registered at all - proves
+        # the hard-blocked command never looks it up (a real, unqualified
+        # command would raise a DIFFERENT "not configured" error instead
+        # of the REMOTE_LOAD_CELL_CONTACT_UNQUALIFIED one).
+        printer, gcode, coord = _build(axis_twist=None, z_offset_probe=None)
+        with self.assertRaises(fake.CommandError) as ctx:
+            coord.cmd_axis_twist_calibrate(fake.FakeGCmd({'AXIS': 'X'}))
+        self.assertIn('REMOTE_LOAD_CELL_CONTACT_UNQUALIFIED', str(ctx.exception))
+
+    def test_no_z_offset_probe_object_needed(self):
+        printer, gcode, coord = _build(
+            axis_twist=FakeAxisTwistCompensation(), z_offset_probe=None)
+        with self.assertRaises(fake.CommandError) as ctx:
+            coord.cmd_axis_twist_calibrate(fake.FakeGCmd({'AXIS': 'X'}))
+        self.assertIn('REMOTE_LOAD_CELL_CONTACT_UNQUALIFIED', str(ctx.exception))
+
+    def test_zero_gcode_scripts_run(self):
+        printer, gcode, coord = _build(
+            axis_twist=FakeAxisTwistCompensation(),
+            z_offset_probe=FakeZOffsetProbe(True))
         with self.assertRaises(fake.CommandError):
-            coord.cmd_axis_twist_calibrate(fake.FakeGCmd({'AXIS': 'X', 'METHOD': 'BOGUS'}))
-
-    def test_no_axis_twist_compensation_configured_raises(self):
-        printer, gcode, coord = _build(axis_twist=None, z_offset_probe=FakeZOffsetProbe(True))
-        with self.assertRaises(fake.CommandError) as ctx:
-            coord.cmd_axis_twist_calibrate(fake.FakeGCmd({'AXIS': 'X'}))
-        self.assertIn('axis_twist_compensation', str(ctx.exception))
-
-    def test_no_load_cell_configured_raises(self):
-        printer, gcode, coord = _build(axis_twist=FakeAxisTwistCompensation(),
-                                        z_offset_probe=None)
-        with self.assertRaises(fake.CommandError) as ctx:
-            coord.cmd_axis_twist_calibrate(fake.FakeGCmd({'AXIS': 'X'}))
-        self.assertIn('METHOD=MANUAL', str(ctx.exception))
-
-    def test_uncalibrated_load_cell_raises(self):
-        printer, gcode, coord = _build(axis_twist=FakeAxisTwistCompensation(),
-                                        z_offset_probe=FakeZOffsetProbe(False))
-        with self.assertRaises(fake.CommandError) as ctx:
-            coord.cmd_axis_twist_calibrate(fake.FakeGCmd({'AXIS': 'X'}))
-        self.assertIn('LOAD_CELL_CALIBRATE', str(ctx.exception))
-
-
-class FailureBehaviorTest(unittest.TestCase):
-    def _stub_that_fails_at(self, fail_index, count):
-        calls = []
-
-        def stub(printer, x, y, probe_x_offset, probe_y_offset, horizontal_move_z,
-                  z_offset_probe, down_min_z, pro_cnt=1, travel_speed=None,
-                  probe_lift_speed=None):
-            i = len(calls)
-            calls.append((x, y))
-            if i == fail_index:
-                raise fake.CommandError("simulated sensor failure at sample %d" % (i + 1))
-            return nebulaos_probe_pair.PairedMeasurement(
-                x=x, y=y, raw_probe_trigger_z=float(i), raw_nozzle_contact_z=0.0,
-                probe_z_offset=float(i))
-        return stub
-
-    def _run(self, coordinator, gcmd, stub):
-        orig = nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair
-        nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = stub
-        try:
-            with self.assertRaises(fake.CommandError):
-                coordinator.cmd_axis_twist_calibrate(gcmd)
-        finally:
-            nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = orig
-
-    def test_first_sample_failure_aborts_axis_leaves_no_compensation(self):
-        axis_twist = FakeAxisTwistCompensation()
-        printer, gcode, coord = _build(axis_twist, FakeZOffsetProbe(True))
-        self._run(coord, fake.FakeGCmd({'AXIS': 'X', 'SAMPLE_COUNT': '3'}),
-                   self._stub_that_fails_at(0, 3))
-        self.assertEqual(coord.axis_twist_x_state, 'error')
-        self.assertEqual(axis_twist.z_compensations, [])  # cleared, never re-populated
-        self.assertEqual(axis_twist.calibrater.finalize_calls, 0)
-
-    def test_middle_sample_failure_aborts_axis(self):
-        axis_twist = FakeAxisTwistCompensation()
-        printer, gcode, coord = _build(axis_twist, FakeZOffsetProbe(True))
-        self._run(coord, fake.FakeGCmd({'AXIS': 'X', 'SAMPLE_COUNT': '5'}),
-                   self._stub_that_fails_at(2, 5))
-        self.assertEqual(coord.axis_twist_x_state, 'error')
-        self.assertEqual(axis_twist.calibrater.finalize_calls, 0)
-
-    def test_final_sample_failure_aborts_axis_no_partial_publish(self):
-        axis_twist = FakeAxisTwistCompensation()
-        printer, gcode, coord = _build(axis_twist, FakeZOffsetProbe(True))
-        self._run(coord, fake.FakeGCmd({'AXIS': 'X', 'SAMPLE_COUNT': '3'}),
-                   self._stub_that_fails_at(2, 3))
-        self.assertEqual(coord.axis_twist_x_state, 'error')
-        # Even though 2 of 3 samples succeeded, finalize must NEVER be
-        # called with a partial set - this is the single most important
-        # invariant this slice requires.
-        self.assertEqual(axis_twist.calibrater.finalize_calls, 0)
-        self.assertEqual(axis_twist.z_compensations, [])
-
-    def test_non_finite_measurement_aborts_axis(self):
-        axis_twist = FakeAxisTwistCompensation()
-        printer, gcode, coord = _build(axis_twist, FakeZOffsetProbe(True))
-        stub = _measurement_sequence([0.0, float('nan'), 2.0])
-        orig = nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair
-        nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = stub
-        try:
-            with self.assertRaises(fake.CommandError):
-                coord.cmd_axis_twist_calibrate(fake.FakeGCmd({'AXIS': 'X', 'SAMPLE_COUNT': '3'}))
-        finally:
-            nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = orig
-        self.assertEqual(coord.axis_twist_x_state, 'error')
-        self.assertEqual(axis_twist.calibrater.finalize_calls, 0)
-
-    def test_failed_axis_does_not_disturb_previously_valid_opposite_axis(self):
-        axis_twist = FakeAxisTwistCompensation()
-        printer, gcode, coord = _build(axis_twist, FakeZOffsetProbe(True))
-        # First, a real successful Y calibration.
-        orig = nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair
-        nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = \
-            _measurement_sequence([0.0, 1.0, 2.0])
-        try:
-            coord.cmd_axis_twist_calibrate(fake.FakeGCmd({'AXIS': 'Y', 'SAMPLE_COUNT': '3'}))
-        finally:
-            nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = orig
-        y_after_success = list(axis_twist.zy_compensations)
-        self.assertEqual(coord.axis_twist_y_state, 'complete')
-
-        # Now a FAILED X calibration.
-        self._run(coord, fake.FakeGCmd({'AXIS': 'X', 'SAMPLE_COUNT': '3'}),
-                   self._stub_that_fails_at(1, 3))
-        self.assertEqual(coord.axis_twist_x_state, 'error')
-        self.assertEqual(coord.axis_twist_y_state, 'complete')
-        self.assertEqual(axis_twist.zy_compensations, y_after_success)
-
-
-# ---------------------------------------------------------------------
-# Manual method
-# ---------------------------------------------------------------------
-
-class ManualMethodTest(unittest.TestCase):
-    def test_x_dispatches_to_pristine_upstream_command(self):
-        printer, gcode, coord = _build()
-        coord.cmd_axis_twist_calibrate(fake.FakeGCmd({'AXIS': 'X', 'METHOD': 'MANUAL'}))
-        self.assertEqual(len(gcode.scripts_run), 1)
-        self.assertTrue(gcode.scripts_run[0].startswith(
-            'AXIS_TWIST_COMPENSATION_CALIBRATE AXIS=X'))
-
-    def test_y_dispatches_to_pristine_upstream_command(self):
-        printer, gcode, coord = _build()
-        coord.cmd_axis_twist_calibrate(fake.FakeGCmd({'AXIS': 'Y', 'METHOD': 'MANUAL'}))
-        self.assertTrue(gcode.scripts_run[0].startswith(
-            'AXIS_TWIST_COMPENSATION_CALIBRATE AXIS=Y'))
-
-    def test_both_is_rejected_not_silently_chained(self):
-        printer, gcode, coord = _build()
-        with self.assertRaises(fake.CommandError) as ctx:
-            coord.cmd_axis_twist_calibrate(fake.FakeGCmd({'AXIS': 'BOTH', 'METHOD': 'MANUAL'}))
-        self.assertIn('not supported', str(ctx.exception))
+            coord.cmd_axis_twist_calibrate(fake.FakeGCmd({'AXIS': 'BOTH'}))
         self.assertEqual(gcode.scripts_run, [])
 
-    def test_manual_does_not_touch_load_cell_axis_twist_state(self):
-        printer, gcode, coord = _build()
-        coord.cmd_axis_twist_calibrate(fake.FakeGCmd({'AXIS': 'X', 'METHOD': 'MANUAL'}))
-        self.assertEqual(coord.axis_twist_x_state, 'idle')
+    def test_zero_compensation_arrays_touched(self):
+        axis_twist = FakeAxisTwistCompensation()
+        printer, gcode, coord = _build(
+            axis_twist=axis_twist, z_offset_probe=FakeZOffsetProbe(True))
+        with self.assertRaises(fake.CommandError):
+            coord.cmd_axis_twist_calibrate(fake.FakeGCmd({'AXIS': 'BOTH'}))
+        self.assertEqual(axis_twist.z_compensations, [])
+        self.assertEqual(axis_twist.zy_compensations, [])
+        self.assertEqual(axis_twist.clear_calls, [])
+        self.assertEqual(axis_twist.calibrater.finalize_calls, 0)
 
-    def test_manual_requires_no_axis_twist_compensation_object_lookup(self):
-        # MANUAL mode must work even if [axis_twist_compensation] object
-        # lookup would fail - it never touches it directly, only via the
-        # delegated upstream command string.
-        printer, gcode, coord = _build(axis_twist=None)
-        coord.cmd_axis_twist_calibrate(fake.FakeGCmd({'AXIS': 'X', 'METHOD': 'MANUAL'}))
-        self.assertEqual(len(gcode.scripts_run), 1)
+    def test_zero_config_set_calls(self):
+        printer, gcode, coord = _build(
+            axis_twist=FakeAxisTwistCompensation(),
+            z_offset_probe=FakeZOffsetProbe(True))
+        with self.assertRaises(fake.CommandError):
+            coord.cmd_axis_twist_calibrate(fake.FakeGCmd({'AXIS': 'X'}))
+        configfile = printer.lookup_object('configfile')
+        self.assertEqual(configfile.set_calls, [])
+
+    def test_no_public_unsafe_override(self):
+        # There is deliberately no FORCE=/UNSAFE=/OVERRIDE= gcode param
+        # that bypasses the block.
+        printer, gcode, coord = _build()
+        for override_kwargs in ({'AXIS': 'X', 'FORCE': '1'},
+                                 {'AXIS': 'X', 'UNSAFE': 'true'},
+                                 {'AXIS': 'X', 'OVERRIDE': 'yes'}):
+            with self.assertRaises(fake.CommandError) as ctx:
+                coord.cmd_axis_twist_calibrate(fake.FakeGCmd(override_kwargs))
+            self.assertIn('REMOTE_LOAD_CELL_CONTACT_UNQUALIFIED', str(ctx.exception))
 
 
 # ---------------------------------------------------------------------
 # Status
 # ---------------------------------------------------------------------
 
-class StatusTest(unittest.TestCase, _StubbedPairMixin):
-    def test_status_distinguishes_x_and_y_for_both(self):
-        axis_twist = FakeAxisTwistCompensation()
-        printer, gcode, coord = _build(axis_twist, FakeZOffsetProbe(True))
-        # X gets a linear gradient, Y a differently-SHAPED one (not just a
-        # constant shift, which the mean-centering formula would make
-        # indistinguishable from X's own pattern - see this module's own
-        # parity note on why a constant shift alone doesn't change the
-        # normalized result).
-        self._run_with_stub(
-            coord, fake.FakeGCmd({'AXIS': 'BOTH'}),
-            _measurement_sequence([0.0, 1.0, 2.0, 0.0, 2.0, 1.0]))
+class StatusTest(unittest.TestCase):
+    def test_axis_x_sets_capability_unqualified_state(self):
+        printer, gcode, coord = _build()
+        with self.assertRaises(fake.CommandError):
+            coord.cmd_axis_twist_calibrate(fake.FakeGCmd({'AXIS': 'X'}))
         status = coord.get_status(0.)
-        self.assertEqual(status['axis_twist_x_state'], 'complete')
-        self.assertEqual(status['axis_twist_y_state'], 'complete')
-        self.assertNotEqual(status['axis_twist_x_result'], status['axis_twist_y_result'])
-        self.assertIsNone(status['axis_twist_current_axis'])  # nothing running anymore
+        self.assertEqual(status['axis_twist_x_state'], 'capability_unqualified')
+        self.assertEqual(status['axis_twist_y_state'], 'idle')
+        self.assertIn('REMOTE_LOAD_CELL_CONTACT_UNQUALIFIED', status['axis_twist_x_error'])
+
+    def test_axis_both_sets_capability_unqualified_on_both(self):
+        printer, gcode, coord = _build()
+        with self.assertRaises(fake.CommandError):
+            coord.cmd_axis_twist_calibrate(fake.FakeGCmd({'AXIS': 'BOTH'}))
+        status = coord.get_status(0.)
+        self.assertEqual(status['axis_twist_x_state'], 'capability_unqualified')
+        self.assertEqual(status['axis_twist_y_state'], 'capability_unqualified')
 
     def test_status_command_does_not_raise(self):
         printer, gcode, coord = _build()
@@ -598,7 +470,9 @@ class StatusTest(unittest.TestCase, _StubbedPairMixin):
 
 
 # ---------------------------------------------------------------------
-# Layer 2: real pinned upstream object parity
+# Layer 2: real pinned upstream object parity (kept as a compatibility
+# proof for a future re-activation, even though the live command path
+# does not call this any more)
 # ---------------------------------------------------------------------
 
 def _find_klipper_src():
@@ -673,31 +547,14 @@ class MiniFakeConfig:
 @unittest.skipUnless(_KLIPPER_SRC, "no pinned Klipper checkout found (set KLIPPER_SRC)")
 class RealUpstreamParityTest(unittest.TestCase):
     """Imports the REAL pinned axis_twist_compensation.py directly and
-    proves: (a) this project's own finalize handoff produces IDENTICAL
-    results to calling the real object's own method directly, and (b) the
-    fakes used everywhere else in this file mirror the real algorithm
-    accurately."""
+    proves the real object's own _finalize_calibration() math matches
+    what axis_twist_geometry_preflight()/axis_twist_bed_points() and a
+    future re-activated LOAD_CELL path would rely on."""
 
     @classmethod
     def setUpClass(cls):
-        # This repo's own top-level package is ALSO called `extras` (this
-        # test file is itself extras.test_nebulaos_axis_twist), so
-        # sys.modules['extras'] is already bound to THIS repo's package by
-        # the time this test runs - a plain `import extras.
-        # axis_twist_compensation` would resolve against the WRONG
-        # `extras` package's __path__ and fail to find it. Register the
-        # real pinned klippy/extras/ directory under a distinctly-named
-        # synthetic package instead, so the real module's own
-        # `from . import manual_probe, bed_mesh, probe` (relative imports)
-        # still resolve correctly, against the real files, with zero
-        # collision with this repo's own package.
         import importlib
         import importlib.util
-        # probe.py (imported transitively via axis_twist_compensation.py
-        # -> bed_mesh.py -> probe.py) does a plain top-level `import pins`,
-        # matching how klippy.py itself runs it (klippy/ on sys.path, not
-        # as a package) - pins.py itself is dependency-light (stdlib `re`
-        # only), so this does not reopen the `extras` collision above.
         klippy_dir = os.path.join(_KLIPPER_SRC, 'klippy')
         if klippy_dir not in sys.path:
             sys.path.insert(0, klippy_dir)
@@ -730,11 +587,6 @@ class RealUpstreamParityTest(unittest.TestCase):
         self.assertEqual(compensation.calibrater.configname, 'axis_twist_compensation')
 
     def test_direct_finalize_call_matches_this_modules_expected_math(self):
-        """Ground truth: call the REAL _finalize_calibration() directly
-        (bypassing this project's coordinator entirely) and confirm it
-        produces exactly the mean-centered values this module's own
-        FakeCalibrater (and therefore every orchestration test above)
-        assumes."""
         printer, compensation = self._build_real_compensation()
         calibrater = compensation.calibrater
         calibrater.results = [0.0, 1.0, 2.0]
@@ -744,45 +596,7 @@ class RealUpstreamParityTest(unittest.TestCase):
         self.assertEqual(calibrater.results, [1.0, 0.0, -1.0])
         self.assertEqual(compensation.z_compensations, [1.0, 0.0, -1.0])
 
-    def test_this_projects_coordinator_against_the_real_object_end_to_end(self):
-        """The strongest test in this file: runs THIS PROJECT'S OWN
-        cmd_axis_twist_calibrate against the real, unmodified upstream
-        AxisTwistCompensation/Calibrater object - no fakes standing in for
-        upstream at all."""
-        printer, compensation = self._build_real_compensation()
-        gcode = MiniFakeGCode()
-        printer.objects['gcode'] = gcode
-        printer.add_object('probe', FakeProbeObj())
-        printer.add_object('configfile', FakeConfigFile())
-        printer.add_object('axis_twist_compensation', compensation)
-        printer.add_object('nebulaos_z_offset_probe', FakeZOffsetProbe(True))
-
-        # nebulaos_calibration.py's coordinator expects the real
-        # printer.get_reactor()/lookup_object('gcode') conventions used
-        # throughout this test file's other fakes - adapt the mini-fake
-        # printer minimally rather than rebuilding NebulaOSCalibration's
-        # own config-reading path a third way.
-        printer.get_reactor = lambda: fake.FakeReactor()
-        config = fake.FakeConfig({}, section='nebulaos_calibration', printer=printer)
-        coord = nebulaos_calibration.NebulaOSCalibration(config)
-
-        stub = _measurement_sequence([0.0, 1.0, 2.0])
-        orig = nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair
-        nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = stub
-        try:
-            coord.cmd_axis_twist_calibrate(
-                fake.FakeGCmd({'AXIS': 'X', 'METHOD': 'LOAD_CELL', 'SAMPLE_COUNT': '3'}))
-        finally:
-            nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = orig
-
-        # Identical to the direct-call ground truth above.
-        self.assertEqual(compensation.z_compensations, [1.0, 0.0, -1.0])
-        self.assertEqual(coord.axis_twist_x_state, 'complete')
-
     def test_zy_compensations_field_name_matches_real_upstream(self):
-        """Guards the exact upstream attribute/option names this project
-        depends on for Y - a typo here would silently write to a field
-        upstream's own runtime correction never reads."""
         printer, compensation = self._build_real_compensation()
         calibrater = compensation.calibrater
         calibrater.results = [0.0, 1.0, 2.0]

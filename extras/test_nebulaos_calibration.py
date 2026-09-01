@@ -102,14 +102,42 @@ def _build(z_offset_probe=None, probe_obj=None, z_compensate=None,
     return printer, gcode, coordinator
 
 
+def _accepted_measurement(x, y, probe_trigger_z, nozzle_contact_z):
+    repeatability = nebulaos_probe_pair.RepeatabilityResult(
+        sample_count=1, accepted_count=1, samples=[], mean=nozzle_contact_z,
+        minimum=nozzle_contact_z, maximum=nozzle_contact_z, range=0.0,
+        stddev=0.0, accepted=True, rejection_reason=None)
+    return nebulaos_probe_pair.PairedMeasurement(
+        x=x, y=y, contact_id=1.0,
+        predicted_surface_z=probe_trigger_z,
+        commanded_floor_z=probe_trigger_z - 5.0,
+        raw_probe_trigger_z=probe_trigger_z,
+        raw_nozzle_contact_z=nozzle_contact_z,
+        repeatability=repeatability,
+        probe_z_offset=probe_trigger_z - nozzle_contact_z,
+        accepted=True, rejection_reason=None)
+
+
+def _rejected_measurement(x, y, reason='excessive_fit_delta(9.0>1.0)'):
+    repeatability = nebulaos_probe_pair.RepeatabilityResult(
+        sample_count=1, accepted_count=0, samples=[], mean=None,
+        minimum=None, maximum=None, range=None, stddev=None,
+        accepted=False, rejection_reason=reason)
+    return nebulaos_probe_pair.PairedMeasurement(
+        x=x, y=y, contact_id=1.0, predicted_surface_z=2.0,
+        commanded_floor_z=-3.0, raw_probe_trigger_z=2.0,
+        raw_nozzle_contact_z=None, repeatability=repeatability,
+        probe_z_offset=None, accepted=False, rejection_reason=reason)
+
+
 def _stub_pair(probe_trigger_z, nozzle_contact_z):
     def fake_measure(printer, x, y, probe_x_offset, probe_y_offset,
                       horizontal_move_z, z_offset_probe, down_min_z,
-                      pro_cnt=1, travel_speed=None, probe_lift_speed=None):
-        return nebulaos_probe_pair.PairedMeasurement(
-            x=x, y=y, raw_probe_trigger_z=probe_trigger_z,
-            raw_nozzle_contact_z=nozzle_contact_z,
-            probe_z_offset=probe_trigger_z - nozzle_contact_z)
+                      pro_cnt=1, travel_speed=None, probe_lift_speed=None,
+                      max_abs_fit_delta=None, min_accepted_samples=None,
+                      max_repeatability_range=None,
+                      max_repeatability_stddev=None):
+        return _accepted_measurement(x, y, probe_trigger_z, nozzle_contact_z)
     return fake_measure
 
 
@@ -161,9 +189,7 @@ class LoadCellHappyPathTest(unittest.TestCase):
 
         def fake_measure(printer_, x, y, *a, **kw):
             seen['xy'] = (x, y)
-            return nebulaos_probe_pair.PairedMeasurement(
-                x=x, y=y, raw_probe_trigger_z=1.0, raw_nozzle_contact_z=0.5,
-                probe_z_offset=0.5)
+            return _accepted_measurement(x, y, 1.0, 0.5)
         orig = nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair
         nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = fake_measure
         try:
@@ -258,6 +284,155 @@ class LoadCellValidationTest(unittest.TestCase):
             nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = orig
         self.assertEqual(coord.z_offset_state, 'complete')
         self.assertAlmostEqual(probe_obj.probe_offsets.z_offset, 5.0, places=9)
+
+
+class LoadCellRejectionGatingTest(unittest.TestCase):
+    """§9: a rejected measurement must never stage a Z-offset, transition
+    to COMPLETE, or call SAVE_CONFIG. Also verifies the coordinator's own
+    quality/repeatability config values are passed through to
+    measure_probe_nozzle_pair() unchanged (not re-derived a second way)."""
+
+    def test_rejected_measurement_is_not_applied_or_staged(self):
+        z_probe = FakeZOffsetProbe(is_calibrated=True)
+        probe_obj = FakeProbeObj(z_offset=0.25)
+        zc = FakeZCompensate(110., 111.)
+        printer, gcode, coord = _build(z_probe, probe_obj, zc)
+
+        def fake_measure(printer_, x, y, *a, **kw):
+            return _rejected_measurement(x, y)
+        orig = nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair
+        nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = fake_measure
+        try:
+            with self.assertRaises(fake.CommandError) as ctx:
+                coord.cmd_z_offset_calibrate(fake.FakeGCmd({'METHOD': 'LOAD_CELL'}))
+        finally:
+            nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = orig
+
+        self.assertIn('measurement rejected', str(ctx.exception))
+        self.assertIn('excessive_fit_delta', str(ctx.exception))
+        # Untouched - the pre-existing live offset must survive a rejection.
+        self.assertEqual(probe_obj.probe_offsets.z_offset, 0.25)
+        configfile = printer.lookup_object('configfile')
+        self.assertEqual(configfile.set_calls, [])
+        self.assertEqual(coord.z_offset_state, 'measurement_quality_failure')
+
+    def test_capability_unqualified_error_sets_distinct_state(self):
+        z_probe = FakeZOffsetProbe(is_calibrated=True)
+        zc = FakeZCompensate(110., 111.)
+        printer, gcode, coord = _build(z_probe, FakeProbeObj(), zc)
+
+        def fake_measure(printer_, x, y, *a, **kw):
+            raise printer_.command_error(
+                "CONTACT_SAFETY_LIMIT_UNQUALIFIED: max_contact_descent_mm "
+                "is not configured")
+        orig = nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair
+        nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = fake_measure
+        try:
+            with self.assertRaises(fake.CommandError):
+                coord.cmd_z_offset_calibrate(fake.FakeGCmd({'METHOD': 'LOAD_CELL'}))
+        finally:
+            nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = orig
+        self.assertEqual(coord.z_offset_state, 'capability_unqualified')
+
+    def test_quality_and_repeatability_config_passed_through_unchanged(self):
+        z_probe = FakeZOffsetProbe(is_calibrated=True)
+        zc = FakeZCompensate(110., 111.)
+        printer, gcode, coord = _build(
+            z_probe, FakeProbeObj(), zc,
+            config_overrides={
+                'max_abs_fit_delta': '0.3', 'min_accepted_samples': '2',
+                'max_repeatability_range': '0.1', 'max_repeatability_stddev': '0.05'})
+        seen = {}
+
+        def fake_measure(printer_, x, y, *a, **kw):
+            seen.update(kw)
+            return _accepted_measurement(x, y, 1.0, 0.5)
+        orig = nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair
+        nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = fake_measure
+        try:
+            coord.cmd_z_offset_calibrate(fake.FakeGCmd({'METHOD': 'LOAD_CELL'}))
+        finally:
+            nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = orig
+        self.assertAlmostEqual(seen['max_abs_fit_delta'], 0.3, places=9)
+        self.assertEqual(seen['min_accepted_samples'], 2)
+        self.assertAlmostEqual(seen['max_repeatability_range'], 0.1, places=9)
+        self.assertAlmostEqual(seen['max_repeatability_stddev'], 0.05, places=9)
+
+    def test_diagnostics_recorded_in_status_after_success(self):
+        z_probe = FakeZOffsetProbe(is_calibrated=True)
+        zc = FakeZCompensate(110., 111.)
+        printer, gcode, coord = _build(z_probe, FakeProbeObj(), zc)
+        orig = nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair
+        nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = \
+            _stub_pair(2.0, 0.5)
+        try:
+            coord.cmd_z_offset_calibrate(fake.FakeGCmd({'METHOD': 'LOAD_CELL'}))
+        finally:
+            nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = orig
+        status = coord.get_status(0.)
+        self.assertEqual(status['z_offset_predicted_surface_z'], 2.0)
+        self.assertEqual(status['z_offset_raw_probe_trigger_z'], 2.0)
+        self.assertEqual(status['z_offset_accepted_count'], 1)
+
+
+class ReferenceXYTest(unittest.TestCase):
+    """§11: the canonical reference point now comes from this section's
+    own reference_x/reference_y config, not [z_compensate]'s home_x/
+    home_y - which stays only as a fallback for an older printer.cfg."""
+
+    def test_configured_reference_xy_used_when_no_explicit_override(self):
+        z_probe = FakeZOffsetProbe(is_calibrated=True)
+        printer, gcode, coord = _build(
+            z_probe, FakeProbeObj(), z_compensate=FakeZCompensate(110., 111.),
+            config_overrides={'reference_x': '20', 'reference_y': '25'})
+        seen = {}
+
+        def fake_measure(printer_, x, y, *a, **kw):
+            seen['xy'] = (x, y)
+            return _accepted_measurement(x, y, 1.0, 0.5)
+        orig = nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair
+        nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = fake_measure
+        try:
+            coord.cmd_z_offset_calibrate(fake.FakeGCmd({'METHOD': 'LOAD_CELL'}))
+        finally:
+            nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = orig
+        self.assertEqual(seen['xy'], (20.0, 25.0))
+
+    def test_explicit_gcmd_xy_overrides_configured_reference(self):
+        z_probe = FakeZOffsetProbe(is_calibrated=True)
+        printer, gcode, coord = _build(
+            z_probe, FakeProbeObj(), z_compensate=FakeZCompensate(110., 111.),
+            config_overrides={'reference_x': '20', 'reference_y': '25'})
+        seen = {}
+
+        def fake_measure(printer_, x, y, *a, **kw):
+            seen['xy'] = (x, y)
+            return _accepted_measurement(x, y, 1.0, 0.5)
+        orig = nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair
+        nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = fake_measure
+        try:
+            coord.cmd_z_offset_calibrate(
+                fake.FakeGCmd({'METHOD': 'LOAD_CELL', 'X': '42', 'Y': '99'}))
+        finally:
+            nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = orig
+        self.assertEqual(seen['xy'], (42.0, 99.0))
+
+    def test_falls_back_to_z_compensate_home_xy_when_reference_unset(self):
+        z_probe = FakeZOffsetProbe(is_calibrated=True)
+        printer, gcode, coord = _build(
+            z_probe, FakeProbeObj(), z_compensate=FakeZCompensate(110., 111.))
+        seen = {}
+
+        def fake_measure(printer_, x, y, *a, **kw):
+            seen['xy'] = (x, y)
+            return _accepted_measurement(x, y, 1.0, 0.5)
+        orig = nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair
+        nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = fake_measure
+        try:
+            coord.cmd_z_offset_calibrate(fake.FakeGCmd({'METHOD': 'LOAD_CELL'}))
+        finally:
+            nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = orig
+        self.assertEqual(seen['xy'], (110.0, 111.0))
 
 
 class ManualMethodTest(unittest.TestCase):
