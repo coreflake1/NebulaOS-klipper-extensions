@@ -1,12 +1,11 @@
 # NebulaOS automatic probe/nozzle pairing primitive (Phase 2 calibration-
-# framework mission; bounded-descent contact-safety rewrite).
+# framework mission; bounded-descent contact-safety rewrite, corrected).
 #
-# The shared math behind NEBULAOS_Z_OFFSET_CALIBRATE METHOD=LOAD_CELL: at a
-# physical bed point P, take a FRESH automatic BLTouch probe reading (this
-# doubles as the locally-expected surface Z the bounded-descent envelope is
-# derived from), then move the actual nozzle over the exact same P and take
-# one or more validated, envelope-bounded HX711 contact readings, and
-# derive the probe's true Z-offset from the two raw readings.
+# The shared math behind NEBULAOS_Z_OFFSET_CALIBRATE: at a physical bed
+# point P, take a FRESH automatic BLTouch probe reading, then move the
+# actual nozzle over the exact same P and take one or more validated,
+# envelope-bounded HX711 contact readings, and derive the probe's true
+# Z-offset from the two raw readings.
 #
 # Derived directly from pinned upstream Klipper (58bd67db...)'s own
 # arithmetic, not invented: klippy/extras/probe.py's
@@ -22,42 +21,61 @@
 # be active at the time, any currently-active SET_GCODE_OFFSET Z also
 # cancels the same way - this result does not depend on it.
 #
-# Also independent of [axis_twist_compensation]'s state, whether or not
-# that section is configured: axis twist's own _update_z_compensation_value
-# (klippy/extras/axis_twist_compensation.py) only ever corrects a
-# ProbeResult's .bed_z field, never .test_z (the raw trigger position this
-# module reads) - confirmed directly from the pinned source, not assumed.
-# ZOffsetProbe.touch_probe() bypasses the probe:update_results event
-# entirely (see nebulaos_z_offset_probe.py's own header), so it was never
-# affected either. There is therefore no need to clear/disable axis twist
-# before measuring a Z-offset with this primitive.
-#
 # ---------------------------------------------------------------------
-# Bounded-descent contact-safety envelope (Phase 2 mission)
+# Bounded-descent contact-safety envelope (Phase 2 mission - CORRECTED)
 # ---------------------------------------------------------------------
-# The real hardware incident this rewrite is built on (overnight HX711
-# investigation, 2026-08-31): nebulaos_z_offset_probe.py computed
-# last_fit_delta but never validated it, and the force-trigger threshold
-# alone does not bound how deep the toolhead is ever COMMANDED to move -
-# by the time a bad fit is detected, the descent has already happened.
+# A prior version of this file treated the raw BLTouch trigger position
+# (ProbeResult.test_z) itself as the "predicted surface" the nozzle would
+# hit, and bounded the descent as test_z - max_contact_descent_mm. That is
+# wrong, and dangerously so: pinned upstream Klipper's own
+# manual_probe.py:create_probe_result() defines
+#     bed_z = test_z - z_offset
+# test_z is the toolhead Z at PROBE trigger; bed_z is the ESTIMATED
+# NOZZLE-CONTACT Z - upstream's own name for exactly the quantity this
+# envelope needs to bound against. The two differ by the probe's own
+# z_offset, which on this printer's real captured hardware state is
+# ~1.795mm - far larger than any sane descent margin. Anchoring the
+# envelope to test_z directly was therefore off by the ENTIRE probe
+# offset, not a rounding error.
 #
-# This module now derives, for every physical point, a hard floor the
-# actual probing_move() target can never exceed:
-#     minimum_allowed_z = predicted_surface_z - max_contact_descent_mm
-# where predicted_surface_z is the SAME fresh CR-Touch reading already
-# taken for the probe/nozzle pair (raw_probe_trigger_z) - the two
-# measurements are taken at the identical physical XY, so it is a
-# reasonable, real, freshly-measured local reference, not a cached or
-# nominal one. max_contact_descent_mm is read from the ZOffsetProbe
-# instance's own config (nebulaos_z_offset_probe.py); when it is not
-# configured (not yet hardware-qualified), this function refuses to
-# command ANY nozzle contact motion at all, failing closed with a
-# CONTACT_SAFETY_LIMIT_UNQUALIFIED error - see that module's own comment
-# for why no invented default is used. The same fail-closed treatment
-# applies to max_abs_fit_delta and, when pro_cnt>1, the repeatability
-# bounds (min_accepted_samples/max_repeatability_range/
-# max_repeatability_stddev) - all caller-supplied, all optional, all
-# unqualified-safe.
+# The complication upstream's formula does not have to deal with: this
+# workflow's whole job is to MEASURE a new z_offset, so the CURRENT one is
+# only ever a prior estimate, of unknown and workflow-dependent quality.
+# Two physically distinct cases follow, and the envelope is derived
+# differently in each - see _resolve_envelope() below for the exact
+# formulas, and PairedMeasurement.contact_mode/predicted_nozzle_contact_z
+# for how a caller can tell which one ran.
+#
+#   ESTABLISHED (a credible existing probe_z_offset is already active):
+#     predicted_nozzle_contact_z = raw_probe_trigger_z - probe_z_offset
+#     commanded_floor_z = predicted_nozzle_contact_z
+#                          - established_contact_margin_mm
+#     established_contact_margin_mm is a SMALL, separately-configured
+#     bound on how much further than the (imperfect but credible)
+#     predicted plane the nozzle may still be commanded to travel - it
+#     must not, and does not, also carry the probe's own Z offset the way
+#     the old max_contact_descent_mm accidentally did.
+#
+#   BOOTSTRAP / VIRGIN (no credible existing probe_z_offset - e.g. the
+#   real factory default of exactly 0.000, which is a "not yet
+#   calibrated" marker, not a physical claim that probe and nozzle
+#   trigger at the same Z):
+#     commanded_floor_z = starting_nozzle_z - bootstrap_contact_envelope_mm
+#     starting_nozzle_z is the toolhead's own actual, known, currently-
+#     measured Z right before the descent begins - not a prediction at
+#     all, just "how far below where the nozzle already safely is are we
+#     willing to blindly search." bootstrap_contact_envelope_mm is a
+#     SEPARATE config value from down_min_z (never silently reused as one)
+#     and requires its own explicit hardware qualification before a
+#     virgin printer's first automatic Z-offset calibration can run at
+#     all - there is no invented default for it either.
+#
+# Both established_contact_margin_mm and bootstrap_contact_envelope_mm are
+# read from the CALLER (nebulaos_calibration.py's own config - a
+# calibration-acceptance concern, not a raw motion-primitive one), not
+# from the ZOffsetProbe instance. Neither has a production default; this
+# function fails closed with CONTACT_SAFETY_LIMIT_UNQUALIFIED, before any
+# nozzle contact motion, when the one the current case needs is unset.
 #
 # Every individual contact is recorded as a ContactSample - accepted or
 # rejected, always appended, never silently dropped - and the aggregate
@@ -71,6 +89,14 @@ import math
 
 from . import probe as probe_module
 
+# A live probe z_offset within this many mm of exactly zero is treated as
+# "not yet calibrated" (the real, tracked factory default is the literal
+# string "0.000" - see NebulaOS-firmware's migrate_config_ownership.py
+# FACTORY_DEFAULTS), not as a physically-zero offset that happens to be
+# correct. Small enough that no genuine calibration result could ever
+# land inside it by chance.
+_CREDIBLE_Z_OFFSET_EPSILON_MM = 0.0005
+
 ContactSample = collections.namedtuple('ContactSample', [
     'sample_index', 'starting_z', 'commanded_floor_z',
     'raw_trigger_z', 'fitted_contact_z', 'fit_delta',
@@ -82,30 +108,53 @@ RepeatabilityResult = collections.namedtuple('RepeatabilityResult', [
     'accepted', 'rejection_reason'])
 
 PairedMeasurement = collections.namedtuple('PairedMeasurement', [
-    'x', 'y', 'contact_id',
-    'predicted_surface_z', 'commanded_floor_z',
+    'x', 'y', 'contact_id', 'contact_mode',
+    'predicted_nozzle_contact_z', 'commanded_floor_z',
     'raw_probe_trigger_z', 'raw_nozzle_contact_z',
     'repeatability', 'probe_z_offset',
     'accepted', 'rejection_reason'])
 
 
-def _require_safety_limits(printer, z_offset_probe, x, y, pro_cnt,
-                            max_abs_fit_delta, min_accepted_samples,
+def _is_credible_probe_z_offset(probe_z_offset):
+    """False for the real factory default (exactly 0.000) and anything
+    close enough to it to be indistinguishable from "never calibrated" -
+    see this module's own header for why 0.000 must never be treated as a
+    valid physical prior for the ESTABLISHED envelope case."""
+    return (math.isfinite(probe_z_offset)
+            and abs(probe_z_offset) > _CREDIBLE_Z_OFFSET_EPSILON_MM)
+
+
+def _require_safety_limits(printer, x, y, probe_z_offset, is_established,
+                            established_contact_margin_mm,
+                            bootstrap_contact_envelope_mm,
+                            pro_cnt, max_abs_fit_delta, min_accepted_samples,
                             max_repeatability_range,
                             max_repeatability_stddev):
     """Fail-closed preflight: refuses ANY nozzle contact motion (called
-    before the nozzle is ever moved toward the bed) unless every
-    safety-critical constant this run actually needs is configured. No
-    invented production defaults - see nebulaos_z_offset_probe.py's own
-    comment on max_contact_descent_mm."""
-    name = getattr(z_offset_probe, '_name', 'nebulaos_z_offset_probe')
-    max_contact_descent_mm = getattr(z_offset_probe, 'max_contact_descent_mm', None)
-    if max_contact_descent_mm is None:
-        raise printer.command_error(
-            "CONTACT_SAFETY_LIMIT_UNQUALIFIED: max_contact_descent_mm is "
-            "not configured on [%s] - the bounded-descent envelope cannot "
-            "be computed, refusing nozzle contact motion at X=%.3f Y=%.3f"
-            % (name, x, y))
+    before the nozzle is ever moved toward the bed, and before the fresh
+    CR-Touch reading too - the ESTABLISHED/BOOTSTRAP choice and the
+    corresponding required config are both already knowable from
+    probe_z_offset alone) unless every safety-critical constant this run
+    actually needs is configured. No invented production defaults."""
+    if is_established:
+        if established_contact_margin_mm is None:
+            raise printer.command_error(
+                "CONTACT_SAFETY_LIMIT_UNQUALIFIED: established_contact_"
+                "margin_mm is not configured - the nozzle-contact safety "
+                "envelope cannot be derived for this ESTABLISHED "
+                "calibration (existing probe z_offset=%.5f is credible), "
+                "refusing nozzle contact motion at X=%.3f Y=%.3f"
+                % (probe_z_offset, x, y))
+    else:
+        if bootstrap_contact_envelope_mm is None:
+            raise printer.command_error(
+                "CONTACT_SAFETY_LIMIT_UNQUALIFIED: bootstrap_contact_"
+                "envelope_mm is not configured - the existing probe "
+                "z_offset=%.5f is not a credible physical prior (BOOTSTRAP/"
+                "VIRGIN calibration), and no separately-qualified "
+                "bootstrap envelope is configured. Refusing nozzle contact "
+                "motion at X=%.3f Y=%.3f - this does NOT fall back to "
+                "down_min_z." % (probe_z_offset, x, y))
     if max_abs_fit_delta is None:
         raise printer.command_error(
             "CONTACT_SAFETY_LIMIT_UNQUALIFIED: max_abs_fit_delta is not "
@@ -120,13 +169,15 @@ def _require_safety_limits(printer, z_offset_probe, x, y, pro_cnt,
             "max_repeatability_stddev) are not fully configured for "
             "pro_cnt=%d - refusing nozzle contact motion at X=%.3f Y=%.3f"
             % (pro_cnt, x, y))
-    return max_contact_descent_mm
 
 
 def measure_probe_nozzle_pair(printer, x, y, probe_x_offset, probe_y_offset,
+                               probe_z_offset,
                                horizontal_move_z, z_offset_probe,
                                down_min_z, pro_cnt=1,
                                travel_speed=None, probe_lift_speed=None,
+                               established_contact_margin_mm=None,
+                               bootstrap_contact_envelope_mm=None,
                                max_abs_fit_delta=None,
                                min_accepted_samples=None,
                                max_repeatability_range=None,
@@ -136,33 +187,33 @@ def measure_probe_nozzle_pair(printer, x, y, probe_x_offset, probe_y_offset,
     `accepted` flag is the single authoritative answer to "may a caller
     stage this result" - see this module's own header comment.
 
-    probe_x_offset/probe_y_offset: the registered probe's own configured
-    XY offset (e.g. BLTouch's [bltouch] x_offset/y_offset) - the probe TIP
-    is moved to (x - probe_x_offset, y - probe_y_offset) so that the probe
-    itself ends up physically over (x, y), exactly mirroring upstream
-    axis_twist_compensation.py's own _calculate_test_points().
-
-    horizontal_move_z: a safe hover height used for every XY traverse in
-    this sequence, so the toolhead never drags either the probe or the
-    nozzle across the bed at print height - applied before EVERY XY move,
-    not just the first.
+    probe_x_offset/probe_y_offset/probe_z_offset: the registered probe's
+    own CURRENT, live configured offsets (probe_obj.get_offsets()).
+    probe_z_offset is the prior this calibration run is trying to refine -
+    see this module's header for the ESTABLISHED/BOOTSTRAP split it
+    determines.
 
     z_offset_probe: a nebulaos_z_offset_probe.ZOffsetProbe instance (or
     anything exposing the same touch_probe(down_min_z, pro_cnt=1,
-    minimum_allowed_z=...)/get_status(eventtime) contract) whose own
-    max_contact_descent_mm config supplies the bounded-descent envelope.
+    minimum_allowed_z=...)/get_status(eventtime) contract). Owns only the
+    raw motion primitive - the envelope derivation lives entirely in this
+    function now, not on that object.
 
     down_min_z: the same absolute stepper-limit-relative depth floor
     touch_probe() has always accepted - kept as an independent, coarser
-    safety layer underneath the new envelope (see touch_probe()'s own
-    comment: the tighter of the two always wins).
+    safety layer underneath the derived envelope (the tighter of the two
+    always wins - see touch_probe()'s own comment).
+
+    established_contact_margin_mm/bootstrap_contact_envelope_mm: the two
+    envelope constants (Phase 2 mission, corrected) - exactly one is
+    required depending on whether probe_z_offset is credible, and
+    whichever is required fails closed with CONTACT_SAFETY_LIMIT_
+    UNQUALIFIED when unset. No production default is invented for either.
 
     max_abs_fit_delta/min_accepted_samples/max_repeatability_range/
     max_repeatability_stddev: measurement-quality and repeatability
-    acceptance bounds (Phase 2 mission, §7/§9/§10) - all optional, all
-    fail-closed when a value this call actually needs is missing (see
-    _require_safety_limits above). Tests may use synthetic values; no
-    production default is invented here.
+    acceptance bounds (Phase 2 mission, §7/§9/§10) - unchanged from
+    before, still fail-closed, still optional, still no invented default.
 
     travel_speed/probe_lift_speed: motion speeds for the repositioning
     moves; None lets toolhead.manual_move fall back to whatever speed was
@@ -182,37 +233,49 @@ def measure_probe_nozzle_pair(printer, x, y, probe_x_offset, probe_y_offset,
     probe_obj = printer.lookup_object('probe')
     reactor = printer.get_reactor()
 
-    max_contact_descent_mm = _require_safety_limits(
-        printer, z_offset_probe, x, y, pro_cnt, max_abs_fit_delta,
-        min_accepted_samples, max_repeatability_range,
-        max_repeatability_stddev)
+    is_established = _is_credible_probe_z_offset(probe_z_offset)
+    _require_safety_limits(
+        printer, x, y, probe_z_offset, is_established,
+        established_contact_margin_mm, bootstrap_contact_envelope_mm,
+        pro_cnt, max_abs_fit_delta, min_accepted_samples,
+        max_repeatability_range, max_repeatability_stddev)
 
     def hover():
         toolhead.manual_move([None, None, horizontal_move_z], probe_lift_speed)
 
-    # Step 1-2: fresh CR-Touch measurement at physical P. This doubles as
-    # the locally-expected surface Z the bounded-descent envelope is
-    # derived from - the SAME reading, not a second/cached one.
+    # Fresh CR-Touch measurement at physical P - needed for BOTH cases'
+    # diagnostics (and for the ESTABLISHED envelope's own prediction), and
+    # for the final probe_z_offset arithmetic either way.
     hover()
     toolhead.manual_move([x - probe_x_offset, y - probe_y_offset, None],
                          travel_speed)
     probe_gcmd = gcode.create_gcode_command("", "", {})
     ppos = probe_module.run_single_probe(probe_obj, probe_gcmd)
     raw_probe_trigger_z = ppos.test_z
-    predicted_surface_z = raw_probe_trigger_z
 
-    if not math.isfinite(predicted_surface_z):
+    if not math.isfinite(raw_probe_trigger_z):
         raise printer.command_error(
             "measure_probe_nozzle_pair: CR-Touch reading at X=%.3f Y=%.3f "
             "is not finite (%r) - cannot derive a bounded-descent "
-            "envelope, refusing nozzle contact" % (x, y, predicted_surface_z))
+            "envelope, refusing nozzle contact" % (x, y, raw_probe_trigger_z))
 
-    commanded_floor_z = predicted_surface_z - max_contact_descent_mm
-
-    # Step 3-4: lift clear, then move the NOZZLE (toolhead origin, no
-    # offset) to the exact same physical (x, y).
+    # Move the NOZZLE (toolhead origin, no offset) to the exact same
+    # physical (x, y) before computing/using either envelope formula -
+    # the BOOTSTRAP case's own floor is relative to the nozzle's real
+    # position at this point, not the probe's.
     hover()
     toolhead.manual_move([x, y, None], travel_speed)
+    starting_nozzle_z = toolhead.get_position()[2]
+
+    if is_established:
+        contact_mode = 'established'
+        predicted_nozzle_contact_z = raw_probe_trigger_z - probe_z_offset
+        commanded_floor_z = (predicted_nozzle_contact_z
+                              - established_contact_margin_mm)
+    else:
+        contact_mode = 'bootstrap'
+        predicted_nozzle_contact_z = None
+        commanded_floor_z = starting_nozzle_z - bootstrap_contact_envelope_mm
 
     contact_id = reactor.monotonic()
     samples = []
@@ -306,16 +369,16 @@ def measure_probe_nozzle_pair(printer, x, y, probe_x_offset, probe_y_offset,
         range=rng, stddev=stddev, accepted=repeat_accepted,
         rejection_reason=repeat_rejection)
 
-    probe_z_offset = None
+    probe_z_offset_result = None
     if repeat_accepted:
-        probe_z_offset = raw_probe_trigger_z - mean
+        probe_z_offset_result = raw_probe_trigger_z - mean
 
     return PairedMeasurement(
-        x=x, y=y, contact_id=contact_id,
-        predicted_surface_z=predicted_surface_z,
+        x=x, y=y, contact_id=contact_id, contact_mode=contact_mode,
+        predicted_nozzle_contact_z=predicted_nozzle_contact_z,
         commanded_floor_z=commanded_floor_z,
         raw_probe_trigger_z=raw_probe_trigger_z,
         raw_nozzle_contact_z=mean,
         repeatability=repeatability,
-        probe_z_offset=probe_z_offset,
+        probe_z_offset=probe_z_offset_result,
         accepted=repeat_accepted, rejection_reason=repeat_rejection)

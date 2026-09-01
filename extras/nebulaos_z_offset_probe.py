@@ -78,19 +78,6 @@ class ZOffsetProbe:
             'force_safety_limit', default=2000., minval=100., maxval=10000.)
         self._tare_time = config.getfloat(
             'tare_time', default=4. / 60., minval=0.01, maxval=1.0)
-        # max_contact_descent_mm: the bounded-descent contact-safety
-        # envelope (Phase 2 mission). Deliberately no production default -
-        # this value is NOT hardware-qualified yet (see the overnight
-        # contact-safety investigation this mission is built on). Left
-        # unset (None) until a real qualification run establishes it;
-        # nebulaos_probe_pair.py's bounded-descent orchestration refuses
-        # to command any nozzle contact motion while it is None, failing
-        # closed with a CONTACT_SAFETY_LIMIT_UNQUALIFIED error rather than
-        # silently using an invented number. Same "accept None, validate
-        # only when set" pattern z_compensate.py already uses for
-        # hot_end_temp.
-        self.max_contact_descent_mm = config.getfloat(
-            'max_contact_descent_mm', default=None, minval=0.01, maxval=20.)
 
         self._best_fit = LCBestFit(self._printer)
 
@@ -221,9 +208,13 @@ class ZOffsetProbe:
         #
         # minimum_allowed_z (Phase 2 mission, bounded-descent envelope):
         # an OPTIONAL additional floor, independent of down_min_z, supplied
-        # by a caller that has already derived a locally-expected surface Z
-        # from a fresh CR-Touch measurement at this same physical point
-        # (see nebulaos_probe_pair.py). When given, the actual commanded
+        # by a caller that has already derived a physically-grounded bound
+        # for THIS contact - either a predicted nozzle-contact plane plus a
+        # small margin (an ESTABLISHED calibration, with a credible prior
+        # probe z_offset) or a bounded search below a known starting
+        # position (a BOOTSTRAP/virgin calibration, with no credible prior)
+        # - see nebulaos_probe_pair.py's own header for both formulas. When
+        # given, the actual commanded
         # contact target never exceeds it either - the tighter (higher,
         # i.e. shallower) of the two floors always wins, so this can only
         # ever make a contact SHALLOWER than down_min_z alone would allow,
@@ -278,7 +269,6 @@ class ZOffsetProbe:
             'last_raw_trigger_z': self._last_raw_trigger_z,
             'last_fitted_contact_z': self._last_fitted_contact_z,
             'last_fit_delta': self._last_fit_delta,
-            'max_contact_descent_mm': self.max_contact_descent_mm,
         }
 
 
