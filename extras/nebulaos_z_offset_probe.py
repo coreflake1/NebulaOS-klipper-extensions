@@ -78,6 +78,19 @@ class ZOffsetProbe:
             'force_safety_limit', default=2000., minval=100., maxval=10000.)
         self._tare_time = config.getfloat(
             'tare_time', default=4. / 60., minval=0.01, maxval=1.0)
+        # max_contact_descent_mm: the bounded-descent contact-safety
+        # envelope (Phase 2 mission). Deliberately no production default -
+        # this value is NOT hardware-qualified yet (see the overnight
+        # contact-safety investigation this mission is built on). Left
+        # unset (None) until a real qualification run establishes it;
+        # nebulaos_probe_pair.py's bounded-descent orchestration refuses
+        # to command any nozzle contact motion while it is None, failing
+        # closed with a CONTACT_SAFETY_LIMIT_UNQUALIFIED error rather than
+        # silently using an invented number. Same "accept None, validate
+        # only when set" pattern z_compensate.py already uses for
+        # hot_end_temp.
+        self.max_contact_descent_mm = config.getfloat(
+            'max_contact_descent_mm', default=None, minval=0.01, maxval=20.)
 
         self._best_fit = LCBestFit(self._printer)
 
@@ -202,9 +215,24 @@ class ZOffsetProbe:
 
         return z_contact
 
-    def touch_probe(self, down_min_z, pro_cnt=1):
+    def touch_probe(self, down_min_z, pro_cnt=1, minimum_allowed_z=None):
         # down_min_z: positive depth below Z=0 (e.g. 10 means Z=-10).
         # Negate to get the target Z coordinate, then clamp to stepper limit.
+        #
+        # minimum_allowed_z (Phase 2 mission, bounded-descent envelope):
+        # an OPTIONAL additional floor, independent of down_min_z, supplied
+        # by a caller that has already derived a locally-expected surface Z
+        # from a fresh CR-Touch measurement at this same physical point
+        # (see nebulaos_probe_pair.py). When given, the actual commanded
+        # contact target never exceeds it either - the tighter (higher,
+        # i.e. shallower) of the two floors always wins, so this can only
+        # ever make a contact SHALLOWER than down_min_z alone would allow,
+        # never deeper. This is a SEPARATE, independent safety layer from
+        # force_safety_limit/trigger_force (the MCU-triggered stop below)
+        # - neither replaces the other; if no valid trigger occurs before
+        # this bound, the phoming probing-move call below raises its own
+        # "Probe did not trigger" error, and this method does not retry
+        # deeper.
         toolhead = self._printer.lookup_object('toolhead')
         phoming = self._printer.lookup_object('homing')
         z_floor = max(self._z_min_position, -down_min_z)
@@ -215,13 +243,20 @@ class ZOffsetProbe:
 
             collector = self._start_fit_collector()
 
+            contact_floor = z_floor if minimum_allowed_z is None \
+                else max(z_floor, minimum_allowed_z)
             pos = list(toolhead.get_position())
-            pos[2] = z_floor
+            pos[2] = contact_floor
             epos = phoming.probing_move(
                 self._mcu_trigger_analog, pos, self._contact_speed)
 
             raw_z = epos[2]
             fitted_z = self._fit_contact_z(collector, raw_z, toolhead)
+
+            if not math.isfinite(raw_z) or not math.isfinite(fitted_z):
+                raise self._printer.command_error(
+                    "%s: contact result is not finite (raw=%r fitted=%r)"
+                    % (self._name, raw_z, fitted_z))
 
             self._last_raw_trigger_z = raw_z
             self._last_fitted_contact_z = fitted_z
@@ -243,6 +278,7 @@ class ZOffsetProbe:
             'last_raw_trigger_z': self._last_raw_trigger_z,
             'last_fitted_contact_z': self._last_fitted_contact_z,
             'last_fit_delta': self._last_fit_delta,
+            'max_contact_descent_mm': self.max_contact_descent_mm,
         }
 
 
