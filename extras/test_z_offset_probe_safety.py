@@ -636,6 +636,67 @@ class ContactInterpolationDiagnosticsTest(unittest.TestCase):
         self.assertIn('last_fit_delta', method)
 
 
+# ======================================================================
+# CONTACT-FORCE TELEMETRY (Phase 2 mission, §1)
+# ======================================================================
+
+class ContactForceTelemetryTest(unittest.TestCase):
+    """Verify the new force telemetry is derived from the SAME continuous
+    sample stream already collected for the fit (not a second collection
+    pass), stored as instance state, and exposed via get_status() -
+    matching the existing _last_raw_trigger_z/_last_fitted_contact_z/
+    _last_fit_delta pattern exactly."""
+
+    def test_new_state_fields_declared_in_init(self):
+        init_method = _extract_method(_module_source(), '__init__')
+        for field in ('_last_peak_force_g', '_last_peak_force_time',
+                      '_last_force_at_trigger_g', '_last_tare_counts'):
+            self.assertIn(field, init_method)
+
+    def test_telemetry_derived_from_samples_not_a_second_collection(self):
+        fit_method = _extract_method(_module_source(), '_fit_contact_z')
+        # Must reuse the SAME `samples` list _fit_contact_z already
+        # extracts from collector.collect_until() for the fit - no second
+        # collector.start_collecting()/collect_until() call anywhere in
+        # this method.
+        self.assertEqual(fit_method.count('collect_until('), 1)
+        self.assertEqual(fit_method.count('start_collecting('), 0)
+        self.assertIn('peak_sample = max(samples', fit_method)
+        self.assertIn('abs(s[1])', fit_method)
+
+    def test_peak_force_uses_full_window_not_ascent_only_data(self):
+        fit_method = _extract_method(_module_source(), '_fit_contact_z')
+        # The peak/trigger-force extraction must run on `samples` (the
+        # full pre-filter list) - textually BEFORE `data` (the ascent-
+        # window-filtered list the fit itself uses) is ever built.
+        peak_pos = fit_method.find('peak_sample = max(samples')
+        data_pos = fit_method.find('data = []')
+        self.assertGreater(peak_pos, 0)
+        self.assertGreater(data_pos, 0)
+        self.assertLess(peak_pos, data_pos)
+
+    def test_force_at_trigger_uses_pre_trigger_samples_only(self):
+        fit_method = _extract_method(_module_source(), '_fit_contact_z')
+        self.assertIn('pre_trigger', fit_method)
+        self.assertIn('s[0] <= ascent_start_time', fit_method)
+
+    def test_tare_counts_read_from_sample_tuple_fourth_element(self):
+        fit_method = _extract_method(_module_source(), '_fit_contact_z')
+        self.assertIn('samples[0][3]', fit_method)
+
+    def test_new_fields_in_status(self):
+        method = _extract_method(_module_source(), 'get_status')
+        for field in ('last_peak_force_g', 'last_peak_force_time',
+                      'last_force_at_trigger_g', 'last_tare_counts',
+                      'trigger_force', 'force_safety_limit', 'contact_speed'):
+            self.assertIn(field, method)
+
+    def test_limitations_documented_in_source(self):
+        source = _module_source()
+        self.assertIn('sample-period-resolution approximation', source)
+        self.assertIn('not a continuously-sampled true physical peak', source)
+
+
 class ContactInterpolationUpstreamParityTest(unittest.TestCase):
     """Verify our fit implementation matches upstream 58bd TappingMove semantics."""
 

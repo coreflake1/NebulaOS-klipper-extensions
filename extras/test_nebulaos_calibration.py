@@ -122,7 +122,8 @@ def _accepted_measurement(x, y, probe_trigger_z, nozzle_contact_z,
         raw_nozzle_contact_z=nozzle_contact_z,
         repeatability=repeatability,
         probe_z_offset=probe_trigger_z - nozzle_contact_z,
-        accepted=True, rejection_reason=None)
+        accepted=True, rejection_reason=None,
+        trigger_force=75.0, force_safety_limit=2000.0, contact_speed=2.0)
 
 
 def _rejected_measurement(x, y, reason='excessive_fit_delta(9.0>1.0)'):
@@ -135,7 +136,8 @@ def _rejected_measurement(x, y, reason='excessive_fit_delta(9.0>1.0)'):
         predicted_nozzle_contact_z=0.2, commanded_floor_z=-0.8,
         raw_probe_trigger_z=2.0,
         raw_nozzle_contact_z=None, repeatability=repeatability,
-        probe_z_offset=None, accepted=False, rejection_reason=reason)
+        probe_z_offset=None, accepted=False, rejection_reason=reason,
+        trigger_force=75.0, force_safety_limit=2000.0, contact_speed=2.0)
 
 
 def _stub_pair(probe_trigger_z, nozzle_contact_z):

@@ -127,6 +127,7 @@ class FakeZOffsetProbe:
     def touch_probe(self, down_min_z, pro_cnt=1, minimum_allowed_z=None):
         self.calls.append({'down_min_z': down_min_z, 'pro_cnt': pro_cnt,
                             'minimum_allowed_z': minimum_allowed_z})
+        call_index = self._i
         item = (self._contacts[self._i] if isinstance(self._contacts, list)
                 else self._contacts)
         if isinstance(self._contacts, list):
@@ -134,13 +135,28 @@ class FakeZOffsetProbe:
         if isinstance(item, Exception):
             raise item
         fitted_z, raw_z, fit_delta = item
-        self._last = (raw_z, fitted_z, fit_delta)
+        # Synthetic but deterministic force telemetry, distinct per call
+        # (index-derived) so tests can tell samples apart without needing
+        # a 4th tuple element for every existing fixture.
+        peak_force_g = -80.0 - call_index
+        peak_force_time = 100.0 + call_index
+        force_at_trigger_g = -76.0 - call_index
+        tare_counts = -249399 + call_index
+        self._last = (raw_z, fitted_z, fit_delta, peak_force_g,
+                      peak_force_time, force_at_trigger_g, tare_counts)
         return fitted_z
 
     def get_status(self, eventtime):
-        raw_z, fitted_z, fit_delta = self._last
+        (raw_z, fitted_z, fit_delta, peak_force_g, peak_force_time,
+         force_at_trigger_g, tare_counts) = self._last
         return {'last_raw_trigger_z': raw_z, 'last_fitted_contact_z': fitted_z,
-                'last_fit_delta': fit_delta}
+                'last_fit_delta': fit_delta,
+                'last_peak_force_g': peak_force_g,
+                'last_peak_force_time': peak_force_time,
+                'last_force_at_trigger_g': force_at_trigger_g,
+                'last_tare_counts': tare_counts,
+                'trigger_force': 75.0, 'force_safety_limit': 2000.0,
+                'contact_speed': 2.0}
 
 
 def _patch_run_single_probe(probe_trigger_z):
@@ -648,6 +664,102 @@ class RejectionNeverStagesTest(_Base):
             established_contact_margin_mm=1.0, max_abs_fit_delta=1.0,
             toolhead=toolhead)
         self.assertEqual(toolhead.get_position()[2], 8.0)  # horizontal_move_z
+
+
+# ======================================================================
+# Contact-force telemetry (Phase 2 mission, §1) - propagation through
+# ContactSample and PairedMeasurement
+# ======================================================================
+
+class ContactForceTelemetryPropagationTest(_Base):
+    def test_per_sample_force_fields_populated_from_status(self):
+        result, z_probe, _th = self._measure(
+            REAL_RAW_PROBE_TRIGGER_Z, [(-0.005, -0.235, -0.229)],
+            probe_z_offset=REAL_EXISTING_PROBE_Z_OFFSET,
+            established_contact_margin_mm=1.0)
+        sample = result.repeatability.samples[0]
+        # FakeZOffsetProbe derives these deterministically from call index
+        # 0: peak=-80.0, peak_time=100.0, force_at_trigger=-76.0, tare=-249399
+        self.assertAlmostEqual(sample.peak_force_g, -80.0, places=9)
+        self.assertAlmostEqual(sample.peak_force_time, 100.0, places=9)
+        self.assertAlmostEqual(sample.force_at_trigger_g, -76.0, places=9)
+        self.assertEqual(sample.tare_counts, -249399)
+
+    def test_predicted_to_raw_trigger_depth_established_case(self):
+        # predicted=-1.770, raw=-2.000 -> trigger 0.230mm BELOW predicted
+        # (positive = deeper than predicted, matching the real hardware
+        # language "trigger depth ... below the predicted plane").
+        result, _z, _th = self._measure(
+            REAL_RAW_PROBE_TRIGGER_Z, [(-2.010, -2.000, -0.010)],
+            probe_z_offset=REAL_EXISTING_PROBE_Z_OFFSET,
+            established_contact_margin_mm=1.0)
+        sample = result.repeatability.samples[0]
+        self.assertAlmostEqual(
+            sample.predicted_to_raw_trigger_depth,
+            REAL_PREDICTED_NOZZLE_CONTACT_Z - (-2.000), places=9)
+        self.assertGreater(sample.predicted_to_raw_trigger_depth, 0)
+
+    def test_predicted_to_raw_trigger_depth_is_none_for_bootstrap(self):
+        # No prediction exists in the BOOTSTRAP case - the field must be
+        # None, not silently computed against something meaningless.
+        result, _z, _th = self._measure(
+            REAL_RAW_PROBE_TRIGGER_Z, [(-1.0, -1.0, 0.0)],
+            probe_z_offset=0.0, bootstrap_contact_envelope_mm=10.0)
+        sample = result.repeatability.samples[0]
+        self.assertIsNone(sample.predicted_to_raw_trigger_depth)
+
+    def test_remaining_margin_to_floor(self):
+        margin = 1.0
+        result, _z, _th = self._measure(
+            REAL_RAW_PROBE_TRIGGER_Z, [(-2.010, -2.000, -0.010)],
+            probe_z_offset=REAL_EXISTING_PROBE_Z_OFFSET,
+            established_contact_margin_mm=margin)
+        sample = result.repeatability.samples[0]
+        expected_floor = REAL_PREDICTED_NOZZLE_CONTACT_Z - margin
+        self.assertAlmostEqual(
+            sample.remaining_margin_to_floor, -2.000 - expected_floor,
+            places=9)
+        self.assertGreater(sample.remaining_margin_to_floor, 0)
+
+    def test_configured_values_echoed_on_paired_measurement(self):
+        result, _z, _th = self._measure(
+            REAL_RAW_PROBE_TRIGGER_Z, [(-2.010, -2.000, -0.010)],
+            probe_z_offset=REAL_EXISTING_PROBE_Z_OFFSET,
+            established_contact_margin_mm=1.0)
+        self.assertAlmostEqual(result.trigger_force, 75.0, places=9)
+        self.assertAlmostEqual(result.force_safety_limit, 2000.0, places=9)
+        self.assertAlmostEqual(result.contact_speed, 2.0, places=9)
+
+    def test_force_fields_none_on_hard_contact_error_sample(self):
+        toolhead = FakeToolhead()
+        with self.assertRaises(CommandError):
+            self._measure(
+                REAL_RAW_PROBE_TRIGGER_Z, [CommandError("sensor error")],
+                probe_z_offset=REAL_EXISTING_PROBE_Z_OFFSET,
+                established_contact_margin_mm=1.0, toolhead=toolhead)
+        # The error propagates (asserted above); this test only documents
+        # that the failure-path ContactSample construction (see
+        # measure_probe_nozzle_pair's own except-block) does not raise a
+        # SECOND, unrelated error (e.g. a missing-field TypeError) while
+        # building that sample - if it did, assertRaises above would have
+        # seen the wrong exception type.
+
+    def test_no_sample_missing_force_fields_across_a_repeatability_set(self):
+        result, _z, _th = self._measure(
+            REAL_RAW_PROBE_TRIGGER_Z,
+            [(-2.01, -2.00, -0.01), (-2.02, -2.01, -0.01), (-2.00, -1.99, -0.01)],
+            probe_z_offset=REAL_EXISTING_PROBE_Z_OFFSET,
+            established_contact_margin_mm=1.0, pro_cnt=3,
+            min_accepted_samples=1, max_repeatability_range=10.0,
+            max_repeatability_stddev=10.0)
+        self.assertEqual(len(result.repeatability.samples), 3)
+        for i, s in enumerate(result.repeatability.samples):
+            self.assertIsNotNone(s.peak_force_g)
+            self.assertIsNotNone(s.tare_counts)
+            self.assertIsNotNone(s.remaining_margin_to_floor)
+            # Distinct per call index - proves each sample got its OWN
+            # telemetry, not one snapshot reused across all three.
+            self.assertAlmostEqual(s.peak_force_g, -80.0 - i, places=9)
 
 
 if __name__ == '__main__':

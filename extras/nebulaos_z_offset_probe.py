@@ -84,6 +84,14 @@ class ZOffsetProbe:
         self._last_raw_trigger_z = None
         self._last_fitted_contact_z = None
         self._last_fit_delta = None
+        # Contact-force telemetry (Phase 2 mission, §1) - see
+        # _fit_contact_z()'s own comment for exactly how these are derived
+        # from the SAME sample stream already collected for the fit, and
+        # the honest limitations of each.
+        self._last_peak_force_g = None
+        self._last_peak_force_time = None
+        self._last_force_at_trigger_g = None
+        self._last_tare_counts = None
 
     def _get_safety_range(self):
         counts_per_gram = self._load_cell.get_counts_per_gram()
@@ -157,6 +165,37 @@ class ZOffsetProbe:
         Upstream 58bd parity: adapts TappingMove._analyze_ascent() +
         LCBestFit.find_best_fit(). The retract serves as the ascent move
         whose force-vs-position curve reveals the contact/free-air transition.
+
+        Contact-force telemetry (Phase 2 mission, §1): `collector` was
+        started in touch_probe() BEFORE the descent (probing_move) even
+        began, and is drained here only after the retract completes - so
+        `samples` (before it gets filtered down to `data`, the ascent-only
+        window the FIT itself uses) already spans the FULL physical
+        contact event: pre-contact descent, the trigger itself, any
+        dwell, and the retract. Reused here, not re-collected - the same
+        "existing collector/data path" this mission asks for, not a
+        second load-cell implementation. Each sample is upstream
+        load_cell.py's own [time, grams, counts, tare_counts] tuple
+        (confirmed against the pinned source's _sensor_data_event, not
+        assumed) - samples[i][1] is already force in grams, no conversion
+        needed here.
+
+        None of this runs before or influences phoming.probing_move()'s
+        own trigger decision in any way - it is pure post-hoc extraction
+        from data the trigger algorithm never sees.
+
+        Two honest, bounded limitations, stated rather than hidden:
+          - "force at trigger" is the LAST sample at or before
+            ascent_start_time (the moment probing_move() returned) - a
+            sample-period-resolution approximation of the true trigger
+            instant, not a hardware-timestamped exact reading. The
+            uncertainty window is one sample period (1/sensor sample
+            rate) - typically ~12ms for an 80Hz HX711.
+          - "peak force" is the single largest |grams| sample anywhere in
+            this same continuous window (which will normally land at or
+            just after the trigger, before force drops off during
+            retract) - not a continuously-sampled true physical peak,
+            since the sensor itself only samples at its own fixed rate.
         """
         ascent_start_time = toolhead.get_last_move_time()
 
@@ -172,6 +211,19 @@ class ZOffsetProbe:
             raise self._printer.command_error(
                 "%s: sensor errors during ascent: %i errors, %i overflows"
                 % (self._name, errors, overflows))
+
+        self._last_peak_force_g = None
+        self._last_peak_force_time = None
+        self._last_force_at_trigger_g = None
+        self._last_tare_counts = None
+        if samples:
+            peak_sample = max(samples, key=lambda s: abs(s[1]))
+            self._last_peak_force_g = peak_sample[1]
+            self._last_peak_force_time = peak_sample[0]
+            self._last_tare_counts = samples[0][3]
+            pre_trigger = [s for s in samples if s[0] <= ascent_start_time]
+            if pre_trigger:
+                self._last_force_at_trigger_g = pre_trigger[-1][1]
 
         data = []
         for s in samples:
@@ -269,6 +321,13 @@ class ZOffsetProbe:
             'last_raw_trigger_z': self._last_raw_trigger_z,
             'last_fitted_contact_z': self._last_fitted_contact_z,
             'last_fit_delta': self._last_fit_delta,
+            'last_peak_force_g': self._last_peak_force_g,
+            'last_peak_force_time': self._last_peak_force_time,
+            'last_force_at_trigger_g': self._last_force_at_trigger_g,
+            'last_tare_counts': self._last_tare_counts,
+            'trigger_force': self._trigger_force,
+            'force_safety_limit': self._force_safety_limit,
+            'contact_speed': self._contact_speed,
         }
 
 

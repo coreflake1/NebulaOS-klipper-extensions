@@ -100,7 +100,16 @@ _CREDIBLE_Z_OFFSET_EPSILON_MM = 0.0005
 ContactSample = collections.namedtuple('ContactSample', [
     'sample_index', 'starting_z', 'commanded_floor_z',
     'raw_trigger_z', 'fitted_contact_z', 'fit_delta',
-    'fit_valid', 'motion_safe', 'accepted', 'rejection_reason'])
+    'fit_valid', 'motion_safe', 'accepted', 'rejection_reason',
+    # Contact-force telemetry (Phase 2 mission, §1) - see
+    # nebulaos_z_offset_probe.py's own _fit_contact_z() comment for exact
+    # derivation and honest limitations of each. peak_force_g/
+    # peak_force_time/force_at_trigger_g/tare_counts come straight from
+    # ZOffsetProbe.get_status() for THIS sample; predicted_to_raw_
+    # trigger_depth and remaining_margin_to_floor are derived here from
+    # values already computed in this same function.
+    'peak_force_g', 'peak_force_time', 'force_at_trigger_g', 'tare_counts',
+    'predicted_to_raw_trigger_depth', 'remaining_margin_to_floor'])
 
 RepeatabilityResult = collections.namedtuple('RepeatabilityResult', [
     'sample_count', 'accepted_count', 'samples',
@@ -112,7 +121,11 @@ PairedMeasurement = collections.namedtuple('PairedMeasurement', [
     'predicted_nozzle_contact_z', 'commanded_floor_z',
     'raw_probe_trigger_z', 'raw_nozzle_contact_z',
     'repeatability', 'probe_z_offset',
-    'accepted', 'rejection_reason'])
+    'accepted', 'rejection_reason',
+    # Configured contact-safety values in effect for this run (constant
+    # across every sample) - echoed here purely for reporting/
+    # characterization convenience, per §1's own list.
+    'trigger_force', 'force_safety_limit', 'contact_speed'])
 
 
 def _is_credible_probe_z_offset(probe_z_offset):
@@ -295,12 +308,20 @@ def measure_probe_nozzle_pair(printer, x, y, probe_x_offset, probe_y_offset,
                 raw_trigger_z=None, fitted_contact_z=None, fit_delta=None,
                 fit_valid=False, motion_safe=False, accepted=False,
                 rejection_reason="contact_error: %s"
-                                  % (str(e).strip() or e.__class__.__name__,)))
+                                  % (str(e).strip() or e.__class__.__name__,),
+                peak_force_g=None, peak_force_time=None,
+                force_at_trigger_g=None, tare_counts=None,
+                predicted_to_raw_trigger_depth=None,
+                remaining_margin_to_floor=None))
             raise
 
         status = z_offset_probe.get_status(reactor.monotonic())
         raw_z = status['last_raw_trigger_z']
         fit_delta = status['last_fit_delta']
+        peak_force_g = status['last_peak_force_g']
+        peak_force_time = status['last_peak_force_time']
+        force_at_trigger_g = status['last_force_at_trigger_g']
+        tare_counts = status['last_tare_counts']
         fit_valid = (raw_z is not None and fitted_z is not None
                      and fit_delta is not None
                      and math.isfinite(raw_z) and math.isfinite(fitted_z)
@@ -316,13 +337,25 @@ def measure_probe_nozzle_pair(printer, x, y, probe_x_offset, probe_y_offset,
         else:
             accepted = True
 
+        predicted_to_raw_trigger_depth = None
+        remaining_margin_to_floor = None
+        if raw_z is not None and math.isfinite(raw_z):
+            if predicted_nozzle_contact_z is not None:
+                predicted_to_raw_trigger_depth = (
+                    predicted_nozzle_contact_z - raw_z)
+            remaining_margin_to_floor = raw_z - commanded_floor_z
+
         samples.append(ContactSample(
             sample_index=i, starting_z=starting_z,
             commanded_floor_z=commanded_floor_z,
             raw_trigger_z=raw_z, fitted_contact_z=fitted_z,
             fit_delta=fit_delta, fit_valid=fit_valid,
             motion_safe=motion_safe, accepted=accepted,
-            rejection_reason=rejection_reason))
+            rejection_reason=rejection_reason,
+            peak_force_g=peak_force_g, peak_force_time=peak_force_time,
+            force_at_trigger_g=force_at_trigger_g, tare_counts=tare_counts,
+            predicted_to_raw_trigger_depth=predicted_to_raw_trigger_depth,
+            remaining_margin_to_floor=remaining_margin_to_floor))
         if accepted:
             accepted_zs.append(fitted_z)
 
@@ -373,6 +406,10 @@ def measure_probe_nozzle_pair(printer, x, y, probe_x_offset, probe_y_offset,
     if repeat_accepted:
         probe_z_offset_result = raw_probe_trigger_z - mean
 
+    # Configured values echoed for reporting convenience (§1) - read once
+    # here rather than per-sample, since they cannot change mid-run.
+    final_status = z_offset_probe.get_status(reactor.monotonic())
+
     return PairedMeasurement(
         x=x, y=y, contact_id=contact_id, contact_mode=contact_mode,
         predicted_nozzle_contact_z=predicted_nozzle_contact_z,
@@ -381,4 +418,7 @@ def measure_probe_nozzle_pair(printer, x, y, probe_x_offset, probe_y_offset,
         raw_nozzle_contact_z=mean,
         repeatability=repeatability,
         probe_z_offset=probe_z_offset_result,
-        accepted=repeat_accepted, rejection_reason=repeat_rejection)
+        accepted=repeat_accepted, rejection_reason=repeat_rejection,
+        trigger_force=final_status['trigger_force'],
+        force_safety_limit=final_status['force_safety_limit'],
+        contact_speed=final_status['contact_speed'])
