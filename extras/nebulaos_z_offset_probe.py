@@ -231,6 +231,24 @@ class ZOffsetProbe:
                s[0] <= ascent_start_time + ASCENT_DATA_WINDOW_SECONDS:
                 data.append((s[1], _lookup_z_pos(toolhead, s[0])))
 
+        # Phase 2 hot-reliability investigation (qualification-only diagnostic,
+        # not a normal-operation payload): dump the exact ascent-window samples
+        # the fit is about to run on, plus the full pre-filter collector output,
+        # unconditionally and before either failure branch below, so a failing
+        # hot touch leaves the raw (grams, z) curve in klippy.log instead of
+        # only the aggregate "insufficient ascent samples" verdict.
+        # logging.info, not logging.debug: this device's S55klipper init
+        # script starts klippy without -v, so the root logger level is
+        # INFO (see klippy.py's own debuglevel default) and DEBUG records
+        # are silently dropped before ever reaching klippy.log.
+        logging.info(
+            "%s: raw collector samples (%d, ascent_start=%.4f window=%.4f): %s",
+            self._name, len(samples), ascent_start_time,
+            ASCENT_DATA_WINDOW_SECONDS, samples)
+        logging.info(
+            "%s: ascent fit window data (%d points, grams/z pairs): %s",
+            self._name, len(data), data)
+
         if len(data) < 2 * FIT_MIN_POINTS:
             raise self._printer.command_error(
                 "%s: insufficient ascent samples (%d total, need >= %d"
