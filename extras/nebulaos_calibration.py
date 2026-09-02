@@ -258,17 +258,53 @@ class NebulaOSCalibration:
             'established_contact_margin_mm', default=1.0,
             minval=0.01, maxval=5.)
         # bootstrap_contact_envelope_mm: how far below the nozzle's own
-        # actual, known, currently-measured starting Z a BOOTSTRAP/virgin
-        # calibration run (no credible prior) may blindly search. A
-        # SEPARATE value from down_min_z - never silently reused as one -
-        # requiring its own explicit hardware qualification before a
-        # virgin printer's first automatic Z-offset calibration can run
-        # at all. Still NOT qualified (mission §8, bootstrap Z-offset, not
-        # yet closed) - deliberately no default; BOOTSTRAP mode still
-        # fails closed with CONTACT_SAFETY_LIMIT_UNQUALIFIED until that
-        # work lands.
+        # actual, known, currently-measured starting Z (horizontal_move_z,
+        # default 5.0mm) a BOOTSTRAP/virgin calibration run (no credible
+        # prior) may blindly search. A SEPARATE value from down_min_z -
+        # never silently reused as one.
+        #
+        # Phase 2 mission §8 qualification (2026-09-02): 8.0mm, derived
+        # from this unit's own measured z_offset history (1.6-2.3mm across
+        # cold/hot sessions this mission) plus real margin - a genuinely
+        # virgin unit (probe_z_offset=0.000 at homing) needs to search
+        # from horizontal_move_z=5.0mm down to roughly -(1.6 to 2.3)mm in
+        # that frame, i.e. 6.6-7.3mm of real depth; 8.0mm leaves ~0.7-1.4mm
+        # of margin beyond this unit's own worst observed case for
+        # ordinary unit-to-unit assembly variance, while the resulting
+        # commanded_floor_z (5.0-8.0=-3.0mm) still leaves 2mm of
+        # independent margin before the absolute stepper floor
+        # (position_min=-5.0mm on this printer).
+        #
+        # Physically qualified via NEBULAOS_Z_OFFSET_CALIBRATE
+        # SIMULATE_BOOTSTRAP=1 (see that command's own docstring): 6 real
+        # BOOTSTRAP-mode nozzle contacts on hardware that already has a
+        # trusted ESTABLISHED calibration, WITHOUT ever reading, mutating,
+        # or risking that real calibration - 5 at ENVELOPE=7.0mm, all
+        # succeeding with results (1.014-1.161mm) closely agreeing with an
+        # ESTABLISHED-mode measurement taken moments earlier in the same
+        # session (1.014-2.06mm range that same session) - cross-
+        # validating that the BOOTSTRAP formula/motion path measures the
+        # same real physical quantity correctly. A 6th run at a
+        # deliberately excessive ENVELOPE=12.0mm (commanded_floor_z=-7.0mm,
+        # beyond position_min) completed identically and safely: real
+        # contact triggered at ~1.16mm long before any floor was
+        # approached, and touch_probe()'s own contact_floor=max(z_floor,
+        # minimum_allowed_z) clamp means the ACTUAL floor a probing move
+        # could ever reach is structurally bounded by the independent
+        # absolute z_floor regardless of how generous
+        # bootstrap_contact_envelope_mm is - confirming this constant
+        # cannot itself cause a deeper-than-intended search even if
+        # mis-qualified. Full evidence:
+        # _evidence/phase2-live-full-stack-closure-20260902-180602/
+        # 03-bootstrap-simulation-qualification/. Not yet tested with an
+        # actual, deeper real virgin-unit contact point (this unit's own
+        # current ESTABLISHED calibration only lets the simulation reach
+        # its OWN, comparatively shallow, contact point) - the mechanism,
+        # formula, and safety clamping are proven; the specific 8.0mm
+        # number is a geometry-and-margin-based estimate for a genuinely
+        # virgin unit, not itself hardware-proven at full depth.
         self.bootstrap_contact_envelope_mm = config.getfloat(
-            'bootstrap_contact_envelope_mm', default=None,
+            'bootstrap_contact_envelope_mm', default=8.0,
             minval=0.5, maxval=30.)
         # Measurement-quality and repeatability acceptance bounds (§7/§9/
         # §10).
@@ -322,6 +358,18 @@ class NebulaOSCalibration:
         self.z_offset_accepted_count = None
         self.z_offset_range = None
         self.z_offset_stddev = None
+
+        # SIMULATE_BOOTSTRAP (mission §8) - a completely separate status
+        # namespace from the real z_offset_* fields above, on purpose: a
+        # simulation result must never be mistakable for (or accidentally
+        # overwrite the display of) a real applied/staged calibration.
+        self.bootstrap_sim_id = 0
+        self.bootstrap_sim_state = 'idle'
+        self.bootstrap_sim_result = None
+        self.bootstrap_sim_error = None
+        self.bootstrap_sim_envelope_mm = None
+        self.bootstrap_sim_raw_probe_trigger_z = None
+        self.bootstrap_sim_commanded_floor_z = None
 
         # Axis Twist state - kept PER AXIS (not one shared state) so
         # AXIS=BOTH's status can distinguish X progress from Y progress,
@@ -405,6 +453,13 @@ class NebulaOSCalibration:
             'z_offset_accepted_count': self.z_offset_accepted_count,
             'z_offset_range': self.z_offset_range,
             'z_offset_stddev': self.z_offset_stddev,
+            'bootstrap_sim_id': self.bootstrap_sim_id,
+            'bootstrap_sim_state': self.bootstrap_sim_state,
+            'bootstrap_sim_result': self.bootstrap_sim_result,
+            'bootstrap_sim_error': self.bootstrap_sim_error,
+            'bootstrap_sim_envelope_mm': self.bootstrap_sim_envelope_mm,
+            'bootstrap_sim_raw_probe_trigger_z': self.bootstrap_sim_raw_probe_trigger_z,
+            'bootstrap_sim_commanded_floor_z': self.bootstrap_sim_commanded_floor_z,
             'axis_twist_id': self.axis_twist_id,
             'axis_twist_method': self.axis_twist_method,
             'axis_twist_current_axis': self.axis_twist_current_axis,
@@ -424,7 +479,10 @@ class NebulaOSCalibration:
     cmd_z_offset_calibrate_help = (
         "Calibrate the BLTouch Z-offset via the local secondary load cell "
         "- for a manual calibration, use pristine upstream PROBE_CALIBRATE "
-        "directly")
+        "directly. SIMULATE_BOOTSTRAP=1 ENVELOPE=<mm> qualifies the "
+        "BOOTSTRAP contact path on an already-calibrated unit without "
+        "applying or staging anything - see NEBULAOS_CALIBRATION_STATUS's "
+        "bootstrap_sim_* fields")
 
     def cmd_z_offset_calibrate(self, gcmd):
         """LOAD_CELL only - there is no METHOD=MANUAL passthrough any more
@@ -445,6 +503,11 @@ class NebulaOSCalibration:
         x, y = self._resolve_reference_xy(gcmd)
         probe_obj = self.printer.lookup_object('probe')
         probe_x_offset, probe_y_offset, probe_z_offset = probe_obj.get_offsets()
+
+        if gcmd.get_int('SIMULATE_BOOTSTRAP', 0):
+            self._cmd_z_offset_calibrate_simulate_bootstrap(
+                gcmd, x, y, probe_x_offset, probe_y_offset, z_offset_probe)
+            return
 
         self.z_offset_id += 1
         self.z_offset_state = 'running'
@@ -579,6 +642,101 @@ class NebulaOSCalibration:
             "The SAVE_CONFIG command will make this permanent."
             % (new_offset, measurement.raw_probe_trigger_z,
                measurement.raw_nozzle_contact_z, x, y))
+
+    # ------------------------------------------------------------------
+    # NEBULAOS_Z_OFFSET_CALIBRATE SIMULATE_BOOTSTRAP=1 (mission §8: a
+    # controlled, simulated virgin state for qualifying the BOOTSTRAP
+    # contact envelope without ever touching this unit's real,
+    # already-calibrated probe_z_offset)
+    # ------------------------------------------------------------------
+    def _cmd_z_offset_calibrate_simulate_bootstrap(
+            self, gcmd, x, y, probe_x_offset, probe_y_offset, z_offset_probe):
+        """Forces probe_z_offset=0.0 into measure_probe_nozzle_pair() for
+        THIS call only - _is_credible_probe_z_offset(0.0) is False, so the
+        REAL BOOTSTRAP code path (classification, formula, motion, quality
+        gates) runs for real, with real nozzle contact - without ever
+        reading, mutating, or reapplying this unit's own real,
+        already-calibrated probe_offsets.z_offset (never looked up in this
+        method at all, unlike the real ESTABLISHED path above). The result
+        is reported in its own separate bootstrap_sim_* status namespace
+        and is NEVER applied live or staged/SAVE_CONFIG'd - this exists
+        purely to physically qualify the bootstrap envelope and exercise
+        the bootstrap motion/measurement path on hardware that already has
+        a trusted calibration. This is exactly the "controlled temporary/
+        simulated virgin state" the mission asks for, with an "exact
+        backup/restore" of zero work needed: nothing about the real probe
+        is ever touched to begin with, so there is nothing to restore.
+
+        ENVELOPE= is required and always explicit here (never falls back
+        to self.bootstrap_contact_envelope_mm) - this command's entire
+        purpose is qualifying that value BEFORE it becomes trusted
+        production config in the first place; a caller who has already
+        set a production default can still pass ENVELOPE=<that value>
+        explicitly to re-verify it on a specific unit.
+        """
+        envelope = gcmd.get_float('ENVELOPE', None)
+        if envelope is None:
+            raise self.printer.command_error(
+                "NEBULAOS_Z_OFFSET_CALIBRATE SIMULATE_BOOTSTRAP=1 requires "
+                "ENVELOPE=<mm> - this is a qualification aid for "
+                "determining bootstrap_contact_envelope_mm itself, so it "
+                "never falls back to a config default")
+
+        self.bootstrap_sim_id += 1
+        self.bootstrap_sim_state = 'running'
+        self.bootstrap_sim_result = None
+        self.bootstrap_sim_error = None
+        self.bootstrap_sim_envelope_mm = envelope
+        self.bootstrap_sim_raw_probe_trigger_z = None
+        self.bootstrap_sim_commanded_floor_z = None
+
+        try:
+            measurement = nebulaos_probe_pair.measure_probe_nozzle_pair(
+                self.printer, x, y, probe_x_offset, probe_y_offset,
+                0.0,  # forced - see this method's own docstring
+                self.horizontal_move_z, z_offset_probe, self.down_min_z,
+                pro_cnt=self.pro_cnt, travel_speed=self.travel_speed,
+                probe_lift_speed=self.probe_lift_speed,
+                bootstrap_contact_envelope_mm=envelope,
+                max_abs_fit_delta=self.max_abs_fit_delta,
+                min_accepted_samples=self.min_accepted_samples,
+                max_repeatability_range=self.max_repeatability_range,
+                max_repeatability_stddev=self.max_repeatability_stddev)
+
+            self.bootstrap_sim_raw_probe_trigger_z = measurement.raw_probe_trigger_z
+            self.bootstrap_sim_commanded_floor_z = measurement.commanded_floor_z
+
+            if measurement.contact_mode != 'bootstrap':
+                raise self.printer.command_error(
+                    "SIMULATE_BOOTSTRAP: internal error - contact_mode=%r, "
+                    "expected 'bootstrap' (probe_z_offset=0.0 should "
+                    "always classify as BOOTSTRAP)" % (measurement.contact_mode,))
+
+            if not measurement.accepted:
+                raise self.printer.command_error(
+                    "SIMULATE_BOOTSTRAP: measurement rejected - %s "
+                    "(samples: %d taken, %d accepted)" %
+                    (measurement.rejection_reason,
+                     measurement.repeatability.sample_count,
+                     measurement.repeatability.accepted_count))
+
+            result = measurement.probe_z_offset
+            if not math.isfinite(result):
+                raise self.printer.command_error(
+                    "SIMULATE_BOOTSTRAP: measured value %r is not a "
+                    "finite number" % (result,))
+        except Exception as e:
+            self.bootstrap_sim_state = 'error'
+            self.bootstrap_sim_error = _sanitize_error(e)
+            raise
+
+        self.bootstrap_sim_state = 'complete'
+        self.bootstrap_sim_result = result
+        self.gcode.respond_info(
+            "SIMULATE_BOOTSTRAP: measured %.5f mm at X=%.3f Y=%.3f with "
+            "ENVELOPE=%.3fmm (commanded_floor_z=%.5f) - NOT applied or "
+            "staged, this is a simulation only"
+            % (result, x, y, envelope, measurement.commanded_floor_z))
 
     # ------------------------------------------------------------------
     # NEBULAOS_AXIS_TWIST_CALIBRATE

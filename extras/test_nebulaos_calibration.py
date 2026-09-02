@@ -483,14 +483,13 @@ class LoadCellRejectionGatingTest(unittest.TestCase):
         self.assertAlmostEqual(seen['max_repeatability_stddev'], 0.05, places=9)
 
     def test_qualified_defaults_apply_with_zero_config_overrides(self):
-        # Phase 2 mission §7 qualification (2026-09-02): established_
+        # Phase 2 mission §7/§8 qualification (2026-09-02): established_
         # contact_margin_mm/max_abs_fit_delta/min_accepted_samples/
-        # max_repeatability_range/max_repeatability_stddev now have real
-        # qualified defaults (1.0, 0.3, 2, 0.15, 0.06) and no longer
-        # require a qualification-only printer.cfg override to run an
-        # ESTABLISHED calibration at all. bootstrap_contact_envelope_mm
-        # remains unqualified (mission §8 not yet closed) and must still
-        # come through as None.
+        # max_repeatability_range/max_repeatability_stddev/bootstrap_
+        # contact_envelope_mm now all have real qualified defaults (1.0,
+        # 0.3, 2, 0.15, 0.06, 8.0) and no longer require a
+        # qualification-only printer.cfg override to run a calibration at
+        # all, in either ESTABLISHED or BOOTSTRAP mode.
         z_probe = FakeZOffsetProbe(is_calibrated=True)
         zc = FakeZCompensate(110., 111.)
         printer, gcode, coord = _build(z_probe, FakeProbeObj(), zc)
@@ -510,7 +509,7 @@ class LoadCellRejectionGatingTest(unittest.TestCase):
         self.assertEqual(seen['min_accepted_samples'], 2)
         self.assertAlmostEqual(seen['max_repeatability_range'], 0.15, places=9)
         self.assertAlmostEqual(seen['max_repeatability_stddev'], 0.06, places=9)
-        self.assertIsNone(seen['bootstrap_contact_envelope_mm'])
+        self.assertAlmostEqual(seen['bootstrap_contact_envelope_mm'], 8.0, places=9)
         self.assertEqual(coord.z_offset_state, 'complete')
 
     def test_diagnostics_recorded_in_status_after_success(self):
@@ -615,6 +614,153 @@ class UpstreamFirstCleanupTest(unittest.TestCase):
             sorted(gcode.commands.keys()),
             ['NEBULAOS_AXIS_TWIST_CALIBRATE', 'NEBULAOS_CALIBRATION_STATUS',
              'NEBULAOS_Z_OFFSET_CALIBRATE'])
+
+
+class SimulateBootstrapTest(unittest.TestCase):
+    """Phase 2 mission §8: SIMULATE_BOOTSTRAP=1 ENVELOPE=<mm> qualifies
+    the BOOTSTRAP contact path on an already-calibrated unit - see
+    nebulaos_calibration.py's _cmd_z_offset_calibrate_simulate_bootstrap()
+    docstring for the full rationale."""
+
+    def test_requires_envelope_parameter(self):
+        z_probe = FakeZOffsetProbe(is_calibrated=True)
+        probe_obj = FakeProbeObj(z_offset=1.795)
+        zc = FakeZCompensate(110., 111.)
+        printer, gcode, coord = _build(z_probe, probe_obj, zc)
+        with self.assertRaises(fake.CommandError) as ctx:
+            coord.cmd_z_offset_calibrate(
+                fake.FakeGCmd({'SIMULATE_BOOTSTRAP': '1'}))
+        self.assertIn('ENVELOPE', str(ctx.exception))
+
+    def test_forces_bootstrap_classification_regardless_of_real_offset(self):
+        # probe_obj has a real, credible, already-calibrated z_offset
+        # (1.795) - SIMULATE_BOOTSTRAP must still force the BOOTSTRAP path,
+        # and must never read this value at all.
+        z_probe = FakeZOffsetProbe(is_calibrated=True)
+        probe_obj = FakeProbeObj(z_offset=1.795)
+        zc = FakeZCompensate(110., 111.)
+        printer, gcode, coord = _build(z_probe, probe_obj, zc)
+        seen = {}
+
+        def fake_measure(printer_, x, y, probe_x_offset, probe_y_offset,
+                          probe_z_offset, *a, **kw):
+            seen['probe_z_offset'] = probe_z_offset
+            seen['bootstrap_contact_envelope_mm'] = kw.get(
+                'bootstrap_contact_envelope_mm')
+            seen['established_contact_margin_mm'] = kw.get(
+                'established_contact_margin_mm')
+            return _accepted_measurement(
+                x, y, probe_trigger_z=2.0, nozzle_contact_z=-5.0,
+                contact_mode='bootstrap')
+        orig = nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair
+        nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = fake_measure
+        try:
+            coord.cmd_z_offset_calibrate(
+                fake.FakeGCmd({'SIMULATE_BOOTSTRAP': '1', 'ENVELOPE': '7.0'}))
+        finally:
+            nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = orig
+        self.assertEqual(seen['probe_z_offset'], 0.0)
+        self.assertAlmostEqual(seen['bootstrap_contact_envelope_mm'], 7.0, places=9)
+        # established_contact_margin_mm is not passed through by the
+        # simulation call at all (bootstrap doesn't use it).
+        self.assertIsNone(seen['established_contact_margin_mm'])
+        # Real probe offset must be completely untouched.
+        self.assertAlmostEqual(probe_obj.probe_offsets.z_offset, 1.795, places=9)
+
+    def test_never_applies_or_stages_result(self):
+        z_probe = FakeZOffsetProbe(is_calibrated=True)
+        probe_obj = FakeProbeObj(z_offset=1.795)
+        zc = FakeZCompensate(110., 111.)
+        printer, gcode, coord = _build(z_probe, probe_obj, zc)
+
+        def fake_measure(printer_, x, y, *a, **kw):
+            return _accepted_measurement(
+                x, y, probe_trigger_z=2.0, nozzle_contact_z=-5.0,
+                contact_mode='bootstrap')
+        orig = nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair
+        nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = fake_measure
+        try:
+            coord.cmd_z_offset_calibrate(
+                fake.FakeGCmd({'SIMULATE_BOOTSTRAP': '1', 'ENVELOPE': '7.0'}))
+        finally:
+            nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = orig
+        self.assertAlmostEqual(probe_obj.probe_offsets.z_offset, 1.795, places=9)
+        configfile = printer.lookup_object('configfile')
+        self.assertEqual(configfile.set_calls, [])
+        # And the REAL z_offset_* status namespace is completely untouched.
+        self.assertEqual(coord.z_offset_state, 'idle')
+        self.assertIsNone(coord.z_offset_result)
+        self.assertEqual(coord.z_offset_id, 0)
+
+    def test_result_recorded_in_bootstrap_sim_status_namespace(self):
+        z_probe = FakeZOffsetProbe(is_calibrated=True)
+        probe_obj = FakeProbeObj(z_offset=1.795)
+        zc = FakeZCompensate(110., 111.)
+        printer, gcode, coord = _build(z_probe, probe_obj, zc)
+
+        def fake_measure(printer_, x, y, *a, **kw):
+            return _accepted_measurement(
+                x, y, probe_trigger_z=2.0, nozzle_contact_z=-5.0,
+                contact_mode='bootstrap')
+        orig = nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair
+        nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = fake_measure
+        try:
+            coord.cmd_z_offset_calibrate(
+                fake.FakeGCmd({'SIMULATE_BOOTSTRAP': '1', 'ENVELOPE': '7.0'}))
+        finally:
+            nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = orig
+        status = coord.get_status(0.)
+        self.assertEqual(status['bootstrap_sim_state'], 'complete')
+        self.assertEqual(status['bootstrap_sim_id'], 1)
+        self.assertAlmostEqual(status['bootstrap_sim_result'], 7.0, places=9)
+        self.assertAlmostEqual(status['bootstrap_sim_envelope_mm'], 7.0, places=9)
+        self.assertIsNone(status['bootstrap_sim_error'])
+
+    def test_rejected_measurement_is_not_applied_and_records_error(self):
+        z_probe = FakeZOffsetProbe(is_calibrated=True)
+        probe_obj = FakeProbeObj(z_offset=1.795)
+        zc = FakeZCompensate(110., 111.)
+        printer, gcode, coord = _build(z_probe, probe_obj, zc)
+
+        def fake_measure(printer_, x, y, *a, **kw):
+            return _rejected_measurement(x, y)
+        orig = nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair
+        nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = fake_measure
+        try:
+            with self.assertRaises(fake.CommandError):
+                coord.cmd_z_offset_calibrate(
+                    fake.FakeGCmd({'SIMULATE_BOOTSTRAP': '1', 'ENVELOPE': '7.0'}))
+        finally:
+            nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = orig
+        status = coord.get_status(0.)
+        self.assertEqual(status['bootstrap_sim_state'], 'error')
+        self.assertIsNotNone(status['bootstrap_sim_error'])
+        self.assertIsNone(status['bootstrap_sim_result'])
+        self.assertAlmostEqual(probe_obj.probe_offsets.z_offset, 1.795, places=9)
+
+    def test_unexpected_non_bootstrap_classification_is_an_internal_error(self):
+        # Defense in depth: if measure_probe_nozzle_pair ever returned
+        # something other than 'bootstrap' for a probe_z_offset=0.0 call,
+        # that's a real bug in this simulation path, not a normal
+        # rejection - must raise clearly rather than silently accept.
+        z_probe = FakeZOffsetProbe(is_calibrated=True)
+        probe_obj = FakeProbeObj(z_offset=1.795)
+        zc = FakeZCompensate(110., 111.)
+        printer, gcode, coord = _build(z_probe, probe_obj, zc)
+
+        def fake_measure(printer_, x, y, *a, **kw):
+            return _accepted_measurement(
+                x, y, probe_trigger_z=2.0, nozzle_contact_z=0.5,
+                contact_mode='established')
+        orig = nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair
+        nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = fake_measure
+        try:
+            with self.assertRaises(fake.CommandError) as ctx:
+                coord.cmd_z_offset_calibrate(
+                    fake.FakeGCmd({'SIMULATE_BOOTSTRAP': '1', 'ENVELOPE': '7.0'}))
+        finally:
+            nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = orig
+        self.assertIn('internal error', str(ctx.exception))
 
 
 class StatusTest(unittest.TestCase):
