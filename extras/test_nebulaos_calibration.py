@@ -922,6 +922,14 @@ class AutoCalibrateTest(unittest.TestCase):
         self.assertIn('TARGET=65.0', gcode.scripts_run[1])
         self.assertIn('HEATER=extruder', gcode.scripts_run[2])
         self.assertIn('TARGET=230.0', gcode.scripts_run[2])
+        # establish_thermal_state (mission root-cause fix, 2026-09-02/03):
+        # the nozzle is referenced at z_offset_reference_temp (140C
+        # default), NOT pid_hotend_target (230C) - bed still uses
+        # pid_bed_target (65C).
+        self.assertEqual(gcode.scripts_run[4], 'M140 S65.0')
+        self.assertEqual(gcode.scripts_run[5], 'M104 S140.0')
+        self.assertEqual(gcode.scripts_run[6], 'M190 S65.0')
+        self.assertEqual(gcode.scripts_run[7], 'M109 S140.0')
 
         journal = calibration_journal.read_journal(path=self.journal_path)
         self.assertEqual(journal['state'], calibration_journal.STATE_COMMIT_REQUESTED)
@@ -1018,6 +1026,125 @@ class AutoCalibrateTest(unittest.TestCase):
         coord.auto_calibrate_state = 'running'
         with self.assertRaises(fake.CommandError):
             coord.cmd_auto_calibrate(fake.FakeGCmd({}))
+
+
+class NozzleContaminationFixOrderingTest(unittest.TestCase):
+    """Mission root-cause fix (2026-09-02/03): a hot nozzle-clean cycle
+    biases the load-cell Z-offset contact low by ~0.6mm (nozzle ooze/
+    contamination) - see _evidence/phase2-live-full-stack-closure-
+    20260902-180602/07-nozzle-contamination-test/ for the live A/B proof.
+    Fix is sequencing/thermal-reference only: localized_z_offset must be
+    measured at z_offset_reference_temp (140C default), never at
+    pid_hotend_target (230C), and nothing between nozzle_clean and the
+    Z-offset measurement may reheat the nozzle back to 230C. The contact
+    algorithm and safety envelope are untouched by this fix - these tests
+    only prove command ORDER and TEMPERATURE, nothing about touch_probe()
+    or measure_probe_nozzle_pair()."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.journal_path = os.path.join(self.tmpdir, 'journal.json')
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _build(self):
+        overrides = {'journal_path': self.journal_path}
+        z_probe = FakeZOffsetProbe(is_calibrated=True)
+        probe_obj = FakeProbeObj(z_offset=1.155)
+        printer, gcode, coord = _build_auto_calibrate(
+            z_probe, probe_obj, config_overrides=overrides)
+        gcode.commands['NEBULAOS_NOZZLE_CLEAN'] = lambda gcmd: None
+        orig = nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair
+        nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = \
+            _stub_pair(probe_trigger_z=2.5, nozzle_contact_z=0.831)
+        self.addCleanup(
+            setattr, nebulaos_calibration.nebulaos_probe_pair,
+            'measure_probe_nozzle_pair', orig)
+        return printer, gcode, coord
+
+    def test_exact_stage_order_pid_hotend_to_localized_z_offset(self):
+        printer, gcode, coord = self._build()
+        with self.assertRaises(RestartTriggered):
+            coord.cmd_auto_calibrate(fake.FakeGCmd({}))
+        scripts = gcode.scripts_run
+        script_names = [s.split()[0] for s in scripts]
+        # The exact ordering the mission requires: PID hotend -> nozzle
+        # clean -> M104/M109 (reference temp) -> stabilization (G4) ->
+        # localized Z-offset. Sliced out of the full sequence so this
+        # test fails specifically on a reordering of THIS sub-sequence,
+        # not on unrelated later stages (bed_mesh, commit). Found by the
+        # full command text (not a positional "second PID_CALIBRATE"
+        # guess) so this stays correct even if an earlier stage's own
+        # command count changes.
+        pid_hotend_idx = scripts.index('PID_CALIBRATE HEATER=extruder TARGET=230.0')
+        z_offset_idx = script_names.index('NEBULAOS_Z_OFFSET_CALIBRATE')
+        sub_sequence = script_names[pid_hotend_idx:z_offset_idx + 1]
+        self.assertEqual(sub_sequence, [
+            'PID_CALIBRATE', 'NEBULAOS_NOZZLE_CLEAN',
+            'M140', 'M104', 'M190', 'M109', 'G4',
+            'NEBULAOS_Z_OFFSET_CALIBRATE',
+        ])
+
+    def test_reference_temp_is_140_not_230(self):
+        printer, gcode, coord = self._build()
+        with self.assertRaises(RestartTriggered):
+            coord.cmd_auto_calibrate(fake.FakeGCmd({}))
+        m104 = [s for s in gcode.scripts_run if s.startswith('M104')]
+        m109 = [s for s in gcode.scripts_run if s.startswith('M109')]
+        self.assertEqual(m104, ['M104 S140.0'])
+        self.assertEqual(m109, ['M109 S140.0'])
+
+    def test_no_230_reheat_between_nozzle_clean_and_z_offset(self):
+        printer, gcode, coord = self._build()
+        with self.assertRaises(RestartTriggered):
+            coord.cmd_auto_calibrate(fake.FakeGCmd({}))
+        scripts = gcode.scripts_run
+        nozzle_clean_idx = scripts.index('NEBULAOS_NOZZLE_CLEAN')
+        z_offset_idx = scripts.index('NEBULAOS_Z_OFFSET_CALIBRATE')
+        between = scripts[nozzle_clean_idx + 1:z_offset_idx]
+        hotend_commands = [s for s in between if s.startswith(('M104', 'M109'))]
+        self.assertEqual(hotend_commands, ['M104 S140.0', 'M109 S140.0'])
+        self.assertNotIn('230', ' '.join(hotend_commands))
+
+    def test_pid_hotend_still_tunes_at_230_earlier_in_sequence(self):
+        # The root-cause fix must NOT touch PID-hotend's own target - it
+        # stays at pid_hotend_target (230C default), run well before
+        # nozzle clean.
+        printer, gcode, coord = self._build()
+        with self.assertRaises(RestartTriggered):
+            coord.cmd_auto_calibrate(fake.FakeGCmd({}))
+        pid_hotend_calls = [s for s in gcode.scripts_run
+                             if s.startswith('PID_CALIBRATE HEATER=extruder')]
+        self.assertEqual(pid_hotend_calls, ['PID_CALIBRATE HEATER=extruder TARGET=230.0'])
+
+    def test_bed_stays_at_intended_calibration_temp(self):
+        # Bed reference is unaffected by the nozzle-temperature fix.
+        printer, gcode, coord = self._build()
+        with self.assertRaises(RestartTriggered):
+            coord.cmd_auto_calibrate(fake.FakeGCmd({}))
+        m140 = [s for s in gcode.scripts_run if s.startswith('M140')]
+        m190 = [s for s in gcode.scripts_run if s.startswith('M190')]
+        self.assertEqual(m140, ['M140 S65.0'])
+        self.assertEqual(m190, ['M190 S65.0'])
+
+    def test_z_offset_reference_temp_is_configurable(self):
+        printer, gcode, coord = _build_auto_calibrate(
+            FakeZOffsetProbe(is_calibrated=True),
+            FakeProbeObj(z_offset=1.155),
+            config_overrides={'journal_path': self.journal_path,
+                               'z_offset_reference_temp': '150'})
+        gcode.commands['NEBULAOS_NOZZLE_CLEAN'] = lambda gcmd: None
+        orig = nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair
+        nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = \
+            _stub_pair(probe_trigger_z=2.5, nozzle_contact_z=0.831)
+        try:
+            with self.assertRaises(RestartTriggered):
+                coord.cmd_auto_calibrate(fake.FakeGCmd({}))
+        finally:
+            nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = orig
+        m104 = [s for s in gcode.scripts_run if s.startswith('M104')]
+        self.assertEqual(m104, ['M104 S150.0'])
 
 
 class PostRestartVerificationTest(unittest.TestCase):

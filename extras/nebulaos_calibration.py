@@ -346,24 +346,48 @@ class NebulaOSCalibration:
             'axis_twist_sample_count', default=_DEFAULT_AXIS_TWIST_SAMPLE_COUNT,
             minval=2)
 
-        # NEBULAOS_AUTO_CALIBRATE (mission §11): the PID/thermal targets
-        # this orchestrator PID-tunes AND calibrates at are the SAME
-        # temperatures (rather than tuning PID at one temp and measuring
-        # Z-offset at another) - defaults are exactly the qualification
-        # thermal state this whole mission's hot-reliability evidence was
-        # gathered at (bed 65C / hotend 230C). thermal_soak_seconds is an
-        # EXPLICIT additional dwell after M190/M109 already report the
-        # target reached (their own convergence tolerance is looser than
-        # "fully thermally settled") - a plain upstream G4 dwell, not a
-        # reimplemented wait loop. bed_mesh_profile matches
-        # BED_MESH_CALIBRATE's own upstream default (gcmd.get('PROFILE',
-        # "default")) so a plain `BED_MESH_CALIBRATE` invoked by a user
-        # later, with no PROFILE=, loads exactly what this orchestrator
-        # saved.
+        # NEBULAOS_AUTO_CALIBRATE (mission §11). pid_bed_target/
+        # pid_hotend_target are the PID-tune targets only (PID_CALIBRATE's
+        # own TARGET=, run early in the sequence, well before nozzle
+        # clean) - defaults are the qualification thermal state this
+        # mission's hot-reliability evidence was gathered at (bed 65C /
+        # hotend 230C).
+        #
+        # z_offset_reference_temp (root-caused 2026-09-02/03, live A/B
+        # test - see _evidence/phase2-live-full-stack-closure-
+        # 20260902-180602/07-nozzle-contamination-test/): the LOCALIZED_
+        # Z_OFFSET stage deliberately does NOT reheat to pid_hotend_target
+        # (230C) - it measures at this lower, separate temperature
+        # instead. Root cause: residual nozzle ooze/contamination
+        # accumulating during a long hot dwell (PID-hotend tune + a hot
+        # nozzle-clean cycle) was found to bias the load-cell contact
+        # measurement low by ~0.6mm (a reproducible ~1.01-1.15mm cluster,
+        # against a normal ~1.73-1.80mm cluster) - proven by measuring
+        # immediately after a fresh nozzle clean, at 140C instead of
+        # 230C: 3/3 clean runs landed back in the normal cluster
+        # (1.733-1.742mm, range 0.0095mm) on the SAME unit, SAME
+        # persisted prior, SAME contact algorithm - nothing else changed.
+        # 140C default matches nozzle_clean's own hot_end_temp resting
+        # temperature ([z_compensate] config), so this is normally a
+        # no-op confirmation of a state nozzle_clean already reached, not
+        # a second real heat cycle. The contact algorithm and safety
+        # envelope (established_contact_margin_mm etc.) are UNCHANGED -
+        # this fix is sequencing/thermal-reference only.
+        #
+        # thermal_soak_seconds is an EXPLICIT additional dwell after
+        # M190/M109 already report the target reached (their own
+        # convergence tolerance is looser than "fully thermally
+        # settled") - a plain upstream G4 dwell, not a reimplemented wait
+        # loop. bed_mesh_profile matches BED_MESH_CALIBRATE's own
+        # upstream default (gcmd.get('PROFILE', "default")) so a plain
+        # `BED_MESH_CALIBRATE` invoked by a user later, with no PROFILE=,
+        # loads exactly what this orchestrator saved.
         self.pid_bed_target = config.getfloat(
             'pid_bed_target', default=65., minval=0., maxval=120.)
         self.pid_hotend_target = config.getfloat(
             'pid_hotend_target', default=230., minval=0., maxval=320.)
+        self.z_offset_reference_temp = config.getfloat(
+            'z_offset_reference_temp', default=140., minval=0., maxval=320.)
         self.thermal_soak_seconds = config.getfloat(
             'thermal_soak_seconds', default=15., minval=0., maxval=300.)
         self.bed_mesh_profile = config.get('bed_mesh_profile', default='default')
@@ -901,12 +925,21 @@ class NebulaOSCalibration:
             run('NEBULAOS_NOZZLE_CLEAN')
             self._auto_calibrate_check_cancel(journal, time.time())
 
+            # z_offset_reference_temp (NOT pid_hotend_target/230C) -
+            # root-caused 2026-09-02/03: measuring Z-offset shortly after
+            # a long hot dwell biased the load-cell contact reading low
+            # by ~0.6mm (nozzle ooze/contamination accumulated during
+            # PID-hotend tune + hot nozzle-clean). The bed stays at its
+            # intended calibration/mesh temperature (pid_bed_target) -
+            # only the nozzle reference for THIS specific measurement is
+            # lower. See this module's own __init__ comment for the full
+            # evidence and this constant's own header.
             self._auto_calibrate_advance(
                 journal, 'establish_thermal_state', time.time())
             run('M140 S%.1f' % (self.pid_bed_target,))
-            run('M104 S%.1f' % (self.pid_hotend_target,))
+            run('M104 S%.1f' % (self.z_offset_reference_temp,))
             run('M190 S%.1f' % (self.pid_bed_target,))
-            run('M109 S%.1f' % (self.pid_hotend_target,))
+            run('M109 S%.1f' % (self.z_offset_reference_temp,))
             self._auto_calibrate_check_cancel(journal, time.time())
 
             self._auto_calibrate_advance(journal, 'stabilize', time.time())
