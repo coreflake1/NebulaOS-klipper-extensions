@@ -241,8 +241,21 @@ class NebulaOSCalibration:
         # - on this printer's real captured hardware state that offset is
         # ~1.795mm, far larger than any sane margin, which is exactly the
         # bug this rename and re-derivation fixes.
+        #
+        # Phase 2 mission §7 qualification (2026-09-02): 1.0mm, qualified
+        # from CR-Touch repeatability at a nearby point (~0.01mm, two
+        # orders of magnitude tighter than this margin - see
+        # _evidence/phase2-contact-safety-hwqual-20260901-182810/
+        # 07-contact-parameter-proposal/07-proposal.txt for the original
+        # derivation) and confirmed with zero established-envelope
+        # incidents across 22 real ESTABLISHED touch_probe runs (66
+        # individual contacts) spanning cold (20C ambient) and hot (bed
+        # 65C/hotend 230C) sessions on 2026-09-01 and 2026-09-02 - see
+        # _evidence/phase2-live-full-stack-closure-20260902-180602/
+        # REPORT.md. No longer requires a qualification-only printer.cfg
+        # override.
         self.established_contact_margin_mm = config.getfloat(
-            'established_contact_margin_mm', default=None,
+            'established_contact_margin_mm', default=1.0,
             minval=0.01, maxval=5.)
         # bootstrap_contact_envelope_mm: how far below the nozzle's own
         # actual, known, currently-measured starting Z a BOOTSTRAP/virgin
@@ -250,24 +263,43 @@ class NebulaOSCalibration:
         # SEPARATE value from down_min_z - never silently reused as one -
         # requiring its own explicit hardware qualification before a
         # virgin printer's first automatic Z-offset calibration can run
-        # at all.
+        # at all. Still NOT qualified (mission §8, bootstrap Z-offset, not
+        # yet closed) - deliberately no default; BOOTSTRAP mode still
+        # fails closed with CONTACT_SAFETY_LIMIT_UNQUALIFIED until that
+        # work lands.
         self.bootstrap_contact_envelope_mm = config.getfloat(
             'bootstrap_contact_envelope_mm', default=None,
             minval=0.5, maxval=30.)
         # Measurement-quality and repeatability acceptance bounds (§7/§9/
-        # §10) - deliberately no invented production defaults. Left unset
-        # (None) until real hardware qualification establishes them;
-        # nebulaos_probe_pair.measure_probe_nozzle_pair() fails closed
-        # with CONTACT_SAFETY_LIMIT_UNQUALIFIED rather than silently
-        # applying a guessed bound. Tests may configure synthetic values.
+        # §10).
+        #
+        # Phase 2 mission §7 qualification (2026-09-02): all three
+        # defaults below are qualified from the same 22-run/66-touch
+        # cold+hot dataset referenced above. Observed maxima against each
+        # bound (all comfortably passing, no violations in any run):
+        #   |fit_delta|:            0.2586mm observed vs 0.3mm bound
+        #                           (~14% headroom - the tightest of the
+        #                           three; matches the original proposal's
+        #                           intent of rejecting the real recorded
+        #                           ~1.106mm historical incident with wide
+        #                           margin while still accepting healthy
+        #                           trigger-latency corrections)
+        #   repeatability range:    0.0407mm observed vs 0.15mm bound
+        #                           (~3.7x headroom)
+        #   repeatability stddev:   0.01973mm observed vs 0.06mm bound
+        #                           (~3x headroom)
+        # min_accepted_samples=2 (of pro_cnt=3): every one of the 22 runs
+        # in this dataset accepted all 3 samples; no evidence to justify
+        # a different value. No longer requires a qualification-only
+        # printer.cfg override for any of the four.
         self.max_abs_fit_delta = config.getfloat(
-            'max_abs_fit_delta', default=None, minval=0.001, maxval=10.)
+            'max_abs_fit_delta', default=0.3, minval=0.001, maxval=10.)
         self.min_accepted_samples = config.getint(
-            'min_accepted_samples', default=None, minval=1)
+            'min_accepted_samples', default=2, minval=1)
         self.max_repeatability_range = config.getfloat(
-            'max_repeatability_range', default=None, minval=0.001, maxval=10.)
+            'max_repeatability_range', default=0.15, minval=0.001, maxval=10.)
         self.max_repeatability_stddev = config.getfloat(
-            'max_repeatability_stddev', default=None, minval=0.001, maxval=10.)
+            'max_repeatability_stddev', default=0.06, minval=0.001, maxval=10.)
         self.axis_twist_sample_count = config.getint(
             'axis_twist_sample_count', default=_DEFAULT_AXIS_TWIST_SAMPLE_COUNT,
             minval=2)

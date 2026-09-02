@@ -482,6 +482,37 @@ class LoadCellRejectionGatingTest(unittest.TestCase):
         self.assertAlmostEqual(seen['max_repeatability_range'], 0.1, places=9)
         self.assertAlmostEqual(seen['max_repeatability_stddev'], 0.05, places=9)
 
+    def test_qualified_defaults_apply_with_zero_config_overrides(self):
+        # Phase 2 mission §7 qualification (2026-09-02): established_
+        # contact_margin_mm/max_abs_fit_delta/min_accepted_samples/
+        # max_repeatability_range/max_repeatability_stddev now have real
+        # qualified defaults (1.0, 0.3, 2, 0.15, 0.06) and no longer
+        # require a qualification-only printer.cfg override to run an
+        # ESTABLISHED calibration at all. bootstrap_contact_envelope_mm
+        # remains unqualified (mission §8 not yet closed) and must still
+        # come through as None.
+        z_probe = FakeZOffsetProbe(is_calibrated=True)
+        zc = FakeZCompensate(110., 111.)
+        printer, gcode, coord = _build(z_probe, FakeProbeObj(), zc)
+        seen = {}
+
+        def fake_measure(printer_, x, y, *a, **kw):
+            seen.update(kw)
+            return _accepted_measurement(x, y, 1.0, 0.5)
+        orig = nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair
+        nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = fake_measure
+        try:
+            coord.cmd_z_offset_calibrate(fake.FakeGCmd({}))
+        finally:
+            nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = orig
+        self.assertAlmostEqual(seen['established_contact_margin_mm'], 1.0, places=9)
+        self.assertAlmostEqual(seen['max_abs_fit_delta'], 0.3, places=9)
+        self.assertEqual(seen['min_accepted_samples'], 2)
+        self.assertAlmostEqual(seen['max_repeatability_range'], 0.15, places=9)
+        self.assertAlmostEqual(seen['max_repeatability_stddev'], 0.06, places=9)
+        self.assertIsNone(seen['bootstrap_contact_envelope_mm'])
+        self.assertEqual(coord.z_offset_state, 'complete')
+
     def test_diagnostics_recorded_in_status_after_success(self):
         z_probe = FakeZOffsetProbe(is_calibrated=True)
         zc = FakeZCompensate(110., 111.)
