@@ -475,12 +475,30 @@ class NebulaOSCalibration:
                 raise self.printer.command_error(
                     "NEBULAOS_Z_OFFSET_CALIBRATE: measured value %r is "
                     "not a finite number" % (new_offset,))
-            if abs(new_offset) > self.max_offset_correction_mm:
-                raise self.printer.command_error(
-                    "NEBULAOS_Z_OFFSET_CALIBRATE: measured value %.5fmm "
-                    "exceeds max_offset_correction_mm=%.5fmm - refusing "
-                    "to apply an implausibly large correction"
-                    % (new_offset, self.max_offset_correction_mm))
+            # max_offset_correction_mm bounds the CORRECTION - how far this
+            # measurement moves the probe's z_offset from the credible prior
+            # it is refining - not the absolute z_offset value itself. A
+            # thermal-expansion-driven absolute offset near or past this
+            # many mm (e.g. established cold ~1.78mm drifting to ~2.1-2.3mm
+            # hot) is real calibration data, not automatically implausible;
+            # what would be implausible is THIS RUN disagreeing with the
+            # PRIOR by more than max_offset_correction_mm. There is no
+            # credible prior in BOOTSTRAP mode (see nebulaos_probe_pair.py's
+            # _is_credible_probe_z_offset) - measure_probe_nozzle_pair's own
+            # bootstrap_contact_envelope_mm bound already gates plausibility
+            # for that case, so this check only applies when refining an
+            # ESTABLISHED calibration.
+            if measurement.contact_mode == 'established':
+                correction = new_offset - probe_z_offset
+                if abs(correction) > self.max_offset_correction_mm:
+                    raise self.printer.command_error(
+                        "NEBULAOS_Z_OFFSET_CALIBRATE: measured value %.5fmm "
+                        "implies a %.5fmm correction from the current probe "
+                        "z_offset %.5fmm, exceeding "
+                        "max_offset_correction_mm=%.5fmm - refusing to "
+                        "apply an implausibly large correction"
+                        % (new_offset, correction, probe_z_offset,
+                           self.max_offset_correction_mm))
 
             # Effective in the CURRENT session immediately (needed before
             # Bed Mesh runs later in a future Auto-Calibrate sequence) -

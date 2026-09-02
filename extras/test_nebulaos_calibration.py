@@ -317,6 +317,95 @@ class LoadCellValidationTest(unittest.TestCase):
         self.assertEqual(coord.z_offset_state, 'complete')
         self.assertAlmostEqual(probe_obj.probe_offsets.z_offset, 5.0, places=9)
 
+    def test_thermal_drift_within_correction_bound_is_accepted(self):
+        # Regression test for the max_offset_correction_mm semantics bug
+        # (Phase 2 mission §6): a hot absolute z_offset of 2.300mm is past
+        # the default 2.0mm bound in isolation, but the prior established
+        # calibration is 1.795mm, so the actual CORRECTION this run implies
+        # is only 0.505mm - well within max_offset_correction_mm=2.0. This
+        # is real thermal-expansion calibration data, not an implausible
+        # result, and must be accepted and applied.
+        z_probe = FakeZOffsetProbe(is_calibrated=True)
+        probe_obj = FakeProbeObj(z_offset=1.795)
+        zc = FakeZCompensate(110., 111.)
+        printer, gcode, coord = _build(z_probe, probe_obj, zc)
+        orig = nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair
+        nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = \
+            _stub_pair(probe_trigger_z=2.300, nozzle_contact_z=0.0)
+        try:
+            coord.cmd_z_offset_calibrate(fake.FakeGCmd({}))
+        finally:
+            nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = orig
+        self.assertEqual(coord.z_offset_state, 'complete')
+        self.assertAlmostEqual(probe_obj.probe_offsets.z_offset, 2.300, places=9)
+
+    def test_correction_bound_is_checked_against_prior_not_absolute_value(self):
+        # A small absolute value can still be an implausible CORRECTION if
+        # the prior is itself large - the bound must track the prior, not
+        # a fixed absolute magnitude. Prior 1.795 -> new 0.5 is a -1.295mm
+        # correction (within bound, accepted); this pins that the gate is
+        # symmetric and prior-relative in both directions.
+        z_probe = FakeZOffsetProbe(is_calibrated=True)
+        probe_obj = FakeProbeObj(z_offset=1.795)
+        zc = FakeZCompensate(110., 111.)
+        printer, gcode, coord = _build(z_probe, probe_obj, zc)
+        orig = nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair
+        nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = \
+            _stub_pair(probe_trigger_z=0.5, nozzle_contact_z=0.0)
+        try:
+            coord.cmd_z_offset_calibrate(fake.FakeGCmd({}))
+        finally:
+            nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = orig
+        self.assertEqual(coord.z_offset_state, 'complete')
+        self.assertAlmostEqual(probe_obj.probe_offsets.z_offset, 0.5, places=9)
+
+    def test_correction_exceeding_bound_relative_to_prior_is_still_rejected(self):
+        # The fix must not simply stop rejecting anything: a genuinely
+        # implausible correction relative to the prior (here +2.205mm from
+        # 1.795 to 4.0) must still be refused, and must not stage or apply.
+        z_probe = FakeZOffsetProbe(is_calibrated=True)
+        probe_obj = FakeProbeObj(z_offset=1.795)
+        zc = FakeZCompensate(110., 111.)
+        printer, gcode, coord = _build(z_probe, probe_obj, zc)
+        orig = nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair
+        nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = \
+            _stub_pair(probe_trigger_z=4.0, nozzle_contact_z=0.0)
+        try:
+            with self.assertRaises(fake.CommandError) as ctx:
+                coord.cmd_z_offset_calibrate(fake.FakeGCmd({}))
+        finally:
+            nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = orig
+        self.assertIn('max_offset_correction_mm', str(ctx.exception))
+        self.assertAlmostEqual(probe_obj.probe_offsets.z_offset, 1.795, places=9)
+        configfile = printer.lookup_object('configfile')
+        self.assertEqual(configfile.set_calls, [])
+        self.assertEqual(coord.z_offset_state, 'error')
+
+    def test_bootstrap_mode_is_not_subject_to_the_correction_bound(self):
+        # BOOTSTRAP has no credible prior to correct from (see
+        # nebulaos_probe_pair.py's _is_credible_probe_z_offset) -
+        # max_offset_correction_mm is a fine-tune bound for refining an
+        # ESTABLISHED calibration, and does not apply here. Plausibility
+        # for a bootstrap result is measure_probe_nozzle_pair's own
+        # bootstrap_contact_envelope_mm, exercised elsewhere.
+        z_probe = FakeZOffsetProbe(is_calibrated=True)
+        probe_obj = FakeProbeObj(z_offset=1.795)
+        zc = FakeZCompensate(110., 111.)
+        printer, gcode, coord = _build(z_probe, probe_obj, zc)
+
+        def fake_measure(printer_, x, y, *a, **kw):
+            return _accepted_measurement(
+                x, y, probe_trigger_z=20.0, nozzle_contact_z=0.0,
+                contact_mode='bootstrap')
+        orig = nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair
+        nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = fake_measure
+        try:
+            coord.cmd_z_offset_calibrate(fake.FakeGCmd({}))
+        finally:
+            nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = orig
+        self.assertEqual(coord.z_offset_state, 'complete')
+        self.assertAlmostEqual(probe_obj.probe_offsets.z_offset, 20.0, places=9)
+
 
 class LoadCellRejectionGatingTest(unittest.TestCase):
     """§9: a rejected measurement must never stage a Z-offset, transition
