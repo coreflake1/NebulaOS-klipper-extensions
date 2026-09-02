@@ -2,14 +2,18 @@
 # contact-safety stabilization rewrite, corrected).
 #
 # The single [nebulaos_calibration] object that owns the canonical
-# NEBULAOS_* public calibration API. Slices implemented so far: standalone
+# NEBULAOS_* public calibration API. Implemented: standalone
 # NEBULAOS_Z_OFFSET_CALIBRATE (LOAD_CELL only, bounded-descent envelope +
-# measurement-quality/repeatability gating) and NEBULAOS_AXIS_TWIST_CALIBRATE
-# (AXIS=X|Y|BOTH - see "Axis Twist" section below: HARD BLOCKED pending
-# remote load-cell contact hardware qualification). NEBULAOS_AUTO_CALIBRATE,
-# the guided Input Shaper/E-Steps workflows, NEBULAOS_CALIBRATION_CONTINUE/
-# CANCEL, and the persistent calibration journal are NOT part of this
-# slice - see the Phase 2 mission report for exactly what remains and why.
+# measurement-quality/repeatability gating, plus its SIMULATE_BOOTSTRAP=1
+# qualification aid - mission §8); NEBULAOS_AXIS_TWIST_CALIBRATE (AXIS=X|
+# Y|BOTH - see "Axis Twist" section below: HARD BLOCKED pending remote
+# load-cell contact hardware qualification); NEBULAOS_AUTO_CALIBRATE, the
+# fully-automatic preflight->home->PID->nozzle-clean->Z-offset->bed-mesh->
+# one-SAVE_CONFIG-restart-and-verify sequence (mission §11), backed by
+# nebulaos_calibration_journal.py's persistent transaction journal (mission
+# §12) and NEBULAOS_CALIBRATION_CANCEL. The guided Input Shaper/E-Steps
+# workflows (separate commands, not part of NEBULAOS_AUTO_CALIBRATE - see
+# the Phase 2 mission document's own §13/§14) are NOT part of this slice.
 #
 # ---------------------------------------------------------------------
 # Upstream-first cleanup (Overnight Contact-Safety Stabilization mission)
@@ -67,8 +71,10 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import math
+import time
 
 from . import nebulaos_probe_pair
+from . import nebulaos_calibration_journal as calibration_journal
 
 _MAX_ERROR_LEN = 200
 
@@ -340,6 +346,36 @@ class NebulaOSCalibration:
             'axis_twist_sample_count', default=_DEFAULT_AXIS_TWIST_SAMPLE_COUNT,
             minval=2)
 
+        # NEBULAOS_AUTO_CALIBRATE (mission §11): the PID/thermal targets
+        # this orchestrator PID-tunes AND calibrates at are the SAME
+        # temperatures (rather than tuning PID at one temp and measuring
+        # Z-offset at another) - defaults are exactly the qualification
+        # thermal state this whole mission's hot-reliability evidence was
+        # gathered at (bed 65C / hotend 230C). thermal_soak_seconds is an
+        # EXPLICIT additional dwell after M190/M109 already report the
+        # target reached (their own convergence tolerance is looser than
+        # "fully thermally settled") - a plain upstream G4 dwell, not a
+        # reimplemented wait loop. bed_mesh_profile matches
+        # BED_MESH_CALIBRATE's own upstream default (gcmd.get('PROFILE',
+        # "default")) so a plain `BED_MESH_CALIBRATE` invoked by a user
+        # later, with no PROFILE=, loads exactly what this orchestrator
+        # saved.
+        self.pid_bed_target = config.getfloat(
+            'pid_bed_target', default=65., minval=0., maxval=120.)
+        self.pid_hotend_target = config.getfloat(
+            'pid_hotend_target', default=230., minval=0., maxval=320.)
+        self.thermal_soak_seconds = config.getfloat(
+            'thermal_soak_seconds', default=15., minval=0., maxval=300.)
+        self.bed_mesh_profile = config.get('bed_mesh_profile', default='default')
+        # Overridable only for unit tests (a real printer always uses the
+        # real default path under /usr/data) - see
+        # nebulaos_calibration_journal.py's own header for why this journal
+        # exists at all (crash-safety around the one SAVE_CONFIG+restart
+        # boundary, not routine status - NEBULAOS_CALIBRATION_STATUS's
+        # auto_calibrate_* fields are the normal way to poll progress).
+        self.journal_path = config.get(
+            'journal_path', default=calibration_journal.DEFAULT_JOURNAL_PATH)
+
         self.z_offset_state = 'idle'
         self.z_offset_id = 0
         self.z_offset_result = None
@@ -390,6 +426,21 @@ class NebulaOSCalibration:
         self.axis_twist_y_result = None
         self.axis_twist_y_error = None
 
+        # NEBULAOS_AUTO_CALIBRATE / journal state (mission §11/§12).
+        # auto_calibrate_stage mirrors calibration_journal.STAGES; the
+        # journal itself is the crash-safe copy of this same information
+        # on disk, written at every stage transition (see
+        # _auto_calibrate_advance() below) - these in-memory fields are
+        # what NEBULAOS_CALIBRATION_STATUS actually reports during a
+        # normal (non-crashed) run, cheaper than re-reading the journal
+        # file on every status poll.
+        self.auto_calibrate_id = 0
+        self.auto_calibrate_state = 'idle'
+        self.auto_calibrate_stage = None
+        self.auto_calibrate_error = None
+        self.auto_calibrate_result = None
+        self._auto_calibrate_cancel_requested = False
+
         self.gcode.register_command(
             'NEBULAOS_Z_OFFSET_CALIBRATE', self.cmd_z_offset_calibrate,
             desc=self.cmd_z_offset_calibrate_help)
@@ -399,6 +450,14 @@ class NebulaOSCalibration:
         self.gcode.register_command(
             'NEBULAOS_AXIS_TWIST_CALIBRATE', self.cmd_axis_twist_calibrate,
             desc=self.cmd_axis_twist_calibrate_help)
+        self.gcode.register_command(
+            'NEBULAOS_AUTO_CALIBRATE', self.cmd_auto_calibrate,
+            desc=self.cmd_auto_calibrate_help)
+        self.gcode.register_command(
+            'NEBULAOS_CALIBRATION_CANCEL', self.cmd_calibration_cancel,
+            desc=self.cmd_calibration_cancel_help)
+        self.printer.register_event_handler(
+            "klippy:ready", self._handle_ready)
 
     # ------------------------------------------------------------------
     # Reference XY point
@@ -471,6 +530,11 @@ class NebulaOSCalibration:
             'axis_twist_y_state': self.axis_twist_y_state,
             'axis_twist_y_result': self.axis_twist_y_result,
             'axis_twist_y_error': self.axis_twist_y_error,
+            'auto_calibrate_id': self.auto_calibrate_id,
+            'auto_calibrate_state': self.auto_calibrate_state,
+            'auto_calibrate_stage': self.auto_calibrate_stage,
+            'auto_calibrate_error': self.auto_calibrate_error,
+            'auto_calibrate_result': self.auto_calibrate_result,
         }
 
     # ------------------------------------------------------------------
@@ -737,6 +801,261 @@ class NebulaOSCalibration:
             "ENVELOPE=%.3fmm (commanded_floor_z=%.5f) - NOT applied or "
             "staged, this is a simulation only"
             % (result, x, y, envelope, measurement.commanded_floor_z))
+
+    # ------------------------------------------------------------------
+    # NEBULAOS_AUTO_CALIBRATE / NEBULAOS_CALIBRATION_CANCEL (mission
+    # §11/§12): a single orchestrated sequence - preflight, home, PID bed,
+    # PID hotend, nozzle clean, establish the calibration thermal state,
+    # stabilize, localized Z-offset, upstream bed mesh, final validation,
+    # ONE persistence transaction (SAVE_CONFIG), restart, post-restart
+    # verification. Every real algorithm (PID_CALIBRATE, BED_MESH_
+    # CALIBRATE, G28, SAVE_CONFIG) stays pristine upstream, dispatched via
+    # gcode.run_script_from_command() exactly like nozzle_clear.py's own
+    # _move() helper dispatches G1 - this module owns only the sequencing,
+    # the journal, and reading back each stage's own already-existing
+    # status fields (self.z_offset_result, etc.) to build the one
+    # expected_values dict the post-restart verification checks. Axis
+    # Twist is deliberately NOT part of this sequence - manual Axis Twist
+    # is separate, owner-initiated upstream AXIS_TWIST_COMPENSATION_
+    # CALIBRATE maintenance, not part of automatic calibration.
+    # ------------------------------------------------------------------
+    def _auto_calibrate_advance(self, journal, stage, now):
+        """Advance both the in-memory status (what NEBULAOS_CALIBRATION_
+        STATUS reports right now) and the on-disk journal (what a future
+        boot reads back after a crash) together, in that order - the
+        in-memory field is genuinely for THIS process only; a torn write
+        to the journal file would still leave this process's own status
+        correct for as long as it keeps running."""
+        self.auto_calibrate_stage = stage
+        calibration_journal.advance_stage(journal, stage, now)
+        calibration_journal.write_journal(journal, path=self.journal_path)
+
+    def _auto_calibrate_check_cancel(self, journal, now):
+        if not self._auto_calibrate_cancel_requested:
+            return
+        self._auto_calibrate_cancel_requested = False
+        calibration_journal.mark_cancelled(journal, now)
+        calibration_journal.write_journal(journal, path=self.journal_path)
+        raise self.printer.command_error(
+            "NEBULAOS_AUTO_CALIBRATE: cancelled by NEBULAOS_CALIBRATION_CANCEL")
+
+    cmd_auto_calibrate_help = (
+        "Fully automatic calibration: PID (bed+hotend), nozzle clean, "
+        "localized Z-offset, upstream bed mesh, one SAVE_CONFIG+restart. "
+        "Axis Twist is NOT included - see AXIS_TWIST_COMPENSATION_CALIBRATE")
+
+    def cmd_auto_calibrate(self, gcmd):
+        if self.auto_calibrate_state == 'running':
+            raise self.printer.command_error(
+                "NEBULAOS_AUTO_CALIBRATE: a calibration is already in progress")
+
+        now = time.time()
+        self.auto_calibrate_id += 1
+        self.auto_calibrate_state = 'running'
+        self.auto_calibrate_stage = None
+        self.auto_calibrate_error = None
+        self.auto_calibrate_result = None
+        self._auto_calibrate_cancel_requested = False
+        journal = calibration_journal.new_journal(
+            self.auto_calibrate_id, 'auto_calibrate', now)
+        calibration_journal.write_journal(journal, path=self.journal_path)
+
+        def run(script):
+            self.gcode.run_script_from_command(script)
+
+        try:
+            # preflight: the same load-cell/reference-point checks
+            # cmd_z_offset_calibrate() already performs, run up front so a
+            # missing prerequisite is caught before any heating/motion at
+            # all rather than partway through the sequence.
+            self._auto_calibrate_advance(journal, 'preflight', time.time())
+            z_offset_probe = self.printer.lookup_object(
+                'nebulaos_z_offset_probe', None)
+            if z_offset_probe is None:
+                raise self.printer.command_error(
+                    "NEBULAOS_AUTO_CALIBRATE: no [nebulaos_z_offset_probe] "
+                    "is configured on this printer")
+            if not z_offset_probe.get_status(
+                    self.reactor.monotonic())['is_calibrated']:
+                raise self.printer.command_error(
+                    "NEBULAOS_AUTO_CALIBRATE: the load cell has not been "
+                    "calibrated yet - run LOAD_CELL_CALIBRATE first")
+            self._resolve_reference_xy(gcmd)
+            self._auto_calibrate_check_cancel(journal, time.time())
+
+            self._auto_calibrate_advance(journal, 'home', time.time())
+            run('G28')
+            self._auto_calibrate_check_cancel(journal, time.time())
+
+            self._auto_calibrate_advance(journal, 'pid_bed', time.time())
+            run('PID_CALIBRATE HEATER=heater_bed TARGET=%.1f'
+                % (self.pid_bed_target,))
+            self._auto_calibrate_check_cancel(journal, time.time())
+
+            self._auto_calibrate_advance(journal, 'pid_hotend', time.time())
+            run('PID_CALIBRATE HEATER=extruder TARGET=%.1f'
+                % (self.pid_hotend_target,))
+            self._auto_calibrate_check_cancel(journal, time.time())
+
+            self._auto_calibrate_advance(journal, 'nozzle_clean', time.time())
+            run('NEBULAOS_NOZZLE_CLEAN')
+            self._auto_calibrate_check_cancel(journal, time.time())
+
+            self._auto_calibrate_advance(
+                journal, 'establish_thermal_state', time.time())
+            run('M140 S%.1f' % (self.pid_bed_target,))
+            run('M104 S%.1f' % (self.pid_hotend_target,))
+            run('M190 S%.1f' % (self.pid_bed_target,))
+            run('M109 S%.1f' % (self.pid_hotend_target,))
+            self._auto_calibrate_check_cancel(journal, time.time())
+
+            self._auto_calibrate_advance(journal, 'stabilize', time.time())
+            if self.thermal_soak_seconds > 0:
+                run('G4 P%d' % (int(self.thermal_soak_seconds * 1000),))
+            self._auto_calibrate_check_cancel(journal, time.time())
+
+            self._auto_calibrate_advance(
+                journal, 'localized_z_offset', time.time())
+            run('NEBULAOS_Z_OFFSET_CALIBRATE')
+            if self.z_offset_state != 'complete' or self.z_offset_result is None:
+                raise self.printer.command_error(
+                    "NEBULAOS_AUTO_CALIBRATE: localized Z-offset did not "
+                    "complete (state=%r)" % (self.z_offset_state,))
+            z_offset_result = self.z_offset_result
+            self._auto_calibrate_check_cancel(journal, time.time())
+
+            self._auto_calibrate_advance(journal, 'bed_mesh', time.time())
+            run('BED_MESH_CALIBRATE PROFILE=%s' % (self.bed_mesh_profile,))
+            self._auto_calibrate_check_cancel(journal, time.time())
+
+            self._auto_calibrate_advance(
+                journal, 'final_validation', time.time())
+            bed_mesh = self.printer.lookup_object('bed_mesh', None)
+            mesh_status = (bed_mesh.get_status(self.reactor.monotonic())
+                            if bed_mesh is not None else {})
+            if not mesh_status.get('profile_name'):
+                raise self.printer.command_error(
+                    "NEBULAOS_AUTO_CALIBRATE: final validation failed - "
+                    "no bed_mesh profile is active after BED_MESH_CALIBRATE")
+            expected_values = {
+                'bltouch.z_offset': round(z_offset_result, 3),
+                'bed_mesh.profile': mesh_status['profile_name'],
+            }
+            self._auto_calibrate_check_cancel(journal, time.time())
+
+            calibration_journal.mark_commit_requested(
+                journal, expected_values, time.time())
+            calibration_journal.write_journal(journal, path=self.journal_path)
+            self.auto_calibrate_stage = 'commit'
+            self.gcode.respond_info(
+                "NEBULAOS_AUTO_CALIBRATE: all stages complete (z_offset=%.5f, "
+                "bed_mesh profile=%r) - committing with SAVE_CONFIG, "
+                "printer will restart"
+                % (z_offset_result, mesh_status['profile_name']))
+            run('SAVE_CONFIG')
+            # SAVE_CONFIG restarts klippy - if we ever reach the next line,
+            # SAVE_CONFIG itself refused (e.g. nothing was staged) rather
+            # than restarting, which upstream configfile.py treats as a
+            # command_error, not a silent return - so this is unreachable
+            # in the success path, kept only so a future upstream change
+            # in that behavior fails loudly here instead of leaving
+            # auto_calibrate_state stuck at 'running' forever.
+            raise self.printer.command_error(
+                "NEBULAOS_AUTO_CALIBRATE: SAVE_CONFIG returned without "
+                "restarting - this should never happen")
+        except Exception as e:
+            if journal.get('commit_requested'):
+                # mark_commit_requested() already ran and was written to
+                # disk BEFORE the SAVE_CONFIG call above - in production
+                # that call never returns at all (klippy restarts); any
+                # exception surfacing from it here (or from anything
+                # after it, though nothing runs after it on the success
+                # path) must NOT downgrade the already-correct
+                # commit_requested/restart_pending/verification_pending
+                # journal state back to an error - that would be
+                # actively wrong, since the commit truly happened. Only
+                # _handle_ready()'s own post-restart verification may
+                # ever change this journal's state from here.
+                raise
+            self.auto_calibrate_state = (
+                'cancelled' if 'cancelled by NEBULAOS_CALIBRATION_CANCEL'
+                in str(e) else 'error')
+            self.auto_calibrate_error = _sanitize_error(e)
+            if journal['state'] not in (calibration_journal.STATE_CANCELLED,):
+                calibration_journal.mark_error(
+                    journal, self.auto_calibrate_error, time.time())
+                calibration_journal.write_journal(journal, path=self.journal_path)
+            raise
+
+    cmd_calibration_cancel_help = (
+        "Request cancellation of an in-progress NEBULAOS_AUTO_CALIBRATE - "
+        "takes effect at the next stage boundary, never mid-stage")
+
+    def cmd_calibration_cancel(self, gcmd):
+        if self.auto_calibrate_state != 'running':
+            raise self.printer.command_error(
+                "NEBULAOS_CALIBRATION_CANCEL: no NEBULAOS_AUTO_CALIBRATE "
+                "is currently running")
+        self._auto_calibrate_cancel_requested = True
+        self.gcode.respond_info(
+            "NEBULAOS_CALIBRATION_CANCEL: requested - will take effect at "
+            "the next stage boundary")
+
+    def _handle_ready(self, *args):
+        """klippy:ready - runs on EVERY klippy startup, including the one
+        immediately after NEBULAOS_AUTO_CALIBRATE's own SAVE_CONFIG
+        restart. Reads the on-disk journal (never the in-memory status,
+        which is always fresh/empty in a new process) and, if it shows a
+        commit that was requested but never verified, checks the real,
+        just-reloaded config against what was expected and records the
+        result - the only code path that ever clears verification_pending.
+        A journal showing anything else (no file, or an already-verified/
+        errored/cancelled state) is left untouched - this only ever acts
+        on a genuine "restart just happened, verification still owed"
+        case."""
+        journal = calibration_journal.read_journal(path=self.journal_path)
+        if journal is None or not journal.get('verification_pending'):
+            return
+        expected = journal.get('expected_values') or {}
+        errors = []
+        probe_obj = self.printer.lookup_object('probe', None)
+        expected_z_offset = expected.get('bltouch.z_offset')
+        if expected_z_offset is not None:
+            if probe_obj is None:
+                errors.append('probe object is not configured')
+            else:
+                actual = probe_obj.get_offsets()[2]
+                if abs(actual - expected_z_offset) > 0.0005:
+                    errors.append(
+                        'bltouch.z_offset: expected %.5f, found %.5f'
+                        % (expected_z_offset, actual))
+        expected_profile = expected.get('bed_mesh.profile')
+        if expected_profile is not None:
+            bed_mesh = self.printer.lookup_object('bed_mesh', None)
+            actual_profile = (
+                bed_mesh.get_status(self.reactor.monotonic()).get('profile_name')
+                if bed_mesh is not None else None)
+            if actual_profile != expected_profile:
+                errors.append(
+                    'bed_mesh.profile: expected %r, found %r'
+                    % (expected_profile, actual_profile))
+        now = time.time()
+        if errors:
+            calibration_journal.mark_verification_result(
+                journal, success=False, result=None,
+                error='; '.join(errors), now=now)
+        else:
+            calibration_journal.mark_verification_result(
+                journal, success=True, result=dict(expected), error=None,
+                now=now)
+        calibration_journal.write_journal(journal, path=self.journal_path)
+        if journal['calibration_id'] == self.auto_calibrate_id or (
+                self.auto_calibrate_id == 0):
+            self.auto_calibrate_id = journal['calibration_id']
+            self.auto_calibrate_state = journal['state']
+            self.auto_calibrate_stage = journal['stage']
+            self.auto_calibrate_error = journal['error']
+            self.auto_calibrate_result = journal['result']
 
     # ------------------------------------------------------------------
     # NEBULAOS_AXIS_TWIST_CALIBRATE

@@ -609,10 +609,17 @@ class UpstreamFirstCleanupTest(unittest.TestCase):
         self.assertFalse(hasattr(coord, 'cmd_bed_mesh_calibrate'))
 
     def test_no_pid_or_bed_mesh_or_manual_commands_registered(self):
+        # Mission §11/§12: NEBULAOS_AUTO_CALIBRATE and
+        # NEBULAOS_CALIBRATION_CANCEL are real, legitimate NEW commands -
+        # this test's job is only to confirm the REMOVED wrapper commands
+        # (PID convenience macros, bed-mesh named-profile wrapper, manual
+        # METHOD= passthrough) never come back, not that the command set
+        # is frozen forever.
         printer, gcode, coord = _build()
         self.assertEqual(
             sorted(gcode.commands.keys()),
-            ['NEBULAOS_AXIS_TWIST_CALIBRATE', 'NEBULAOS_CALIBRATION_STATUS',
+            ['NEBULAOS_AUTO_CALIBRATE', 'NEBULAOS_AXIS_TWIST_CALIBRATE',
+             'NEBULAOS_CALIBRATION_CANCEL', 'NEBULAOS_CALIBRATION_STATUS',
              'NEBULAOS_Z_OFFSET_CALIBRATE'])
 
 
@@ -784,6 +791,304 @@ class StatusTest(unittest.TestCase):
     def test_status_command_does_not_raise_when_idle(self):
         printer, gcode, coord = _build()
         coord.cmd_calibration_status(fake.FakeGCmd())  # must not raise
+
+
+# ----------------------------------------------------------------------
+# NEBULAOS_AUTO_CALIBRATE / NEBULAOS_CALIBRATION_CANCEL (mission §11/§12)
+# ----------------------------------------------------------------------
+import os
+import shutil
+import tempfile
+
+from . import nebulaos_calibration_journal as calibration_journal
+
+
+class RestartTriggered(Exception):
+    """Simulates SAVE_CONFIG's real behavior: in production, klippy
+    restarts and cmd_auto_calibrate() never returns from that call at all
+    (see its own comment on why the line after it is unreachable in
+    practice) - the real success signal a test can observe is what got
+    written to the journal and to configfile.set_calls BEFORE this point,
+    not a normal return from cmd_auto_calibrate() itself."""
+    pass
+
+
+class DispatchingFakeGCode(fake.FakeGCode):
+    """Unlike the plain FakeGCode (inert - records but never executes),
+    this dispatches each script's first word to self.commands if a
+    handler is registered there, parsing simple KEY=value params.
+    Required because cmd_auto_calibrate() deliberately calls OTHER
+    commands via run_script_from_command() exactly like a real user would
+    - including NEBULAOS_NOZZLE_CLEAN, which in production is registered
+    by a different class (z_compensate.py's ZCompensate) sharing the same
+    real gcode object, and NEBULAOS_Z_OFFSET_CALIBRATE, which IS this same
+    coordinator's own already-tested command."""
+
+    def run_script_from_command(self, script):
+        self.scripts_run.append(script)
+        parts = script.split()
+        name = parts[0]
+        if name == 'SAVE_CONFIG':
+            raise RestartTriggered()
+        handler = self.commands.get(name)
+        if handler is None:
+            return
+        params = {}
+        for tok in parts[1:]:
+            if '=' in tok:
+                k, v = tok.split('=', 1)
+                params[k] = v
+        handler(fake.FakeGCmd(params))
+
+
+class FakeBedMesh:
+    """Stands in for the real registered 'bed_mesh' object. profile_name
+    is settable directly by a test to simulate BED_MESH_CALIBRATE having
+    already run (that upstream algorithm is out of this module's own test
+    scope - see nebulaos_calibration.py's own header)."""
+
+    def __init__(self, profile_name='default'):
+        self.profile_name = profile_name
+
+    def get_status(self, eventtime):
+        return {'profile_name': self.profile_name}
+
+
+def _build_auto_calibrate(z_offset_probe=None, probe_obj=None,
+                           bed_mesh=None,
+                           config_overrides=None):
+    printer = fake.FakePrinter()
+    gcode = DispatchingFakeGCode()
+    printer.add_object('gcode', gcode)
+    printer.add_object('probe', probe_obj if probe_obj is not None else FakeProbeObj())
+    printer.add_object('configfile', FakeConfigFile())
+    if z_offset_probe is not None:
+        printer.add_object('nebulaos_z_offset_probe', z_offset_probe)
+    printer.add_object('bed_mesh', bed_mesh if bed_mesh is not None else FakeBedMesh())
+
+    values = dict(config_overrides or {})
+    values.setdefault('reference_x', '20')
+    values.setdefault('reference_y', '25')
+    config = fake.FakeConfig(values, section='nebulaos_calibration', printer=printer)
+    coordinator = nebulaos_calibration.NebulaOSCalibration(config)
+    config.assert_all_consumed()
+    return printer, gcode, coordinator
+
+
+class AutoCalibrateTest(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.journal_path = os.path.join(self.tmpdir, 'journal.json')
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _build(self, nozzle_clean_ok=True, extra_overrides=None):
+        overrides = {'journal_path': self.journal_path}
+        overrides.update(extra_overrides or {})
+        z_probe = FakeZOffsetProbe(is_calibrated=True)
+        probe_obj = FakeProbeObj(z_offset=1.795)
+        printer, gcode, coord = _build_auto_calibrate(
+            z_probe, probe_obj, config_overrides=overrides)
+
+        def fake_nozzle_clean(gcmd):
+            if not nozzle_clean_ok:
+                raise fake.CommandError("NEBULAOS_NOZZLE_CLEAN: simulated failure")
+        gcode.commands['NEBULAOS_NOZZLE_CLEAN'] = fake_nozzle_clean
+
+        orig = nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair
+        nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = \
+            _stub_pair(probe_trigger_z=2.5, nozzle_contact_z=0.831)
+        self.addCleanup(
+            setattr, nebulaos_calibration.nebulaos_probe_pair,
+            'measure_probe_nozzle_pair', orig)
+        return printer, gcode, coord
+
+    def test_full_happy_path_runs_stages_in_order_and_commits(self):
+        printer, gcode, coord = self._build()
+        with self.assertRaises(RestartTriggered):
+            coord.cmd_auto_calibrate(fake.FakeGCmd({}))
+
+        script_names = [s.split()[0] for s in gcode.scripts_run]
+        self.assertEqual(script_names, [
+            'G28', 'PID_CALIBRATE', 'PID_CALIBRATE', 'NEBULAOS_NOZZLE_CLEAN',
+            'M140', 'M104', 'M190', 'M109', 'G4',
+            'NEBULAOS_Z_OFFSET_CALIBRATE', 'BED_MESH_CALIBRATE',
+            'SAVE_CONFIG',
+        ])
+        # Both PID_CALIBRATE invocations target the right heater at the
+        # configured (default) temperatures.
+        self.assertIn('HEATER=heater_bed', gcode.scripts_run[1])
+        self.assertIn('TARGET=65.0', gcode.scripts_run[1])
+        self.assertIn('HEATER=extruder', gcode.scripts_run[2])
+        self.assertIn('TARGET=230.0', gcode.scripts_run[2])
+
+        journal = calibration_journal.read_journal(path=self.journal_path)
+        self.assertEqual(journal['state'], calibration_journal.STATE_COMMIT_REQUESTED)
+        self.assertTrue(journal['commit_requested'])
+        self.assertTrue(journal['restart_pending'])
+        self.assertTrue(journal['verification_pending'])
+        self.assertAlmostEqual(
+            journal['expected_values']['bltouch.z_offset'], 1.669, places=3)
+        self.assertEqual(journal['expected_values']['bed_mesh.profile'], 'default')
+        self.assertEqual(coord.auto_calibrate_state, 'running')
+
+    def test_preflight_rejects_missing_load_cell_before_any_motion(self):
+        printer, gcode, coord = self._build()
+        printer.objects.pop('nebulaos_z_offset_probe')
+        with self.assertRaises(fake.CommandError):
+            coord.cmd_auto_calibrate(fake.FakeGCmd({}))
+        self.assertEqual(gcode.scripts_run, [])
+        self.assertEqual(coord.auto_calibrate_state, 'error')
+        journal = calibration_journal.read_journal(path=self.journal_path)
+        self.assertEqual(journal['state'], calibration_journal.STATE_ERROR)
+        self.assertFalse(journal['commit_requested'])
+
+    def test_nozzle_clean_failure_aborts_before_heating_to_calibration_temp(self):
+        printer, gcode, coord = self._build(nozzle_clean_ok=False)
+        with self.assertRaises(fake.CommandError):
+            coord.cmd_auto_calibrate(fake.FakeGCmd({}))
+        script_names = [s.split()[0] for s in gcode.scripts_run]
+        self.assertEqual(
+            script_names, ['G28', 'PID_CALIBRATE', 'PID_CALIBRATE', 'NEBULAOS_NOZZLE_CLEAN'])
+        self.assertNotIn('M140', script_names)
+        journal = calibration_journal.read_journal(path=self.journal_path)
+        self.assertEqual(journal['state'], calibration_journal.STATE_ERROR)
+        self.assertFalse(journal['commit_requested'])
+        self.assertFalse(journal['restart_pending'])
+
+    def test_z_offset_failure_never_reaches_bed_mesh_or_commit(self):
+        printer, gcode, coord = self._build()
+        orig = nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair
+        nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = \
+            lambda printer_, x, y, *a, **kw: _rejected_measurement(x, y)
+        try:
+            with self.assertRaises(fake.CommandError):
+                coord.cmd_auto_calibrate(fake.FakeGCmd({}))
+        finally:
+            nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = orig
+        script_names = [s.split()[0] for s in gcode.scripts_run]
+        self.assertNotIn('BED_MESH_CALIBRATE', script_names)
+        self.assertNotIn('SAVE_CONFIG', script_names)
+        journal = calibration_journal.read_journal(path=self.journal_path)
+        self.assertEqual(journal['state'], calibration_journal.STATE_ERROR)
+
+    def test_final_validation_fails_closed_with_no_active_mesh_profile(self):
+        printer, gcode, coord = self._build()
+        printer.objects['bed_mesh'] = FakeBedMesh(profile_name=None)
+        with self.assertRaises(fake.CommandError) as ctx:
+            coord.cmd_auto_calibrate(fake.FakeGCmd({}))
+        self.assertIn('final validation', str(ctx.exception))
+        self.assertNotIn('SAVE_CONFIG', [s.split()[0] for s in gcode.scripts_run])
+        journal = calibration_journal.read_journal(path=self.journal_path)
+        self.assertEqual(journal['state'], calibration_journal.STATE_ERROR)
+        self.assertFalse(journal['commit_requested'])
+
+    def test_cancel_before_running_is_rejected(self):
+        printer, gcode, coord = self._build()
+        with self.assertRaises(fake.CommandError):
+            coord.cmd_calibration_cancel(fake.FakeGCmd({}))
+
+    def test_cancel_takes_effect_at_next_stage_boundary(self):
+        printer, gcode, coord = self._build()
+        # Cancel arrives from a stub registered on G28 itself - simulates
+        # NEBULAOS_CALIBRATION_CANCEL being called by a separate, real
+        # gcode dispatch while the 'home' stage is still in progress
+        # (cmd_auto_calibrate() only checks the flag at the NEXT stage
+        # boundary - immediately after G28 returns, before starting
+        # pid_bed - never mid-stage). auto_calibrate_state must already
+        # read 'running' at the point CANCEL is accepted, matching a real
+        # concurrent CANCEL call's own preflight check.
+        def cancel_during_home(gcmd):
+            self.assertEqual(coord.auto_calibrate_state, 'running')
+            coord.cmd_calibration_cancel(fake.FakeGCmd({}))
+        gcode.commands['G28'] = cancel_during_home
+
+        with self.assertRaises(fake.CommandError) as ctx:
+            coord.cmd_auto_calibrate(fake.FakeGCmd({}))
+        self.assertIn('cancelled', str(ctx.exception))
+        script_names = [s.split()[0] for s in gcode.scripts_run]
+        self.assertEqual(script_names, ['G28'])
+        self.assertEqual(coord.auto_calibrate_state, 'cancelled')
+        journal = calibration_journal.read_journal(path=self.journal_path)
+        self.assertEqual(journal['state'], calibration_journal.STATE_CANCELLED)
+
+    def test_cannot_start_second_run_while_one_is_in_progress(self):
+        printer, gcode, coord = self._build()
+        coord.auto_calibrate_state = 'running'
+        with self.assertRaises(fake.CommandError):
+            coord.cmd_auto_calibrate(fake.FakeGCmd({}))
+
+
+class PostRestartVerificationTest(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.journal_path = os.path.join(self.tmpdir, 'journal.json')
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _write_pending_journal(self, expected_values):
+        j = calibration_journal.new_journal(1, 'auto_calibrate', now=0.0)
+        calibration_journal.mark_commit_requested(j, expected_values, now=1.0)
+        calibration_journal.write_journal(j, path=self.journal_path)
+        return j
+
+    def test_matching_config_after_restart_marks_complete(self):
+        self._write_pending_journal(
+            {'bltouch.z_offset': 1.234, 'bed_mesh.profile': 'default'})
+        probe_obj = FakeProbeObj(z_offset=1.234)
+        printer, gcode, coord = _build_auto_calibrate(
+            probe_obj=probe_obj, bed_mesh=FakeBedMesh(profile_name='default'),
+            config_overrides={'journal_path': self.journal_path})
+        printer.send_event('klippy:ready')
+        journal = calibration_journal.read_journal(path=self.journal_path)
+        self.assertEqual(journal['state'], calibration_journal.STATE_COMPLETE)
+        self.assertFalse(journal['verification_pending'])
+        self.assertEqual(coord.auto_calibrate_state, calibration_journal.STATE_COMPLETE)
+
+    def test_mismatched_z_offset_after_restart_marks_error(self):
+        self._write_pending_journal(
+            {'bltouch.z_offset': 1.234, 'bed_mesh.profile': 'default'})
+        probe_obj = FakeProbeObj(z_offset=9.999)
+        printer, gcode, coord = _build_auto_calibrate(
+            probe_obj=probe_obj, bed_mesh=FakeBedMesh(profile_name='default'),
+            config_overrides={'journal_path': self.journal_path})
+        printer.send_event('klippy:ready')
+        journal = calibration_journal.read_journal(path=self.journal_path)
+        self.assertEqual(journal['state'], calibration_journal.STATE_ERROR)
+        self.assertIn('bltouch.z_offset', journal['error'])
+
+    def test_mismatched_bed_mesh_profile_after_restart_marks_error(self):
+        self._write_pending_journal(
+            {'bltouch.z_offset': 1.234, 'bed_mesh.profile': 'default'})
+        probe_obj = FakeProbeObj(z_offset=1.234)
+        printer, gcode, coord = _build_auto_calibrate(
+            probe_obj=probe_obj, bed_mesh=FakeBedMesh(profile_name='some_other_profile'),
+            config_overrides={'journal_path': self.journal_path})
+        printer.send_event('klippy:ready')
+        journal = calibration_journal.read_journal(path=self.journal_path)
+        self.assertEqual(journal['state'], calibration_journal.STATE_ERROR)
+        self.assertIn('bed_mesh.profile', journal['error'])
+
+    def test_no_journal_file_is_a_silent_no_op(self):
+        printer, gcode, coord = _build_auto_calibrate(
+            config_overrides={'journal_path': self.journal_path})
+        printer.send_event('klippy:ready')  # must not raise
+        self.assertIsNone(calibration_journal.read_journal(path=self.journal_path))
+
+    def test_already_complete_journal_is_left_untouched(self):
+        j = calibration_journal.new_journal(1, 'auto_calibrate', now=0.0)
+        calibration_journal.mark_commit_requested(j, {}, now=1.0)
+        calibration_journal.mark_verification_result(
+            j, success=True, result={}, error=None, now=2.0)
+        calibration_journal.write_journal(j, path=self.journal_path)
+        before = calibration_journal.read_journal(path=self.journal_path)
+        printer, gcode, coord = _build_auto_calibrate(
+            config_overrides={'journal_path': self.journal_path})
+        printer.send_event('klippy:ready')
+        after = calibration_journal.read_journal(path=self.journal_path)
+        self.assertEqual(before, after)
 
 
 if __name__ == '__main__':
