@@ -285,6 +285,25 @@ class NebulaOSCalibration:
         self.journal_path = config.get(
             'journal_path', default=calibration_journal.DEFAULT_JOURNAL_PATH)
 
+        # NEBULAOS_ESTEPS_CALIBRATE (mission §14) - a separate, standalone
+        # guided workflow (not part of NEBULAOS_AUTO_CALIBRATE). Formula
+        # (upstream's own documented measure-and-trim relationship):
+        # new_rotation_distance = old_rotation_distance * actual_extruded
+        #                          / commanded_extrusion
+        # esteps_max_correction_ratio bounds |actual/commanded - 1| - a
+        # sanity ceiling against a mistyped measurement (e.g. cm instead
+        # of mm), same rationale as max_offset_correction_mm elsewhere in
+        # this module: a real e-steps correction is normally a few
+        # percent, not a doubling.
+        self.esteps_temp = config.getfloat(
+            'esteps_temp', default=200., minval=0., maxval=320.)
+        self.esteps_commanded_length_mm = config.getfloat(
+            'esteps_commanded_length_mm', default=100., above=0.)
+        self.esteps_extrude_speed_mm_s = config.getfloat(
+            'esteps_extrude_speed_mm_s', default=5., above=0.)
+        self.esteps_max_correction_ratio = config.getfloat(
+            'esteps_max_correction_ratio', default=0.3, above=0.)
+
         self.z_offset_state = 'idle'
         self.z_offset_id = 0
         self.z_offset_result = None
@@ -331,6 +350,19 @@ class NebulaOSCalibration:
         self.auto_calibrate_result = None
         self._auto_calibrate_cancel_requested = False
 
+        # NEBULAOS_ESTEPS_CALIBRATE state (mission §14) - a 3-call guided
+        # workflow (start/heat -> CONTINUE=1/extrude -> MEASURED=<mm>/
+        # apply), completely separate status namespace from everything
+        # above for the same reason bootstrap_sim_* is separate.
+        self.esteps_id = 0
+        self.esteps_state = 'idle'
+        self.esteps_error = None
+        self.esteps_extruder_name = None
+        self.esteps_commanded_length = None
+        self.esteps_measured_length = None
+        self.esteps_old_rotation_distance = None
+        self.esteps_new_rotation_distance = None
+
         self.gcode.register_command(
             'NEBULAOS_Z_OFFSET_CALIBRATE', self.cmd_z_offset_calibrate,
             desc=self.cmd_z_offset_calibrate_help)
@@ -343,6 +375,9 @@ class NebulaOSCalibration:
         self.gcode.register_command(
             'NEBULAOS_CALIBRATION_CANCEL', self.cmd_calibration_cancel,
             desc=self.cmd_calibration_cancel_help)
+        self.gcode.register_command(
+            'NEBULAOS_ESTEPS_CALIBRATE', self.cmd_esteps_calibrate,
+            desc=self.cmd_esteps_calibrate_help)
         self.printer.register_event_handler(
             "klippy:ready", self._handle_ready)
 
@@ -411,6 +446,14 @@ class NebulaOSCalibration:
             'auto_calibrate_stage': self.auto_calibrate_stage,
             'auto_calibrate_error': self.auto_calibrate_error,
             'auto_calibrate_result': self.auto_calibrate_result,
+            'esteps_id': self.esteps_id,
+            'esteps_state': self.esteps_state,
+            'esteps_error': self.esteps_error,
+            'esteps_extruder_name': self.esteps_extruder_name,
+            'esteps_commanded_length': self.esteps_commanded_length,
+            'esteps_measured_length': self.esteps_measured_length,
+            'esteps_old_rotation_distance': self.esteps_old_rotation_distance,
+            'esteps_new_rotation_distance': self.esteps_new_rotation_distance,
         }
 
     # ------------------------------------------------------------------
@@ -885,6 +928,168 @@ class NebulaOSCalibration:
         self.gcode.respond_info(
             "NEBULAOS_CALIBRATION_CANCEL: requested - will take effect at "
             "the next stage boundary")
+
+    # ------------------------------------------------------------------
+    # NEBULAOS_ESTEPS_CALIBRATE (mission §14): a standalone guided
+    # workflow, NOT part of NEBULAOS_AUTO_CALIBRATE. Internally just
+    # upstream `rotation_distance` - "E-Steps" is product-facing naming
+    # only, matching the mission's own wording. Real motion/heating stays
+    # upstream (M104/M109, G92/G1, SET_EXTRUDER_ROTATION_DISTANCE) -
+    # NebulaOS owns only the guided sequencing, the formula, and staging.
+    #
+    # Three calls, one human interaction, matching the REAL physical
+    # procedure (the filament must be marked BEFORE the guided extrusion
+    # happens, not after - there is no way to ask a human to mark a
+    # moving filament mid-extrusion):
+    #   1. NEBULAOS_ESTEPS_CALIBRATE                    - preflight, heat,
+    #      wait for temp. Stops here and asks the human to mark the
+    #      filament at the extruder's entry point now.
+    #   2. NEBULAOS_ESTEPS_CALIBRATE CONTINUE=1         - extrudes exactly
+    #      esteps_commanded_length_mm. Stops here and asks for the ONE
+    #      real measurement: how far the mark actually moved.
+    #   3. NEBULAOS_ESTEPS_CALIBRATE MEASURED=<mm>      - computes, sanity
+    #      -checks, and applies/stages the new rotation_distance.
+    # ------------------------------------------------------------------
+    cmd_esteps_calibrate_help = (
+        "Guided E-Steps (rotation_distance) calibration - call with no "
+        "params to start (heats and waits for you to mark the filament), "
+        "CONTINUE=1 to extrude the commanded length, MEASURED=<mm> to "
+        "apply the result. EXTRUDER=<name> to target a non-default "
+        "extruder (default 'extruder').")
+
+    def cmd_esteps_calibrate(self, gcmd):
+        measured = gcmd.get_float('MEASURED', None)
+        do_continue = gcmd.get_int('CONTINUE', 0)
+        extruder_name = gcmd.get('EXTRUDER', 'extruder')
+
+        if measured is not None:
+            self._esteps_apply(gcmd, measured)
+        elif do_continue:
+            self._esteps_extrude(gcmd)
+        else:
+            self._esteps_start(gcmd, extruder_name)
+
+    def _esteps_lookup_extruder(self, name):
+        extruder_obj = self.printer.lookup_object(name, None)
+        if extruder_obj is None or getattr(
+                extruder_obj, 'extruder_stepper', None) is None:
+            raise self.printer.command_error(
+                "NEBULAOS_ESTEPS_CALIBRATE: '%s' is not a configured "
+                "extruder with a rotation_distance stepper" % (name,))
+        return extruder_obj
+
+    def _esteps_start(self, gcmd, extruder_name):
+        if self.esteps_state in ('awaiting_continue', 'awaiting_measurement'):
+            raise self.printer.command_error(
+                "NEBULAOS_ESTEPS_CALIBRATE: a guided run is already in "
+                "progress (state=%s) - finish it with CONTINUE=1/MEASURED=, "
+                "or power-cycle to abandon it" % (self.esteps_state,))
+        extruder_obj = self._esteps_lookup_extruder(extruder_name)
+
+        self.esteps_id += 1
+        self.esteps_state = 'running'
+        self.esteps_error = None
+        self.esteps_extruder_name = extruder_name
+        self.esteps_commanded_length = None
+        self.esteps_measured_length = None
+        self.esteps_old_rotation_distance = None
+        self.esteps_new_rotation_distance = None
+
+        try:
+            self.gcode.run_script_from_command('M104 S%.1f' % (self.esteps_temp,))
+            self.gcode.run_script_from_command('M109 S%.1f' % (self.esteps_temp,))
+        except Exception as e:
+            self.esteps_state = 'error'
+            self.esteps_error = _sanitize_error(e)
+            raise
+
+        self.esteps_state = 'awaiting_continue'
+        self.gcode.respond_info(
+            "NEBULAOS_ESTEPS_CALIBRATE: hotend at %.1fC. Mark the filament "
+            "at the extruder's entry point now. When ready, call "
+            "NEBULAOS_ESTEPS_CALIBRATE CONTINUE=1 to extrude %.1fmm."
+            % (self.esteps_temp, self.esteps_commanded_length_mm))
+
+    def _esteps_extrude(self, gcmd):
+        if self.esteps_state != 'awaiting_continue':
+            raise self.printer.command_error(
+                "NEBULAOS_ESTEPS_CALIBRATE CONTINUE=1: no guided run is "
+                "waiting to extrude (state=%s) - start one first with "
+                "NEBULAOS_ESTEPS_CALIBRATE" % (self.esteps_state,))
+        extruder_obj = self._esteps_lookup_extruder(self.esteps_extruder_name)
+
+        try:
+            old_rotation_distance = (
+                extruder_obj.extruder_stepper.stepper.get_rotation_distance()[0])
+            self.esteps_old_rotation_distance = old_rotation_distance
+            # M82 (absolute extrusion) + G92 E0 makes this extrusion
+            # self-contained regardless of whatever extrusion mode/offset
+            # a prior print or macro left active.
+            self.gcode.run_script_from_command('M82')
+            self.gcode.run_script_from_command('G92 E0')
+            self.gcode.run_script_from_command(
+                'G1 E%.4f F%d' % (self.esteps_commanded_length_mm,
+                                  int(self.esteps_extrude_speed_mm_s * 60)))
+        except Exception as e:
+            self.esteps_state = 'error'
+            self.esteps_error = _sanitize_error(e)
+            raise
+
+        self.esteps_commanded_length = self.esteps_commanded_length_mm
+        self.esteps_state = 'awaiting_measurement'
+        self.gcode.respond_info(
+            "NEBULAOS_ESTEPS_CALIBRATE: extruded %.1fmm (commanded). "
+            "Measure how far your mark actually moved and call "
+            "NEBULAOS_ESTEPS_CALIBRATE MEASURED=<mm>."
+            % (self.esteps_commanded_length,))
+
+    def _esteps_apply(self, gcmd, measured):
+        if self.esteps_state != 'awaiting_measurement':
+            raise self.printer.command_error(
+                "NEBULAOS_ESTEPS_CALIBRATE MEASURED=: no guided run is "
+                "waiting for a measurement (state=%s) - start one first "
+                "with NEBULAOS_ESTEPS_CALIBRATE" % (self.esteps_state,))
+        try:
+            if not math.isfinite(measured) or measured <= 0.:
+                raise self.printer.command_error(
+                    "NEBULAOS_ESTEPS_CALIBRATE MEASURED=%r must be a "
+                    "finite, positive length in mm" % (measured,))
+            commanded = self.esteps_commanded_length
+            old_rd = self.esteps_old_rotation_distance
+            # Upstream's own documented measure-and-trim relationship.
+            ratio = measured / commanded
+            new_rd = old_rd * ratio
+            if abs(ratio - 1.0) > self.esteps_max_correction_ratio:
+                raise self.printer.command_error(
+                    "NEBULAOS_ESTEPS_CALIBRATE: measured %.3fmm vs "
+                    "commanded %.3fmm implies a %.1f%% correction, "
+                    "exceeding esteps_max_correction_ratio=%.1f%% - "
+                    "refusing an implausible result (check for a "
+                    "units/typo mistake in MEASURED=)"
+                    % (measured, commanded, (ratio - 1.0) * 100.,
+                       self.esteps_max_correction_ratio * 100.))
+
+            extruder_obj = self._esteps_lookup_extruder(self.esteps_extruder_name)
+            self.gcode.run_script_from_command(
+                'SET_EXTRUDER_ROTATION_DISTANCE EXTRUDER=%s DISTANCE=%.6f'
+                % (self.esteps_extruder_name, new_rd))
+            configfile = self.printer.lookup_object('configfile')
+            configfile.set(self.esteps_extruder_name, 'rotation_distance',
+                            "%.6f" % (new_rd,))
+        except Exception as e:
+            self.esteps_state = 'error'
+            self.esteps_error = _sanitize_error(e)
+            raise
+
+        self.esteps_measured_length = measured
+        self.esteps_new_rotation_distance = new_rd
+        self.esteps_state = 'complete'
+        self.esteps_error = None
+        self.gcode.respond_info(
+            "NEBULAOS_ESTEPS_CALIBRATE: rotation_distance %.6f -> %.6f "
+            "(measured %.3fmm vs commanded %.3fmm), applied live. The "
+            "SAVE_CONFIG command will make this permanent."
+            % (old_rd, new_rd, measured, commanded))
 
     def _handle_ready(self, *args):
         """klippy:ready - runs on EVERY klippy startup, including the one

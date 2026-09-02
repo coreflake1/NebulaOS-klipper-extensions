@@ -623,7 +623,7 @@ class UpstreamFirstCleanupTest(unittest.TestCase):
             sorted(gcode.commands.keys()),
             ['NEBULAOS_AUTO_CALIBRATE',
              'NEBULAOS_CALIBRATION_CANCEL', 'NEBULAOS_CALIBRATION_STATUS',
-             'NEBULAOS_Z_OFFSET_CALIBRATE'])
+             'NEBULAOS_ESTEPS_CALIBRATE', 'NEBULAOS_Z_OFFSET_CALIBRATE'])
 
     def test_no_axis_twist_calibrate_command_or_state(self):
         # Mission §21: NEBULAOS_AXIS_TWIST_CALIBRATE and every axis_twist_*
@@ -1233,6 +1233,250 @@ class PostRestartVerificationTest(unittest.TestCase):
         printer.send_event('klippy:ready')
         after = calibration_journal.read_journal(path=self.journal_path)
         self.assertEqual(before, after)
+
+
+# ----------------------------------------------------------------------
+# NEBULAOS_ESTEPS_CALIBRATE (mission §14)
+# ----------------------------------------------------------------------
+class FakeStepper:
+    def __init__(self, rotation_distance):
+        self._rotation_distance = rotation_distance
+
+    def get_rotation_distance(self):
+        return (self._rotation_distance, 200)
+
+
+class FakeExtruderStepper:
+    def __init__(self, rotation_distance):
+        self.stepper = FakeStepper(rotation_distance)
+
+
+class FakeExtruderObj:
+    """Stands in for the real registered extruder object
+    (kinematics/extruder.py's PrinterExtruder) - models only
+    extruder_stepper.stepper.get_rotation_distance(), the one real seam
+    nebulaos_calibration.py's E-Steps workflow reads directly (matching
+    upstream's own SET_EXTRUDER_ROTATION_DISTANCE, which reads/writes the
+    exact same attribute)."""
+
+    def __init__(self, rotation_distance=7.5, has_stepper=True):
+        self.extruder_stepper = (
+            FakeExtruderStepper(rotation_distance) if has_stepper else None)
+
+
+def _build_esteps(extruder_obj=None, config_overrides=None):
+    printer, gcode, coord = _build(config_overrides=config_overrides)
+    printer.add_object(
+        'extruder', extruder_obj if extruder_obj is not None else FakeExtruderObj())
+    return printer, gcode, coord
+
+
+class EStepsStartTest(unittest.TestCase):
+    def test_happy_path_heats_and_waits_for_continue(self):
+        printer, gcode, coord = _build_esteps()
+        coord.cmd_esteps_calibrate(fake.FakeGCmd({}))
+        self.assertEqual(coord.esteps_state, 'awaiting_continue')
+        self.assertEqual(coord.esteps_id, 1)
+        self.assertEqual(coord.esteps_extruder_name, 'extruder')
+        self.assertEqual(gcode.scripts_run, ['M104 S200.0', 'M109 S200.0'])
+
+    def test_missing_extruder_object_rejected(self):
+        printer, gcode, coord = _build()  # no 'extruder' object added
+        with self.assertRaises(fake.CommandError):
+            coord.cmd_esteps_calibrate(fake.FakeGCmd({}))
+        self.assertEqual(coord.esteps_state, 'idle')
+
+    def test_extruder_without_rotation_distance_stepper_rejected(self):
+        printer, gcode, coord = _build_esteps(
+            FakeExtruderObj(has_stepper=False))
+        with self.assertRaises(fake.CommandError):
+            coord.cmd_esteps_calibrate(fake.FakeGCmd({}))
+
+    def test_cannot_start_a_second_run_while_awaiting_continue(self):
+        printer, gcode, coord = _build_esteps()
+        coord.cmd_esteps_calibrate(fake.FakeGCmd({}))
+        with self.assertRaises(fake.CommandError):
+            coord.cmd_esteps_calibrate(fake.FakeGCmd({}))
+
+    def test_cannot_start_a_second_run_while_awaiting_measurement(self):
+        printer, gcode, coord = _build_esteps()
+        coord.cmd_esteps_calibrate(fake.FakeGCmd({}))
+        coord.cmd_esteps_calibrate(fake.FakeGCmd({'CONTINUE': '1'}))
+        with self.assertRaises(fake.CommandError):
+            coord.cmd_esteps_calibrate(fake.FakeGCmd({}))
+
+    def test_custom_temp_is_honored(self):
+        printer, gcode, coord = _build_esteps(
+            config_overrides={'esteps_temp': '215'})
+        coord.cmd_esteps_calibrate(fake.FakeGCmd({}))
+        self.assertEqual(gcode.scripts_run, ['M104 S215.0', 'M109 S215.0'])
+
+    def test_explicit_extruder_param_is_used_and_recorded(self):
+        printer, gcode, coord = _build(config_overrides=None)
+        printer.add_object('extruder1', FakeExtruderObj())
+        coord.cmd_esteps_calibrate(fake.FakeGCmd({'EXTRUDER': 'extruder1'}))
+        self.assertEqual(coord.esteps_extruder_name, 'extruder1')
+
+
+class EStepsExtrudeTest(unittest.TestCase):
+    def _started(self, extruder_obj=None, config_overrides=None):
+        printer, gcode, coord = _build_esteps(extruder_obj, config_overrides)
+        coord.cmd_esteps_calibrate(fake.FakeGCmd({}))
+        gcode.scripts_run = []  # isolate CONTINUE=1's own scripts
+        return printer, gcode, coord
+
+    def test_continue_without_start_is_rejected(self):
+        printer, gcode, coord = _build_esteps()
+        with self.assertRaises(fake.CommandError):
+            coord.cmd_esteps_calibrate(fake.FakeGCmd({'CONTINUE': '1'}))
+
+    def test_continue_extrudes_exactly_the_commanded_length(self):
+        printer, gcode, coord = self._started()
+        coord.cmd_esteps_calibrate(fake.FakeGCmd({'CONTINUE': '1'}))
+        self.assertEqual(coord.esteps_state, 'awaiting_measurement')
+        self.assertEqual(gcode.scripts_run,
+                          ['M82', 'G92 E0', 'G1 E100.0000 F300'])
+        self.assertEqual(coord.esteps_commanded_length, 100.)
+
+    def test_records_old_rotation_distance_before_extruding(self):
+        printer, gcode, coord = self._started(FakeExtruderObj(rotation_distance=7.5))
+        coord.cmd_esteps_calibrate(fake.FakeGCmd({'CONTINUE': '1'}))
+        self.assertAlmostEqual(coord.esteps_old_rotation_distance, 7.5, places=9)
+
+    def test_custom_commanded_length_and_speed_are_honored(self):
+        printer, gcode, coord = self._started(
+            config_overrides={'esteps_commanded_length_mm': '50',
+                               'esteps_extrude_speed_mm_s': '2'})
+        coord.cmd_esteps_calibrate(fake.FakeGCmd({'CONTINUE': '1'}))
+        self.assertEqual(gcode.scripts_run,
+                          ['M82', 'G92 E0', 'G1 E50.0000 F120'])
+
+    def test_cannot_continue_twice(self):
+        printer, gcode, coord = self._started()
+        coord.cmd_esteps_calibrate(fake.FakeGCmd({'CONTINUE': '1'}))
+        with self.assertRaises(fake.CommandError):
+            coord.cmd_esteps_calibrate(fake.FakeGCmd({'CONTINUE': '1'}))
+
+
+class EStepsApplyTest(unittest.TestCase):
+    def _awaiting_measurement(self, extruder_obj=None, config_overrides=None):
+        printer, gcode, coord = _build_esteps(extruder_obj, config_overrides)
+        coord.cmd_esteps_calibrate(fake.FakeGCmd({}))
+        coord.cmd_esteps_calibrate(fake.FakeGCmd({'CONTINUE': '1'}))
+        gcode.scripts_run = []  # isolate MEASURED='s own scripts
+        return printer, gcode, coord
+
+    def test_measured_without_continue_is_rejected(self):
+        printer, gcode, coord = _build_esteps()
+        with self.assertRaises(fake.CommandError):
+            coord.cmd_esteps_calibrate(fake.FakeGCmd({'MEASURED': '100'}))
+
+    def test_exact_measurement_leaves_rotation_distance_unchanged(self):
+        printer, gcode, coord = self._awaiting_measurement(
+            FakeExtruderObj(rotation_distance=7.5))
+        coord.cmd_esteps_calibrate(fake.FakeGCmd({'MEASURED': '100'}))
+        self.assertEqual(coord.esteps_state, 'complete')
+        self.assertAlmostEqual(coord.esteps_new_rotation_distance, 7.5, places=9)
+        self.assertIn('SET_EXTRUDER_ROTATION_DISTANCE EXTRUDER=extruder '
+                       'DISTANCE=7.500000', gcode.scripts_run)
+
+    def test_under_extrusion_formula_matches_upstream_measure_and_trim(self):
+        # Upstream's own documented relationship:
+        # new = old * actual / commanded. 95mm actually came out of a
+        # commanded 100mm -> rotation_distance must SHRINK proportionally.
+        printer, gcode, coord = self._awaiting_measurement(
+            FakeExtruderObj(rotation_distance=7.5))
+        coord.cmd_esteps_calibrate(fake.FakeGCmd({'MEASURED': '95'}))
+        self.assertAlmostEqual(
+            coord.esteps_new_rotation_distance, 7.5 * 95. / 100., places=9)
+
+    def test_over_extrusion_grows_rotation_distance(self):
+        printer, gcode, coord = self._awaiting_measurement(
+            FakeExtruderObj(rotation_distance=7.5))
+        coord.cmd_esteps_calibrate(fake.FakeGCmd({'MEASURED': '108'}))
+        self.assertAlmostEqual(
+            coord.esteps_new_rotation_distance, 7.5 * 108. / 100., places=9)
+
+    def test_result_is_staged_for_save_config(self):
+        printer, gcode, coord = self._awaiting_measurement(
+            FakeExtruderObj(rotation_distance=7.5))
+        coord.cmd_esteps_calibrate(fake.FakeGCmd({'MEASURED': '95'}))
+        configfile = printer.lookup_object('configfile')
+        self.assertEqual(len(configfile.set_calls), 1)
+        section, option, value = configfile.set_calls[0]
+        self.assertEqual(section, 'extruder')
+        self.assertEqual(option, 'rotation_distance')
+        self.assertAlmostEqual(float(value), 7.5 * 95. / 100., places=5)
+
+    def test_implausible_correction_is_rejected_and_not_applied(self):
+        # 50mm measured vs 100mm commanded is a 50% implied correction -
+        # exceeds the default 30% sanity ceiling.
+        printer, gcode, coord = self._awaiting_measurement(
+            FakeExtruderObj(rotation_distance=7.5))
+        with self.assertRaises(fake.CommandError) as ctx:
+            coord.cmd_esteps_calibrate(fake.FakeGCmd({'MEASURED': '50'}))
+        self.assertIn('esteps_max_correction_ratio', str(ctx.exception))
+        self.assertEqual(coord.esteps_state, 'error')
+        self.assertEqual(gcode.scripts_run, [])
+        configfile = printer.lookup_object('configfile')
+        self.assertEqual(configfile.set_calls, [])
+
+    def test_custom_max_correction_ratio_is_honored(self):
+        printer, gcode, coord = self._awaiting_measurement(
+            FakeExtruderObj(rotation_distance=7.5),
+            config_overrides={'esteps_max_correction_ratio': '0.6'})
+        # 50% correction now passes under a 60% ceiling.
+        coord.cmd_esteps_calibrate(fake.FakeGCmd({'MEASURED': '50'}))
+        self.assertEqual(coord.esteps_state, 'complete')
+
+    def test_zero_measured_is_rejected(self):
+        printer, gcode, coord = self._awaiting_measurement()
+        with self.assertRaises(fake.CommandError):
+            coord.cmd_esteps_calibrate(fake.FakeGCmd({'MEASURED': '0'}))
+
+    def test_negative_measured_is_rejected(self):
+        printer, gcode, coord = self._awaiting_measurement()
+        with self.assertRaises(fake.CommandError):
+            coord.cmd_esteps_calibrate(fake.FakeGCmd({'MEASURED': '-5'}))
+
+    def test_cannot_apply_twice(self):
+        printer, gcode, coord = self._awaiting_measurement()
+        coord.cmd_esteps_calibrate(fake.FakeGCmd({'MEASURED': '100'}))
+        with self.assertRaises(fake.CommandError):
+            coord.cmd_esteps_calibrate(fake.FakeGCmd({'MEASURED': '100'}))
+
+    def test_can_start_a_new_run_after_completion(self):
+        printer, gcode, coord = self._awaiting_measurement()
+        coord.cmd_esteps_calibrate(fake.FakeGCmd({'MEASURED': '100'}))
+        coord.cmd_esteps_calibrate(fake.FakeGCmd({}))  # must not raise
+        self.assertEqual(coord.esteps_state, 'awaiting_continue')
+        self.assertEqual(coord.esteps_id, 2)
+
+
+class EStepsStatusTest(unittest.TestCase):
+    def test_status_fields_present_and_idle_by_default(self):
+        printer, gcode, coord = _build_esteps()
+        status = coord.get_status(0.)
+        self.assertEqual(status['esteps_state'], 'idle')
+        self.assertEqual(status['esteps_id'], 0)
+        self.assertIsNone(status['esteps_error'])
+        self.assertIsNone(status['esteps_commanded_length'])
+        self.assertIsNone(status['esteps_measured_length'])
+        self.assertIsNone(status['esteps_old_rotation_distance'])
+        self.assertIsNone(status['esteps_new_rotation_distance'])
+
+    def test_status_reflects_completed_run(self):
+        printer, gcode, coord = _build_esteps(FakeExtruderObj(rotation_distance=7.5))
+        coord.cmd_esteps_calibrate(fake.FakeGCmd({}))
+        coord.cmd_esteps_calibrate(fake.FakeGCmd({'CONTINUE': '1'}))
+        coord.cmd_esteps_calibrate(fake.FakeGCmd({'MEASURED': '95'}))
+        status = coord.get_status(0.)
+        self.assertEqual(status['esteps_state'], 'complete')
+        self.assertEqual(status['esteps_commanded_length'], 100.)
+        self.assertEqual(status['esteps_measured_length'], 95.)
+        self.assertAlmostEqual(status['esteps_old_rotation_distance'], 7.5, places=9)
+        self.assertAlmostEqual(
+            status['esteps_new_rotation_distance'], 7.5 * 95. / 100., places=9)
 
 
 if __name__ == '__main__':
