@@ -65,6 +65,32 @@ class AdvanceStageTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             journal.advance_stage(j, 'not_a_real_stage', now=1.0)
 
+    def test_input_shaper_stages_accepted_with_explicit_stages_arg(self):
+        j = journal.new_journal(1, 'input_shaper_calibrate', now=0.0)
+        journal.advance_stage(j, 'measure', now=1.0,
+                               stages=journal.INPUT_SHAPER_STAGES)
+        self.assertEqual(j['stage'], 'measure')
+
+    def test_input_shaper_stage_rejected_against_default_stages(self):
+        j = journal.new_journal(1, 'input_shaper_calibrate', now=0.0)
+        with self.assertRaises(ValueError):
+            journal.advance_stage(j, 'measure', now=1.0)
+
+    def test_auto_calibrate_stage_rejected_against_input_shaper_stages(self):
+        j = journal.new_journal(1, 'auto_calibrate', now=0.0)
+        with self.assertRaises(ValueError):
+            journal.advance_stage(j, 'pid_bed', now=1.0,
+                                   stages=journal.INPUT_SHAPER_STAGES)
+
+    def test_input_shaper_stages_full_walk_accumulates_in_order(self):
+        j = journal.new_journal(1, 'input_shaper_calibrate', now=0.0)
+        for i, stage in enumerate(journal.INPUT_SHAPER_STAGES):
+            journal.advance_stage(j, stage, now=float(i),
+                                   stages=journal.INPUT_SHAPER_STAGES)
+        self.assertEqual(
+            list(journal.INPUT_SHAPER_STAGES[:-1]), j['completed_stages'])
+        self.assertEqual(j['stage'], journal.INPUT_SHAPER_STAGES[-1])
+
 
 class CommitAndVerificationTest(unittest.TestCase):
     def test_mark_commit_requested_sets_all_three_flags(self):

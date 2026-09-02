@@ -304,6 +304,44 @@ class NebulaOSCalibration:
         self.esteps_max_correction_ratio = config.getfloat(
             'esteps_max_correction_ratio', default=0.3, above=0.)
 
+        # NEBULAOS_INPUT_SHAPER_CALIBRATE (mission §13) - a separate,
+        # standalone guided workflow (not part of NEBULAOS_AUTO_CALIBRATE:
+        # resonance testing is done cold and has nothing to do with the
+        # nozzle/bed thermal state that workflow coordinates). Wraps
+        # upstream G28 + `SHAPER_CALIBRATE` (no AXIS= - see
+        # nebulaos_calibration_journal.py's own INPUT_SHAPER_STAGES
+        # comment for why one command covers both X and Y on this unit's
+        # fixed-mounted ADXL345) + one SAVE_CONFIG+restart + post-restart
+        # verification, the same pattern as cmd_auto_calibrate's own
+        # localized_z_offset/bed_mesh stages, using its own separate
+        # journal file so an in-flight NEBULAOS_AUTO_CALIBRATE journal is
+        # never at risk of being overwritten by this unrelated workflow
+        # (or vice versa).
+        #
+        # Feasibility note (2026-09-02/03 overnight source-prep, NOT yet
+        # hardware-validated end-to-end as this exact guided command):
+        # the underlying platform - [mcu rpi]/[adxl345]/[resonance_tester]/
+        # [input_shaper] in machine.cfg, klipper_mcu served by
+        # S54nebulaos-host-mcu - is Phase 1.9A work already merged into
+        # this branch's own history (confirmed: `git merge-base
+        # --is-ancestor c86dc54 HEAD` on phase2/calibration-framework),
+        # not a separate unmerged-branch prerequisite as an earlier
+        # research pass in this mission incorrectly assumed. It is also
+        # not merely theoretical: a live ACCELEROMETER_QUERY CHIP=adxl345
+        # against this exact candidate on 2026-08-31 returned real,
+        # plausible values (x=3064.38, y=444.12, z=8438.35 - see
+        # _evidence/phase2-axis-twist-qualification-20260831-203913/
+        # custom-boot/adxl-query.json), and that same session's HELP
+        # output lists SHAPER_CALIBRATE/TEST_RESONANCES/INPUT_SHAPER/
+        # MEASURE_AXES_NOISE as registered, live commands. What is NOT
+        # yet proven live is this specific guided command end-to-end
+        # (preflight/home/measure/commit/restart/verify) - that is
+        # tomorrow's hardware task, not assumed complete tonight.
+        self.input_shaper_journal_path = config.get(
+            'input_shaper_journal_path', default=(
+                calibration_journal.DEFAULT_JOURNAL_DIR
+                + "/input_shaper_journal.json"))
+
         self.z_offset_state = 'idle'
         self.z_offset_id = 0
         self.z_offset_result = None
@@ -363,6 +401,15 @@ class NebulaOSCalibration:
         self.esteps_old_rotation_distance = None
         self.esteps_new_rotation_distance = None
 
+        # NEBULAOS_INPUT_SHAPER_CALIBRATE state (mission §13) - its own
+        # status namespace, same reasoning as bootstrap_sim_*/esteps_*
+        # above.
+        self.input_shaper_id = 0
+        self.input_shaper_state = 'idle'
+        self.input_shaper_stage = None
+        self.input_shaper_error = None
+        self.input_shaper_result = None
+
         self.gcode.register_command(
             'NEBULAOS_Z_OFFSET_CALIBRATE', self.cmd_z_offset_calibrate,
             desc=self.cmd_z_offset_calibrate_help)
@@ -378,6 +425,9 @@ class NebulaOSCalibration:
         self.gcode.register_command(
             'NEBULAOS_ESTEPS_CALIBRATE', self.cmd_esteps_calibrate,
             desc=self.cmd_esteps_calibrate_help)
+        self.gcode.register_command(
+            'NEBULAOS_INPUT_SHAPER_CALIBRATE', self.cmd_input_shaper_calibrate,
+            desc=self.cmd_input_shaper_calibrate_help)
         self.printer.register_event_handler(
             "klippy:ready", self._handle_ready)
 
@@ -454,6 +504,11 @@ class NebulaOSCalibration:
             'esteps_measured_length': self.esteps_measured_length,
             'esteps_old_rotation_distance': self.esteps_old_rotation_distance,
             'esteps_new_rotation_distance': self.esteps_new_rotation_distance,
+            'input_shaper_id': self.input_shaper_id,
+            'input_shaper_state': self.input_shaper_state,
+            'input_shaper_stage': self.input_shaper_stage,
+            'input_shaper_error': self.input_shaper_error,
+            'input_shaper_result': self.input_shaper_result,
         }
 
     # ------------------------------------------------------------------
@@ -1091,26 +1146,124 @@ class NebulaOSCalibration:
             "SAVE_CONFIG command will make this permanent."
             % (old_rd, new_rd, measured, commanded))
 
-    def _handle_ready(self, *args):
-        """klippy:ready - runs on EVERY klippy startup, including the one
-        immediately after NEBULAOS_AUTO_CALIBRATE's own SAVE_CONFIG
-        restart. Reads the on-disk journal (never the in-memory status,
-        which is always fresh/empty in a new process) and, if it shows a
-        commit that was requested but never verified, checks the real,
-        just-reloaded config against what was expected and records the
-        result - the only code path that ever clears verification_pending.
-        A journal showing anything else (no file, or an already-verified/
-        errored/cancelled state) is left untouched - this only ever acts
-        on a genuine "restart just happened, verification still owed"
-        case."""
-        journal = calibration_journal.read_journal(path=self.journal_path)
-        if journal is None or not journal.get('verification_pending'):
-            return
-        expected = journal.get('expected_values') or {}
+    # ------------------------------------------------------------------
+    # NEBULAOS_INPUT_SHAPER_CALIBRATE (mission §13) - see this module's own
+    # __init__ comment above input_shaper_journal_path for the platform
+    # feasibility evidence and what remains hardware-unverified.
+    # ------------------------------------------------------------------
+    cmd_input_shaper_calibrate_help = (
+        "Guided Input Shaper calibration: home, upstream SHAPER_CALIBRATE "
+        "(both X and Y in one pass - this unit's ADXL345 is fixed-mounted, "
+        "not a movable clip-on sensor), one SAVE_CONFIG+restart, "
+        "post-restart verification")
+
+    def cmd_input_shaper_calibrate(self, gcmd):
+        if self.input_shaper_state == 'running':
+            raise self.printer.command_error(
+                "NEBULAOS_INPUT_SHAPER_CALIBRATE: a calibration is already "
+                "in progress")
+
+        now = time.time()
+        self.input_shaper_id += 1
+        self.input_shaper_state = 'running'
+        self.input_shaper_stage = None
+        self.input_shaper_error = None
+        self.input_shaper_result = None
+        journal = calibration_journal.new_journal(
+            self.input_shaper_id, 'input_shaper_calibrate', now)
+        calibration_journal.write_journal(
+            journal, path=self.input_shaper_journal_path)
+
+        def advance(stage, t):
+            self.input_shaper_stage = stage
+            calibration_journal.advance_stage(
+                journal, stage, t,
+                stages=calibration_journal.INPUT_SHAPER_STAGES)
+            calibration_journal.write_journal(
+                journal, path=self.input_shaper_journal_path)
+
+        def run(script):
+            self.gcode.run_script_from_command(script)
+
+        try:
+            advance('preflight', time.time())
+            if self.printer.lookup_object('resonance_tester', None) is None:
+                raise self.printer.command_error(
+                    "NEBULAOS_INPUT_SHAPER_CALIBRATE: no [resonance_tester] "
+                    "is configured on this printer")
+            input_shaper_obj = self.printer.lookup_object(
+                'input_shaper', None)
+            if input_shaper_obj is None:
+                raise self.printer.command_error(
+                    "NEBULAOS_INPUT_SHAPER_CALIBRATE: no [input_shaper] is "
+                    "configured on this printer")
+
+            advance('home', time.time())
+            run('G28')
+
+            advance('measure', time.time())
+            run('SHAPER_CALIBRATE')
+            shapers_by_axis = {
+                s.axis: s for s in input_shaper_obj.get_shapers()}
+            shaper_x = shapers_by_axis.get('x')
+            shaper_y = shapers_by_axis.get('y')
+            if (shaper_x is None or shaper_y is None
+                    or not shaper_x.params.shaper_freq
+                    or not shaper_y.params.shaper_freq):
+                raise self.printer.command_error(
+                    "NEBULAOS_INPUT_SHAPER_CALIBRATE: SHAPER_CALIBRATE did "
+                    "not produce a usable shaper_freq for both X and Y")
+
+            advance('final_validation', time.time())
+            expected_values = {
+                'input_shaper.shaper_type_x': shaper_x.params.shaper_type,
+                'input_shaper.shaper_freq_x':
+                    round(shaper_x.params.shaper_freq, 3),
+                'input_shaper.shaper_type_y': shaper_y.params.shaper_type,
+                'input_shaper.shaper_freq_y':
+                    round(shaper_y.params.shaper_freq, 3),
+            }
+
+            calibration_journal.mark_commit_requested(
+                journal, expected_values, time.time())
+            calibration_journal.write_journal(
+                journal, path=self.input_shaper_journal_path)
+            self.input_shaper_stage = 'commit'
+            self.gcode.respond_info(
+                "NEBULAOS_INPUT_SHAPER_CALIBRATE: shaper_x=%s@%.1fHz "
+                "shaper_y=%s@%.1fHz - committing with SAVE_CONFIG, printer "
+                "will restart"
+                % (shaper_x.params.shaper_type, shaper_x.params.shaper_freq,
+                   shaper_y.params.shaper_type, shaper_y.params.shaper_freq))
+            run('SAVE_CONFIG')
+            # See cmd_auto_calibrate's own identical comment - unreachable
+            # in the success path (SAVE_CONFIG restarts klippy), kept only
+            # so a future upstream behavior change fails loudly here.
+            raise self.printer.command_error(
+                "NEBULAOS_INPUT_SHAPER_CALIBRATE: SAVE_CONFIG returned "
+                "without restarting - this should never happen")
+        except Exception as e:
+            if journal.get('commit_requested'):
+                raise
+            self.input_shaper_state = 'error'
+            self.input_shaper_error = _sanitize_error(e)
+            if journal['state'] != calibration_journal.STATE_CANCELLED:
+                calibration_journal.mark_error(
+                    journal, self.input_shaper_error, time.time())
+                calibration_journal.write_journal(
+                    journal, path=self.input_shaper_journal_path)
+            raise
+
+    def _verify_expected_values(self, expected):
+        """Checks a journal's expected_values dict against the real,
+        just-reloaded printer config/state - shared by every workflow's
+        post-restart verification in _handle_ready() below, since each
+        workflow only ever populates the small subset of keys it knows
+        about and this method simply ignores keys that aren't present."""
         errors = []
-        probe_obj = self.printer.lookup_object('probe', None)
         expected_z_offset = expected.get('bltouch.z_offset')
         if expected_z_offset is not None:
+            probe_obj = self.printer.lookup_object('probe', None)
             if probe_obj is None:
                 errors.append('probe object is not configured')
             else:
@@ -1129,6 +1282,56 @@ class NebulaOSCalibration:
                 errors.append(
                     'bed_mesh.profile: expected %r, found %r'
                     % (expected_profile, actual_profile))
+        input_shaper_keys = (
+            'input_shaper.shaper_type_x', 'input_shaper.shaper_freq_x',
+            'input_shaper.shaper_type_y', 'input_shaper.shaper_freq_y')
+        if any(k in expected for k in input_shaper_keys):
+            input_shaper_obj = self.printer.lookup_object(
+                'input_shaper', None)
+            shapers_by_axis = (
+                {s.axis: s for s in input_shaper_obj.get_shapers()}
+                if input_shaper_obj is not None else {})
+            for axis in ('x', 'y'):
+                expected_type = expected.get(
+                    'input_shaper.shaper_type_%s' % (axis,))
+                expected_freq = expected.get(
+                    'input_shaper.shaper_freq_%s' % (axis,))
+                if expected_type is None and expected_freq is None:
+                    continue
+                shaper = shapers_by_axis.get(axis)
+                if shaper is None:
+                    errors.append(
+                        'input_shaper axis %s is not configured' % (axis,))
+                    continue
+                if (expected_type is not None
+                        and shaper.params.shaper_type != expected_type):
+                    errors.append(
+                        'input_shaper.shaper_type_%s: expected %r, found %r'
+                        % (axis, expected_type, shaper.params.shaper_type))
+                if (expected_freq is not None
+                        and abs(shaper.params.shaper_freq - expected_freq)
+                        > 0.05):
+                    errors.append(
+                        'input_shaper.shaper_freq_%s: expected %.3f, '
+                        'found %.3f'
+                        % (axis, expected_freq, shaper.params.shaper_freq))
+        return errors
+
+    def _verify_journal_at_path(self, path):
+        """Reads one on-disk journal and, if it shows a commit that was
+        requested but never verified, checks it and writes the result
+        back - returns the (possibly updated) journal dict, or None if
+        there was nothing to verify. Shared body of _handle_ready() below,
+        called once per known journal file (auto_calibrate's own
+        self.journal_path, input_shaper's own self.input_shaper_journal_
+        path, ...) since each guided workflow keeps a separate journal
+        file on purpose (see input_shaper_journal_path's own __init__
+        comment)."""
+        journal = calibration_journal.read_journal(path=path)
+        if journal is None or not journal.get('verification_pending'):
+            return None
+        expected = journal.get('expected_values') or {}
+        errors = self._verify_expected_values(expected)
         now = time.time()
         if errors:
             calibration_journal.mark_verification_result(
@@ -1138,14 +1341,42 @@ class NebulaOSCalibration:
             calibration_journal.mark_verification_result(
                 journal, success=True, result=dict(expected), error=None,
                 now=now)
-        calibration_journal.write_journal(journal, path=self.journal_path)
-        if journal['calibration_id'] == self.auto_calibrate_id or (
-                self.auto_calibrate_id == 0):
+        calibration_journal.write_journal(journal, path=path)
+        return journal
+
+    def _handle_ready(self, *args):
+        """klippy:ready - runs on EVERY klippy startup, including the one
+        immediately after NEBULAOS_AUTO_CALIBRATE's (or NEBULAOS_INPUT_
+        SHAPER_CALIBRATE's) own SAVE_CONFIG restart. Reads each guided
+        workflow's own on-disk journal (never the in-memory status, which
+        is always fresh/empty in a new process) and, for any journal that
+        shows a commit that was requested but never verified, checks the
+        real, just-reloaded config against what was expected and records
+        the result - the only code path that ever clears
+        verification_pending. A journal showing anything else (no file, or
+        an already-verified/errored/cancelled state) is left untouched -
+        this only ever acts on a genuine "restart just happened,
+        verification still owed" case."""
+        journal = self._verify_journal_at_path(self.journal_path)
+        if journal is not None and (
+                journal['calibration_id'] == self.auto_calibrate_id
+                or self.auto_calibrate_id == 0):
             self.auto_calibrate_id = journal['calibration_id']
             self.auto_calibrate_state = journal['state']
             self.auto_calibrate_stage = journal['stage']
             self.auto_calibrate_error = journal['error']
             self.auto_calibrate_result = journal['result']
+
+        input_shaper_journal = self._verify_journal_at_path(
+            self.input_shaper_journal_path)
+        if input_shaper_journal is not None and (
+                input_shaper_journal['calibration_id'] == self.input_shaper_id
+                or self.input_shaper_id == 0):
+            self.input_shaper_id = input_shaper_journal['calibration_id']
+            self.input_shaper_state = input_shaper_journal['state']
+            self.input_shaper_stage = input_shaper_journal['stage']
+            self.input_shaper_error = input_shaper_journal['error']
+            self.input_shaper_result = input_shaper_journal['result']
 
     # ------------------------------------------------------------------
     # NEBULAOS_CALIBRATION_STATUS
@@ -1164,6 +1395,11 @@ class NebulaOSCalibration:
             "auto_calibrate_stage=%s auto_calibrate_error=%s"
             % (status['auto_calibrate_state'], status['auto_calibrate_stage'],
                status['auto_calibrate_error']))
+        gcmd.respond_info(
+            "NEBULAOS_CALIBRATION_STATUS: input_shaper_state=%s "
+            "input_shaper_stage=%s input_shaper_error=%s"
+            % (status['input_shaper_state'], status['input_shaper_stage'],
+               status['input_shaper_error']))
 
 
 def load_config(config):

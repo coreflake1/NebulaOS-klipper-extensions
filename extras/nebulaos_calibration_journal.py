@@ -60,6 +60,28 @@ STAGES = (
     'post_restart_verification',
 )
 
+# Stage identifiers for NEBULAOS_INPUT_SHAPER_CALIBRATE (mission §13) - a
+# separate, much shorter workflow from auto_calibrate's own STAGES above:
+# no thermal staging (resonance testing is done cold), and no relocation
+# step between the X and Y measurements, because this unit's ADXL345 is
+# fixed-mounted on the SoC via a real SPI bus (machine.cfg's own
+# [adxl345]/cs_pin: rpi:None), not a DIY clip-on sensor moved between axes
+# - upstream's own `SHAPER_CALIBRATE` (no AXIS=) already measures both X
+# and Y in one command. 'commit' and 'post_restart_verification' are
+# spelled identically to STAGES above on purpose: mark_commit_requested()/
+# mark_verification_result() below call advance_stage() with their
+# default `stages=STAGES` argument, and both of those two specific names
+# must therefore validate against either tuple.
+INPUT_SHAPER_STAGES = (
+    'preflight',
+    'home',
+    'measure',
+    'final_validation',
+    'commit',
+    'restart',
+    'post_restart_verification',
+)
+
 # Journal-level state (distinct from STAGES: state is the ENGINE's own
 # transaction status; stage is WHICH step of the workflow it refers to).
 STATE_RUNNING = 'running'
@@ -96,12 +118,17 @@ def new_journal(calibration_id, workflow, now):
     }
 
 
-def advance_stage(journal, stage, now):
+def advance_stage(journal, stage, now, stages=STAGES):
     """Mark `stage` as the current stage and append the PREVIOUS current
     stage (if any) to completed_stages - called once per stage transition,
     BEFORE that stage's own work runs, so a journal read mid-crash always
-    shows the stage that was in progress, not the last one that finished."""
-    if stage not in STAGES:
+    shows the stage that was in progress, not the last one that finished.
+
+    `stages` is the valid-stage-name tuple to validate against - defaults
+    to STAGES (auto_calibrate's own workflow) so every existing caller is
+    unaffected; a caller running a different workflow (e.g.
+    INPUT_SHAPER_STAGES) passes its own tuple explicitly."""
+    if stage not in stages:
         raise ValueError("unknown calibration stage %r" % (stage,))
     prev = journal.get('stage')
     if prev is not None and prev not in journal['completed_stages']:

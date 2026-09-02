@@ -623,7 +623,8 @@ class UpstreamFirstCleanupTest(unittest.TestCase):
             sorted(gcode.commands.keys()),
             ['NEBULAOS_AUTO_CALIBRATE',
              'NEBULAOS_CALIBRATION_CANCEL', 'NEBULAOS_CALIBRATION_STATUS',
-             'NEBULAOS_ESTEPS_CALIBRATE', 'NEBULAOS_Z_OFFSET_CALIBRATE'])
+             'NEBULAOS_ESTEPS_CALIBRATE', 'NEBULAOS_INPUT_SHAPER_CALIBRATE',
+             'NEBULAOS_Z_OFFSET_CALIBRATE'])
 
     def test_no_axis_twist_calibrate_command_or_state(self):
         # Mission §21: NEBULAOS_AXIS_TWIST_CALIBRATE and every axis_twist_*
@@ -1233,6 +1234,238 @@ class PostRestartVerificationTest(unittest.TestCase):
         printer.send_event('klippy:ready')
         after = calibration_journal.read_journal(path=self.journal_path)
         self.assertEqual(before, after)
+
+
+# ----------------------------------------------------------------------
+# NEBULAOS_INPUT_SHAPER_CALIBRATE (mission §13)
+# ----------------------------------------------------------------------
+class FakeAxisShaperParams:
+    def __init__(self, shaper_type='mzv', shaper_freq=0.0):
+        self.shaper_type = shaper_type
+        self.shaper_freq = shaper_freq
+
+
+class FakeAxisShaper:
+    def __init__(self, axis, shaper_type='mzv', shaper_freq=0.0):
+        self.axis = axis
+        self.params = FakeAxisShaperParams(shaper_type, shaper_freq)
+
+
+class FakeInputShaper:
+    """Stands in for the real registered 'input_shaper' object. Its own
+    x/y AxisInputShaper-alikes start with shaper_freq=0.0 (upstream's own
+    real default when nothing has ever been calibrated) - a test's fake
+    SHAPER_CALIBRATE handler mutates .params in place, exactly like real
+    ShaperCalibrate.apply_params()'s SET_INPUT_SHAPER call does."""
+
+    def __init__(self):
+        self.x = FakeAxisShaper('x')
+        self.y = FakeAxisShaper('y')
+        self.z = FakeAxisShaper('z')
+
+    def get_shapers(self):
+        return [self.x, self.y, self.z]
+
+
+def _build_input_shaper_calibrate(
+        config_overrides=None, shaper_calibrate_ok=True,
+        result_x=('mzv', 45.3), result_y=('ei', 38.7),
+        include_resonance_tester=True, include_input_shaper=True):
+    printer = fake.FakePrinter()
+    gcode = DispatchingFakeGCode()
+    printer.add_object('gcode', gcode)
+    printer.add_object('probe', FakeProbeObj())
+    printer.add_object('configfile', FakeConfigFile())
+    if include_resonance_tester:
+        printer.add_object('resonance_tester', object())
+    input_shaper_obj = FakeInputShaper()
+    if include_input_shaper:
+        printer.add_object('input_shaper', input_shaper_obj)
+
+    def fake_shaper_calibrate(gcmd):
+        if not shaper_calibrate_ok:
+            raise fake.CommandError("SHAPER_CALIBRATE: simulated failure")
+        input_shaper_obj.x.params.shaper_type = result_x[0]
+        input_shaper_obj.x.params.shaper_freq = result_x[1]
+        input_shaper_obj.y.params.shaper_type = result_y[0]
+        input_shaper_obj.y.params.shaper_freq = result_y[1]
+    gcode.commands['SHAPER_CALIBRATE'] = fake_shaper_calibrate
+
+    values = dict(config_overrides or {})
+    values.setdefault('reference_x', '20')
+    values.setdefault('reference_y', '25')
+    config = fake.FakeConfig(values, section='nebulaos_calibration', printer=printer)
+    coordinator = nebulaos_calibration.NebulaOSCalibration(config)
+    config.assert_all_consumed()
+    return printer, gcode, coordinator, input_shaper_obj
+
+
+class InputShaperCalibrateTest(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.journal_path = os.path.join(self.tmpdir, 'input_shaper_journal.json')
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _build(self, **kwargs):
+        overrides = {'input_shaper_journal_path': self.journal_path}
+        overrides.update(kwargs.pop('config_overrides', None) or {})
+        return _build_input_shaper_calibrate(
+            config_overrides=overrides, **kwargs)
+
+    def test_happy_path_runs_g28_then_shaper_calibrate_then_commits(self):
+        printer, gcode, coord, _ = self._build(
+            result_x=('mzv', 45.3), result_y=('ei', 38.7))
+        with self.assertRaises(RestartTriggered):
+            coord.cmd_input_shaper_calibrate(fake.FakeGCmd({}))
+        self.assertEqual(gcode.scripts_run,
+                          ['G28', 'SHAPER_CALIBRATE', 'SAVE_CONFIG'])
+        journal = calibration_journal.read_journal(path=self.journal_path)
+        self.assertEqual(
+            journal['state'], calibration_journal.STATE_COMMIT_REQUESTED)
+        self.assertEqual(journal['expected_values'], {
+            'input_shaper.shaper_type_x': 'mzv',
+            'input_shaper.shaper_freq_x': 45.3,
+            'input_shaper.shaper_type_y': 'ei',
+            'input_shaper.shaper_freq_y': 38.7,
+        })
+        self.assertEqual(coord.input_shaper_stage, 'commit')
+
+    def test_missing_resonance_tester_raises_before_any_motion(self):
+        printer, gcode, coord, _ = self._build(include_resonance_tester=False)
+        with self.assertRaises(fake.CommandError):
+            coord.cmd_input_shaper_calibrate(fake.FakeGCmd({}))
+        self.assertEqual(gcode.scripts_run, [])
+        self.assertEqual(coord.input_shaper_state, 'error')
+
+    def test_missing_input_shaper_object_raises_before_any_motion(self):
+        printer, gcode, coord, _ = self._build(include_input_shaper=False)
+        with self.assertRaises(fake.CommandError):
+            coord.cmd_input_shaper_calibrate(fake.FakeGCmd({}))
+        self.assertEqual(gcode.scripts_run, [])
+
+    def test_zero_freq_result_on_one_axis_is_rejected_before_commit(self):
+        printer, gcode, coord, _ = self._build(result_y=('mzv', 0.0))
+        with self.assertRaises(fake.CommandError):
+            coord.cmd_input_shaper_calibrate(fake.FakeGCmd({}))
+        self.assertNotIn('SAVE_CONFIG', gcode.scripts_run)
+        self.assertEqual(coord.input_shaper_state, 'error')
+        journal = calibration_journal.read_journal(path=self.journal_path)
+        self.assertEqual(journal['state'], calibration_journal.STATE_ERROR)
+
+    def test_shaper_calibrate_failure_never_reaches_commit(self):
+        printer, gcode, coord, _ = self._build(shaper_calibrate_ok=False)
+        with self.assertRaises(fake.CommandError):
+            coord.cmd_input_shaper_calibrate(fake.FakeGCmd({}))
+        self.assertEqual(gcode.scripts_run, ['G28', 'SHAPER_CALIBRATE'])
+        journal = calibration_journal.read_journal(path=self.journal_path)
+        self.assertEqual(journal['state'], calibration_journal.STATE_ERROR)
+
+    def test_cannot_start_second_run_while_one_is_in_progress(self):
+        printer, gcode, coord, _ = self._build()
+        coord.input_shaper_state = 'running'
+        with self.assertRaises(fake.CommandError):
+            coord.cmd_input_shaper_calibrate(fake.FakeGCmd({}))
+        self.assertEqual(gcode.scripts_run, [])
+
+    def test_status_fields_present_and_idle_by_default(self):
+        printer, gcode, coord, _ = self._build()
+        status = coord.get_status(0.0)
+        self.assertEqual(status['input_shaper_state'], 'idle')
+        self.assertIsNone(status['input_shaper_stage'])
+        self.assertIsNone(status['input_shaper_error'])
+        self.assertIsNone(status['input_shaper_result'])
+
+
+class InputShaperPostRestartVerificationTest(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.journal_path = os.path.join(self.tmpdir, 'input_shaper_journal.json')
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _write_pending_journal(self, expected_values):
+        j = calibration_journal.new_journal(1, 'input_shaper_calibrate', now=0.0)
+        calibration_journal.mark_commit_requested(j, expected_values, now=1.0)
+        calibration_journal.write_journal(j, path=self.journal_path)
+        return j
+
+    def test_matching_shaper_params_after_restart_marks_complete(self):
+        self._write_pending_journal({
+            'input_shaper.shaper_type_x': 'mzv',
+            'input_shaper.shaper_freq_x': 45.3,
+            'input_shaper.shaper_type_y': 'ei',
+            'input_shaper.shaper_freq_y': 38.7,
+        })
+        printer, gcode, coord, input_shaper_obj = _build_input_shaper_calibrate(
+            config_overrides={'input_shaper_journal_path': self.journal_path})
+        input_shaper_obj.x.params.shaper_type = 'mzv'
+        input_shaper_obj.x.params.shaper_freq = 45.3
+        input_shaper_obj.y.params.shaper_type = 'ei'
+        input_shaper_obj.y.params.shaper_freq = 38.7
+        printer.send_event('klippy:ready')
+        journal = calibration_journal.read_journal(path=self.journal_path)
+        self.assertEqual(journal['state'], calibration_journal.STATE_COMPLETE)
+        self.assertEqual(coord.input_shaper_state, calibration_journal.STATE_COMPLETE)
+
+    def test_mismatched_shaper_freq_after_restart_marks_error(self):
+        self._write_pending_journal({
+            'input_shaper.shaper_type_x': 'mzv',
+            'input_shaper.shaper_freq_x': 45.3,
+        })
+        printer, gcode, coord, input_shaper_obj = _build_input_shaper_calibrate(
+            config_overrides={'input_shaper_journal_path': self.journal_path})
+        input_shaper_obj.x.params.shaper_type = 'mzv'
+        input_shaper_obj.x.params.shaper_freq = 12.0
+        printer.send_event('klippy:ready')
+        journal = calibration_journal.read_journal(path=self.journal_path)
+        self.assertEqual(journal['state'], calibration_journal.STATE_ERROR)
+        self.assertIn('shaper_freq_x', journal['error'])
+
+    def test_missing_input_shaper_object_after_restart_marks_error(self):
+        self._write_pending_journal({'input_shaper.shaper_type_x': 'mzv'})
+        printer, gcode, coord, _ = _build_input_shaper_calibrate(
+            config_overrides={'input_shaper_journal_path': self.journal_path},
+            include_input_shaper=False)
+        printer.send_event('klippy:ready')
+        journal = calibration_journal.read_journal(path=self.journal_path)
+        self.assertEqual(journal['state'], calibration_journal.STATE_ERROR)
+
+    def test_auto_calibrate_and_input_shaper_journals_are_independent(self):
+        # A pending auto_calibrate journal at the DEFAULT journal_path must
+        # not be disturbed by input-shaper verification, and vice versa -
+        # they are two separate files by design (see input_shaper_journal_
+        # path's own __init__ comment).
+        # 1.795 matches FakeProbeObj()'s own default z_offset - _build_
+        # input_shaper_calibrate() below has no probe_obj= parameter, so
+        # this test uses that same default rather than introducing one.
+        auto_journal_path = os.path.join(self.tmpdir, 'auto_journal.json')
+        aj = calibration_journal.new_journal(1, 'auto_calibrate', now=0.0)
+        calibration_journal.mark_commit_requested(
+            aj, {'bltouch.z_offset': 1.795, 'bed_mesh.profile': 'default'},
+            now=1.0)
+        calibration_journal.write_journal(aj, path=auto_journal_path)
+        self._write_pending_journal({
+            'input_shaper.shaper_type_x': 'mzv',
+            'input_shaper.shaper_freq_x': 45.3,
+        })
+        printer, gcode, coord, input_shaper_obj = _build_input_shaper_calibrate(
+            config_overrides={
+                'input_shaper_journal_path': self.journal_path,
+                'journal_path': auto_journal_path,
+            })
+        printer.add_object('bed_mesh', FakeBedMesh(profile_name='default'))
+        input_shaper_obj.x.params.shaper_type = 'mzv'
+        input_shaper_obj.x.params.shaper_freq = 45.3
+        printer.send_event('klippy:ready')
+        auto_journal = calibration_journal.read_journal(path=auto_journal_path)
+        input_shaper_journal = calibration_journal.read_journal(path=self.journal_path)
+        self.assertEqual(auto_journal['state'], calibration_journal.STATE_COMPLETE)
+        self.assertEqual(input_shaper_journal['state'], calibration_journal.STATE_COMPLETE)
+        self.assertEqual(coord.auto_calibrate_state, calibration_journal.STATE_COMPLETE)
+        self.assertEqual(coord.input_shaper_state, calibration_journal.STATE_COMPLETE)
 
 
 # ----------------------------------------------------------------------
