@@ -5,15 +5,16 @@
 # NEBULAOS_* public calibration API. Implemented: standalone
 # NEBULAOS_Z_OFFSET_CALIBRATE (LOAD_CELL only, bounded-descent envelope +
 # measurement-quality/repeatability gating, plus its SIMULATE_BOOTSTRAP=1
-# qualification aid - mission §8); NEBULAOS_AXIS_TWIST_CALIBRATE (AXIS=X|
-# Y|BOTH - see "Axis Twist" section below: HARD BLOCKED pending remote
-# load-cell contact hardware qualification); NEBULAOS_AUTO_CALIBRATE, the
+# qualification aid - mission §8); NEBULAOS_AUTO_CALIBRATE, the
 # fully-automatic preflight->home->PID->nozzle-clean->Z-offset->bed-mesh->
 # one-SAVE_CONFIG-restart-and-verify sequence (mission §11), backed by
 # nebulaos_calibration_journal.py's persistent transaction journal (mission
-# §12) and NEBULAOS_CALIBRATION_CANCEL. The guided Input Shaper/E-Steps
-# workflows (separate commands, not part of NEBULAOS_AUTO_CALIBRATE - see
-# the Phase 2 mission document's own §13/§14) are NOT part of this slice.
+# §12) and NEBULAOS_CALIBRATION_CANCEL. Automatic Axis Twist is a final
+# product decision to NOT support (see "Axis Twist" section below) -
+# NEBULAOS_AXIS_TWIST_CALIBRATE has been removed entirely, not merely
+# blocked. The guided Input Shaper/E-Steps workflows (separate commands,
+# not part of NEBULAOS_AUTO_CALIBRATE - see the Phase 2 mission
+# document's own §13/§14) are NOT part of this slice.
 #
 # ---------------------------------------------------------------------
 # Upstream-first cleanup (Overnight Contact-Safety Stabilization mission)
@@ -43,31 +44,25 @@
 # gcode_macro convenience wrappers instead.
 #
 # ---------------------------------------------------------------------
-# Axis Twist: automatic (LOAD_CELL) path is HARD BLOCKED
+# Axis Twist: automatic (LOAD_CELL) path REMOVED - product decision
 # ---------------------------------------------------------------------
-# NEBULAOS_AXIS_TWIST_CALIBRATE remains NebulaOS-owned - upstream provides
-# no automatic load-cell nozzle-reference frontend, and one is genuinely
-# useful once the underlying contact primitive is hardware-qualified for
-# REMOTE bed points (away from [nebulaos_z_offset_probe]'s own qualified
-# reference point - see the real safety incident this whole mission is
-# built on, _evidence/overnight-hx711-investigation-20260831-233518/
-# REPORT.md). That qualification has NOT happened. Until it does, this
-# command performs ZERO movement, ZERO nozzle contact, and ZERO
-# compensation/config changes for any AXIS value - see
-# cmd_axis_twist_calibrate() below, which returns a structured
-# REMOTE_LOAD_CELL_CONTACT_UNQUALIFIED error before looking up any
-# hardware object at all. There is deliberately no unsafe public override.
+# Phase 2 mission, final product decision (2026-09): automatic (remote
+# load-cell contact) Axis Twist is UNSUPPORTED on the Ender-3 V3 KE and
+# will not ship. NEBULAOS_AXIS_TWIST_CALIBRATE, axis_twist_bed_points(),
+# axis_twist_geometry_preflight(), and every axis_twist_* status field
+# that existed only to support that abandoned command have been removed
+# entirely (they previously existed hard-blocked, then dead/unwired,
+# pending a hardware qualification that was cancelled rather than
+# completed - see the real safety incident that originally motivated the
+# hard block, _evidence/overnight-hx711-investigation-20260831-233518/
+# REPORT.md, and the Aug 31 qualification evidence this decision
+# supersedes, _evidence/phase2-axis-twist-qualification-20260831-203913/).
 #
-# The corrected pure geometry-preflight math this future qualification
-# will need (axis_twist_geometry_preflight() below) is implemented and
-# fully tested now, but is NOT wired to any live motion path - it is dead
-# code from cmd_axis_twist_calibrate's point of view until a future
-# mission re-enables the LOAD_CELL path. Its own header comment explains
-# the transform and the real analysis mistake (sign error) an earlier
-# session made and then corrected by reading nebulaos_probe_pair.py's real
-# code, not re-deriving it - the SAME subtraction-based transform is used
-# in both places for exactly that reason (a second, potentially-divergent
-# copy of this math is the failure mode being avoided).
+# Manual Axis Twist is NOT affected and needs no wrapper here: call
+# pristine upstream AXIS_TWIST_COMPENSATION_CALIBRATE (AXIS=X or AXIS=Y)
+# directly - see klippy/extras/axis_twist_compensation.py (58bd67db...,
+# NOT modified, NOT shadowed). Its own [axis_twist_compensation] config
+# section and calibrate_start/end_x/y geometry remain untouched.
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import math
@@ -77,113 +72,6 @@ from . import nebulaos_probe_pair
 from . import nebulaos_calibration_journal as calibration_journal
 
 _MAX_ERROR_LEN = 200
-
-# Matches upstream's own axis_twist_compensation.py DEFAULT_SAMPLE_COUNT.
-_DEFAULT_AXIS_TWIST_SAMPLE_COUNT = 3
-
-
-def axis_twist_bed_points(compensation, axis, sample_count):
-    """Reproduces ONLY the linear-interpolation bed-point arithmetic from
-    pinned upstream klippy/extras/axis_twist_compensation.py's
-    Calibrater.cmd_AXIS_TWIST_COMPENSATION_CALIBRATE (58bd67db..., the
-    'if axis == "X" / elif axis == "Y"' block) - upstream does not expose
-    this as a separately-callable helper. `compensation` is the real,
-    already-configured AxisTwistCompensation object (its calibrate_start_x/
-    end_x/y and calibrate_start_y/end_y/x are the same six config values
-    Calibrater's own __init__ already reads for x_start_point/x_end_point/
-    y_start_point/y_end_point - this function deliberately reads them from
-    the SAME object, not a second copy, so the two can never disagree).
-    Returns a list of (x, y) bed-frame nozzle-target points, matching
-    upstream's own bed_points list exactly (in order)."""
-    if axis == 'X':
-        start = (compensation.calibrate_start_x, compensation.calibrate_y)
-        end = (compensation.calibrate_end_x, compensation.calibrate_y)
-        if start[0] is None or end[0] is None or start[1] is None:
-            raise ValueError(
-                "axis_twist_compensation for X axis requires "
-                "calibrate_start_x, calibrate_end_x and calibrate_y to be defined")
-        axis_range = end[0] - start[0]
-        interval = axis_range / (sample_count - 1)
-        return [(start[0] + i * interval, start[1]) for i in range(sample_count)]
-    elif axis == 'Y':
-        start = (compensation.calibrate_x, compensation.calibrate_start_y)
-        end = (compensation.calibrate_x, compensation.calibrate_end_y)
-        if start[1] is None or end[1] is None or start[0] is None:
-            raise ValueError(
-                "axis_twist_compensation for Y axis requires "
-                "calibrate_start_y, calibrate_end_y and calibrate_x to be defined")
-        axis_range = end[1] - start[1]
-        interval = axis_range / (sample_count - 1)
-        return [(start[0], start[1] + i * interval) for i in range(sample_count)]
-    else:
-        raise ValueError("axis_twist_bed_points: axis must be 'X' or 'Y', got %r" % (axis,))
-
-
-def axis_twist_geometry_preflight(axis, bed_points, probe_x_offset,
-                                   probe_y_offset, axis_minimum,
-                                   axis_maximum, safety_margin_mm=0.0):
-    """Pure geometry validation for an Axis Twist LOAD_CELL calibration run
-    - NO printer/toolhead access, NO movement of any kind, safe to call at
-    any time (including before homing). NOT currently reachable from
-    cmd_axis_twist_calibrate() - see this module's own header comment on
-    why the LOAD_CELL path is hard blocked - but implemented and tested
-    now so a future qualification mission has a correct, ready-made check
-    to wire in rather than deriving this again.
-
-    For each nozzle-frame bed point `P` (as returned by
-    axis_twist_bed_points), computes BOTH carriage targets a real
-    calibration run would need to reach:
-        nozzle_carriage_target = P                          (no offset)
-        probe_carriage_target  = P - (probe_x_offset, probe_y_offset)
-    - the SAME subtraction-based transform nebulaos_probe_pair.py's real,
-    hardware-qualified measure_probe_nozzle_pair() uses (confirmed
-    directly against its source, not re-derived a second, potentially-
-    divergent way - see this module's header comment for why an earlier,
-    ADDITION-based version of this exact check was wrong and led to a real
-    live-session safety incident).
-
-    Validates the axis this run cares about (X for axis=='X', Y for
-    axis=='Y') on BOTH targets against [axis_minimum, axis_maximum],
-    shrunk on both ends by safety_margin_mm. Returns the ordered list of
-    (nozzle_target, probe_target) pairs on success. Raises ValueError
-    naming the FIRST invalid point (and whether it was the nozzle or probe
-    target) on failure - never silently clamps, skips, or adjusts an
-    endpoint.
-    """
-    if axis not in ('X', 'Y'):
-        raise ValueError(
-            "axis_twist_geometry_preflight: axis must be 'X' or 'Y', got %r"
-            % (axis,))
-    axis_index = 0 if axis == 'X' else 1
-    lo = axis_minimum + safety_margin_mm
-    hi = axis_maximum - safety_margin_mm
-    offset = probe_x_offset if axis == 'X' else probe_y_offset
-
-    results = []
-    for i, point in enumerate(bed_points):
-        nozzle_target = point
-        probe_target = (point[0] - probe_x_offset, point[1] - probe_y_offset)
-
-        nozzle_value = nozzle_target[axis_index]
-        probe_value = probe_target[axis_index]
-
-        if not (lo <= nozzle_value <= hi):
-            raise ValueError(
-                "axis_twist_geometry_preflight: AXIS=%s point %d/%d - "
-                "nozzle carriage target %.3f is outside [%.3f, %.3f] "
-                "(safety_margin_mm=%.3f)"
-                % (axis, i + 1, len(bed_points), nozzle_value, lo, hi,
-                   safety_margin_mm))
-        if not (lo <= probe_value <= hi):
-            raise ValueError(
-                "axis_twist_geometry_preflight: AXIS=%s point %d/%d - "
-                "probe carriage target %.3f (offset=%.3f) is outside "
-                "[%.3f, %.3f] (safety_margin_mm=%.3f)"
-                % (axis, i + 1, len(bed_points), probe_value, offset, lo,
-                   hi, safety_margin_mm))
-
-        results.append((nozzle_target, probe_target))
-    return results
 
 
 def _sanitize_error(exc):
@@ -342,9 +230,6 @@ class NebulaOSCalibration:
             'max_repeatability_range', default=0.15, minval=0.001, maxval=10.)
         self.max_repeatability_stddev = config.getfloat(
             'max_repeatability_stddev', default=0.06, minval=0.001, maxval=10.)
-        self.axis_twist_sample_count = config.getint(
-            'axis_twist_sample_count', default=_DEFAULT_AXIS_TWIST_SAMPLE_COUNT,
-            minval=2)
 
         # NEBULAOS_AUTO_CALIBRATE (mission §11). pid_bed_target/
         # pid_hotend_target are the PID-tune targets only (PID_CALIBRATE's
@@ -431,25 +316,6 @@ class NebulaOSCalibration:
         self.bootstrap_sim_raw_probe_trigger_z = None
         self.bootstrap_sim_commanded_floor_z = None
 
-        # Axis Twist state - kept PER AXIS (not one shared state) so
-        # AXIS=BOTH's status can distinguish X progress from Y progress,
-        # and so recalibrating one axis never disturbs the other's last
-        # known result in this module's own status view (the underlying
-        # upstream object's own compensation arrays already have this
-        # property independently - see clear_compensations(axis) - this
-        # just mirrors it in the status model).
-        self.axis_twist_id = 0
-        self.axis_twist_method = None
-        self.axis_twist_current_axis = None  # the sub-axis actively running now, or None
-        self.axis_twist_sample_index = 0
-        self.axis_twist_sample_total = 0
-        self.axis_twist_x_state = 'idle'
-        self.axis_twist_x_result = None
-        self.axis_twist_x_error = None
-        self.axis_twist_y_state = 'idle'
-        self.axis_twist_y_result = None
-        self.axis_twist_y_error = None
-
         # NEBULAOS_AUTO_CALIBRATE / journal state (mission §11/§12).
         # auto_calibrate_stage mirrors calibration_journal.STAGES; the
         # journal itself is the crash-safe copy of this same information
@@ -471,9 +337,6 @@ class NebulaOSCalibration:
         self.gcode.register_command(
             'NEBULAOS_CALIBRATION_STATUS', self.cmd_calibration_status,
             desc=self.cmd_calibration_status_help)
-        self.gcode.register_command(
-            'NEBULAOS_AXIS_TWIST_CALIBRATE', self.cmd_axis_twist_calibrate,
-            desc=self.cmd_axis_twist_calibrate_help)
         self.gcode.register_command(
             'NEBULAOS_AUTO_CALIBRATE', self.cmd_auto_calibrate,
             desc=self.cmd_auto_calibrate_help)
@@ -543,17 +406,6 @@ class NebulaOSCalibration:
             'bootstrap_sim_envelope_mm': self.bootstrap_sim_envelope_mm,
             'bootstrap_sim_raw_probe_trigger_z': self.bootstrap_sim_raw_probe_trigger_z,
             'bootstrap_sim_commanded_floor_z': self.bootstrap_sim_commanded_floor_z,
-            'axis_twist_id': self.axis_twist_id,
-            'axis_twist_method': self.axis_twist_method,
-            'axis_twist_current_axis': self.axis_twist_current_axis,
-            'axis_twist_sample_index': self.axis_twist_sample_index,
-            'axis_twist_sample_total': self.axis_twist_sample_total,
-            'axis_twist_x_state': self.axis_twist_x_state,
-            'axis_twist_x_result': self.axis_twist_x_result,
-            'axis_twist_x_error': self.axis_twist_x_error,
-            'axis_twist_y_state': self.axis_twist_y_state,
-            'axis_twist_y_result': self.axis_twist_y_result,
-            'axis_twist_y_error': self.axis_twist_y_error,
             'auto_calibrate_id': self.auto_calibrate_id,
             'auto_calibrate_state': self.auto_calibrate_state,
             'auto_calibrate_stage': self.auto_calibrate_stage,
@@ -1091,71 +943,6 @@ class NebulaOSCalibration:
             self.auto_calibrate_result = journal['result']
 
     # ------------------------------------------------------------------
-    # NEBULAOS_AXIS_TWIST_CALIBRATE
-    # ------------------------------------------------------------------
-    cmd_axis_twist_calibrate_help = (
-        "Automatic Axis Twist (AXIS=X|Y|BOTH) - HARD BLOCKED pending "
-        "remote load-cell contact hardware qualification; use pristine "
-        "upstream AXIS_TWIST_COMPENSATION_CALIBRATE for a manual run")
-
-    _REMOTE_LOAD_CELL_CONTACT_UNQUALIFIED_MSG = (
-        "REMOTE_LOAD_CELL_CONTACT_UNQUALIFIED: automatic Axis Twist "
-        "calibration is hard-blocked - HX711 nozzle contact at a REMOTE "
-        "bed point (away from [nebulaos_z_offset_probe]'s own qualified "
-        "reference point) has not been hardware-qualified. Zero movement, "
-        "zero nozzle contact, and zero compensation/config changes were "
-        "made. For a manual calibration, call pristine upstream "
-        "AXIS_TWIST_COMPENSATION_CALIBRATE AXIS=%s directly.")
-
-    def cmd_axis_twist_calibrate(self, gcmd):
-        """Phase 2 contact-safety mission (§4/§14): this command is now
-        ONLY the automatic (load-cell) Axis Twist frontend - there is no
-        METHOD=MANUAL passthrough any more (see this module's own header
-        comment: call pristine upstream AXIS_TWIST_COMPENSATION_CALIBRATE
-        directly for a manual run, it needs no wrapper). The automatic
-        path itself is hard-blocked pending hardware qualification of
-        remote HX711 nozzle contact: this handler performs ZERO printer
-        object lookups and ZERO motion for any AXIS value - it cannot
-        accidentally touch hardware even if a future edit here got the
-        gating logic below wrong, because there is no hardware-touching
-        code left to reach at all.
-        """
-        # AXIS has no default on purpose - per this project's own rules,
-        # ambiguous input must never silently select a (potentially
-        # unsafe/unintended) axis, even for a status/error response.
-        axis = gcmd.get('AXIS', None)
-        if axis is None:
-            raise self.printer.command_error(
-                "NEBULAOS_AXIS_TWIST_CALIBRATE: AXIS=X|Y|BOTH is required")
-        axis = axis.upper()
-        if axis not in ('X', 'Y', 'BOTH'):
-            raise self.printer.command_error(
-                "NEBULAOS_AXIS_TWIST_CALIBRATE: unknown AXIS='%s' - "
-                "expected X, Y, or BOTH" % (axis,))
-
-        self.axis_twist_id += 1
-        self.axis_twist_method = 'LOAD_CELL'
-        self.axis_twist_current_axis = None
-        msg = self._REMOTE_LOAD_CELL_CONTACT_UNQUALIFIED_MSG % (
-            axis if axis != 'BOTH' else 'X (and separately AXIS=Y)')
-        if axis in ('X', 'BOTH'):
-            self._axis_twist_set_axis_state('X', 'capability_unqualified', None, msg)
-        if axis in ('Y', 'BOTH'):
-            self._axis_twist_set_axis_state('Y', 'capability_unqualified', None, msg)
-        raise self.printer.command_error(
-            "NEBULAOS_AXIS_TWIST_CALIBRATE: %s" % (msg,))
-
-    def _axis_twist_set_axis_state(self, axis, state, result, error):
-        if axis == 'X':
-            self.axis_twist_x_state = state
-            self.axis_twist_x_result = result
-            self.axis_twist_x_error = error
-        else:
-            self.axis_twist_y_state = state
-            self.axis_twist_y_result = result
-            self.axis_twist_y_error = error
-
-    # ------------------------------------------------------------------
     # NEBULAOS_CALIBRATION_STATUS
     # ------------------------------------------------------------------
     cmd_calibration_status_help = "Report the current NebulaOS calibration status"
@@ -1168,15 +955,10 @@ class NebulaOSCalibration:
             % (status['z_offset_state'], status['z_offset_id'],
                status['z_offset_result'], status['z_offset_error']))
         gcmd.respond_info(
-            "NEBULAOS_CALIBRATION_STATUS: axis_twist X state=%s result=%s "
-            "error=%s | Y state=%s result=%s error=%s | active=%s "
-            "sample=%s/%s"
-            % (status['axis_twist_x_state'], status['axis_twist_x_result'],
-               status['axis_twist_x_error'], status['axis_twist_y_state'],
-               status['axis_twist_y_result'], status['axis_twist_y_error'],
-               status['axis_twist_current_axis'],
-               status['axis_twist_sample_index'],
-               status['axis_twist_sample_total']))
+            "NEBULAOS_CALIBRATION_STATUS: auto_calibrate_state=%s "
+            "auto_calibrate_stage=%s auto_calibrate_error=%s"
+            % (status['auto_calibrate_state'], status['auto_calibrate_stage'],
+               status['auto_calibrate_error']))
 
 
 def load_config(config):

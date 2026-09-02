@@ -614,13 +614,30 @@ class UpstreamFirstCleanupTest(unittest.TestCase):
         # this test's job is only to confirm the REMOVED wrapper commands
         # (PID convenience macros, bed-mesh named-profile wrapper, manual
         # METHOD= passthrough) never come back, not that the command set
-        # is frozen forever.
+        # is frozen forever. NEBULAOS_AXIS_TWIST_CALIBRATE is gone
+        # entirely (mission §21, final product decision) - automatic Axis
+        # Twist is not supported; manual Axis Twist is pristine upstream
+        # AXIS_TWIST_COMPENSATION_CALIBRATE, which needs no wrapper here.
         printer, gcode, coord = _build()
         self.assertEqual(
             sorted(gcode.commands.keys()),
-            ['NEBULAOS_AUTO_CALIBRATE', 'NEBULAOS_AXIS_TWIST_CALIBRATE',
+            ['NEBULAOS_AUTO_CALIBRATE',
              'NEBULAOS_CALIBRATION_CANCEL', 'NEBULAOS_CALIBRATION_STATUS',
              'NEBULAOS_Z_OFFSET_CALIBRATE'])
+
+    def test_no_axis_twist_calibrate_command_or_state(self):
+        # Mission §21: NEBULAOS_AXIS_TWIST_CALIBRATE and every axis_twist_*
+        # status field must be gone completely, not merely hard-blocked.
+        printer, gcode, coord = _build()
+        self.assertNotIn('NEBULAOS_AXIS_TWIST_CALIBRATE', gcode.commands)
+        self.assertFalse(hasattr(coord, 'cmd_axis_twist_calibrate'))
+        self.assertFalse(hasattr(coord, 'axis_twist_id'))
+        self.assertFalse(hasattr(coord, 'axis_twist_x_state'))
+        self.assertFalse(hasattr(coord, 'axis_twist_y_state'))
+        status = coord.get_status(0.)
+        self.assertNotIn('axis_twist_id', status)
+        self.assertNotIn('axis_twist_x_state', status)
+        self.assertNotIn('axis_twist_y_state', status)
 
 
 class SimulateBootstrapTest(unittest.TestCase):
