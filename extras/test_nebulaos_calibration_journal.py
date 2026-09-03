@@ -67,14 +67,14 @@ class AdvanceStageTest(unittest.TestCase):
 
     def test_input_shaper_stages_accepted_with_explicit_stages_arg(self):
         j = journal.new_journal(1, 'input_shaper_calibrate', now=0.0)
-        journal.advance_stage(j, 'measure', now=1.0,
+        journal.advance_stage(j, 'measure_x', now=1.0,
                                stages=journal.INPUT_SHAPER_STAGES)
-        self.assertEqual(j['stage'], 'measure')
+        self.assertEqual(j['stage'], 'measure_x')
 
     def test_input_shaper_stage_rejected_against_default_stages(self):
         j = journal.new_journal(1, 'input_shaper_calibrate', now=0.0)
         with self.assertRaises(ValueError):
-            journal.advance_stage(j, 'measure', now=1.0)
+            journal.advance_stage(j, 'measure_x', now=1.0)
 
     def test_auto_calibrate_stage_rejected_against_input_shaper_stages(self):
         j = journal.new_journal(1, 'auto_calibrate', now=0.0)

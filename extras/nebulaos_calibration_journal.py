@@ -75,7 +75,8 @@ STAGES = (
 INPUT_SHAPER_STAGES = (
     'preflight',
     'home',
-    'measure',
+    'measure_x',
+    'measure_y',
     'final_validation',
     'commit',
     'restart',

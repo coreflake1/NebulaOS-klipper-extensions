@@ -307,36 +307,32 @@ class NebulaOSCalibration:
         # NEBULAOS_INPUT_SHAPER_CALIBRATE (mission §13) - a separate,
         # standalone guided workflow (not part of NEBULAOS_AUTO_CALIBRATE:
         # resonance testing is done cold and has nothing to do with the
-        # nozzle/bed thermal state that workflow coordinates). Wraps
-        # upstream G28 + `SHAPER_CALIBRATE` (no AXIS= - see
-        # nebulaos_calibration_journal.py's own INPUT_SHAPER_STAGES
-        # comment for why one command covers both X and Y on this unit's
-        # fixed-mounted ADXL345) + one SAVE_CONFIG+restart + post-restart
-        # verification, the same pattern as cmd_auto_calibrate's own
-        # localized_z_offset/bed_mesh stages, using its own separate
-        # journal file so an in-flight NEBULAOS_AUTO_CALIBRATE journal is
-        # never at risk of being overwritten by this unrelated workflow
-        # (or vice versa).
+        # nozzle/bed thermal state that workflow coordinates). A genuine
+        # 3-call guided sequence (see cmd_input_shaper_calibrate's own
+        # header comment) wrapping upstream G28 + `SHAPER_CALIBRATE
+        # AXIS=X` + `SHAPER_CALIBRATE AXIS=Y` + one SAVE_CONFIG+restart +
+        # post-restart verification, the same journal pattern as
+        # cmd_auto_calibrate's own localized_z_offset/bed_mesh stages,
+        # using its own separate journal file so an in-flight
+        # NEBULAOS_AUTO_CALIBRATE journal is never at risk of being
+        # overwritten by this unrelated workflow (or vice versa).
         #
-        # Feasibility note (2026-09-02/03 overnight source-prep, NOT yet
-        # hardware-validated end-to-end as this exact guided command):
-        # the underlying platform - [mcu rpi]/[adxl345]/[resonance_tester]/
+        # Platform feasibility (2026-09-02/03 overnight source-prep): the
+        # underlying platform - [mcu rpi]/[adxl345]/[resonance_tester]/
         # [input_shaper] in machine.cfg, klipper_mcu served by
         # S54nebulaos-host-mcu - is Phase 1.9A work already merged into
         # this branch's own history (confirmed: `git merge-base
         # --is-ancestor c86dc54 HEAD` on phase2/calibration-framework),
         # not a separate unmerged-branch prerequisite as an earlier
-        # research pass in this mission incorrectly assumed. It is also
-        # not merely theoretical: a live ACCELEROMETER_QUERY CHIP=adxl345
-        # against this exact candidate on 2026-08-31 returned real,
-        # plausible values (x=3064.38, y=444.12, z=8438.35 - see
-        # _evidence/phase2-axis-twist-qualification-20260831-203913/
-        # custom-boot/adxl-query.json), and that same session's HELP
-        # output lists SHAPER_CALIBRATE/TEST_RESONANCES/INPUT_SHAPER/
-        # MEASURE_AXES_NOISE as registered, live commands. What is NOT
-        # yet proven live is this specific guided command end-to-end
-        # (preflight/home/measure/commit/restart/verify) - that is
-        # tomorrow's hardware task, not assumed complete tonight.
+        # research pass in this mission incorrectly assumed. Live-
+        # reconfirmed 2026-09-03 on the actual candidate: ACCELEROMETER_
+        # QUERY and MEASURE_AXES_NOISE both return real, plausible values
+        # (see this session's own evidence), and the operator confirmed
+        # live that the accelerometer is a genuinely movable clip-on
+        # module (not fixed, despite machine.cfg's own wiring comment
+        # describing the electrical path, not the physical mounting) -
+        # which is exactly why this is a real 3-call relocate-between-
+        # axes guided workflow rather than one combined pass.
         self.input_shaper_journal_path = config.get(
             'input_shaper_journal_path', default=(
                 calibration_journal.DEFAULT_JOURNAL_DIR
@@ -409,6 +405,14 @@ class NebulaOSCalibration:
         self.input_shaper_stage = None
         self.input_shaper_error = None
         self.input_shaper_result = None
+        # Private (not part of get_status()'s public contract) - carry the
+        # X measurement and the in-flight journal across the 3 separate
+        # gcode calls of the guided workflow, same reasoning as esteps_*'s
+        # own cross-call fields above but kept private since these are
+        # mid-flight internals, not a result anyone should poll.
+        self._input_shaper_type_x = None
+        self._input_shaper_freq_x = None
+        self._input_shaper_active_journal = None
 
         self.gcode.register_command(
             'NEBULAOS_Z_OFFSET_CALIBRATE', self.cmd_z_offset_calibrate,
@@ -1152,21 +1156,57 @@ class NebulaOSCalibration:
             % (old_rd, new_rd, measured, commanded))
 
     # ------------------------------------------------------------------
-    # NEBULAOS_INPUT_SHAPER_CALIBRATE (mission §13) - see this module's own
-    # __init__ comment above input_shaper_journal_path for the platform
-    # feasibility evidence and what remains hardware-unverified.
+    # NEBULAOS_INPUT_SHAPER_CALIBRATE (mission §13). Corrected live
+    # 2026-09-03: an earlier draft of this command assumed the ADXL345 was
+    # fixed-mounted (matching this unit's own [adxl345] SPI wiring
+    # comment in machine.cfg) and ran a single combined `SHAPER_CALIBRATE`
+    # pass for both axes - the operator confirmed live that the real
+    # accelerometer on this printer is in fact a separate, movable
+    # clip-on module, not the fixed one machine.cfg's own comment
+    # describes (that comment is accurate about the WIRING/electrical
+    # path, just not about whether the sensor itself is rigidly fixed in
+    # one physical spot). A movable sensor needs a genuine relocate-
+    # between-axes guided workflow, matching this mission's own §7/§8
+    # requirement and mirroring NEBULAOS_ESTEPS_CALIBRATE's own 3-call
+    # guided pattern (the human step must happen BETWEEN two real
+    # measurements, not before or after both):
+    #   1. NEBULAOS_INPUT_SHAPER_CALIBRATE            - preflight, home.
+    #      Stops here and asks the human to mount the accelerometer
+    #      rigidly on the TOOLHEAD now.
+    #   2. NEBULAOS_INPUT_SHAPER_CALIBRATE CONTINUE=1 - runs upstream
+    #      `SHAPER_CALIBRATE AXIS=X`. Stops here and asks the human to
+    #      move the SAME accelerometer rigidly to the BED now.
+    #   3. NEBULAOS_INPUT_SHAPER_CALIBRATE CONTINUE=1 - runs upstream
+    #      `SHAPER_CALIBRATE AXIS=Y`, then commits both results with one
+    #      SAVE_CONFIG+restart+post-restart verification, same journal
+    #      pattern as NEBULAOS_AUTO_CALIBRATE.
     # ------------------------------------------------------------------
     cmd_input_shaper_calibrate_help = (
-        "Guided Input Shaper calibration: home, upstream SHAPER_CALIBRATE "
-        "(both X and Y in one pass - this unit's ADXL345 is fixed-mounted, "
-        "not a movable clip-on sensor), one SAVE_CONFIG+restart, "
-        "post-restart verification")
+        "Guided Input Shaper calibration for a MOVABLE clip-on "
+        "accelerometer - call with no params to home and preflight; call "
+        "again with CONTINUE=1 once it's mounted on the TOOLHEAD (measures "
+        "X); call a third time with CONTINUE=1 once it's been moved to the "
+        "BED (measures Y, then commits with SAVE_CONFIG+restart)")
 
     def cmd_input_shaper_calibrate(self, gcmd):
-        if self.input_shaper_state == 'running':
+        if gcmd.get_int('CONTINUE', 0):
+            if self.input_shaper_state == 'awaiting_x_mount':
+                return self._input_shaper_measure_axis(gcmd, 'x')
+            if self.input_shaper_state == 'awaiting_y_mount':
+                return self._input_shaper_measure_axis(gcmd, 'y')
             raise self.printer.command_error(
-                "NEBULAOS_INPUT_SHAPER_CALIBRATE: a calibration is already "
-                "in progress")
+                "NEBULAOS_INPUT_SHAPER_CALIBRATE CONTINUE=1: no guided run "
+                "is waiting for a sensor move (state=%s) - start one first "
+                "with a plain NEBULAOS_INPUT_SHAPER_CALIBRATE"
+                % (self.input_shaper_state,))
+        return self._input_shaper_start(gcmd)
+
+    def _input_shaper_start(self, gcmd):
+        if self.input_shaper_state in ('awaiting_x_mount', 'awaiting_y_mount'):
+            raise self.printer.command_error(
+                "NEBULAOS_INPUT_SHAPER_CALIBRATE: a guided run is already "
+                "in progress (state=%s) - finish it with CONTINUE=1, or "
+                "power-cycle to abandon it" % (self.input_shaper_state,))
 
         now = time.time()
         self.input_shaper_id += 1
@@ -1174,10 +1214,13 @@ class NebulaOSCalibration:
         self.input_shaper_stage = None
         self.input_shaper_error = None
         self.input_shaper_result = None
+        self._input_shaper_type_x = None
+        self._input_shaper_freq_x = None
         journal = calibration_journal.new_journal(
             self.input_shaper_id, 'input_shaper_calibrate', now)
         calibration_journal.write_journal(
             journal, path=self.input_shaper_journal_path)
+        self._input_shaper_active_journal = journal
 
         def advance(stage, t):
             self.input_shaper_stage = stage
@@ -1187,48 +1230,79 @@ class NebulaOSCalibration:
             calibration_journal.write_journal(
                 journal, path=self.input_shaper_journal_path)
 
-        def run(script):
-            self.gcode.run_script_from_command(script)
-
         try:
             advance('preflight', time.time())
             if self.printer.lookup_object('resonance_tester', None) is None:
                 raise self.printer.command_error(
                     "NEBULAOS_INPUT_SHAPER_CALIBRATE: no [resonance_tester] "
                     "is configured on this printer")
-            input_shaper_obj = self.printer.lookup_object(
-                'input_shaper', None)
-            if input_shaper_obj is None:
+            if self.printer.lookup_object('input_shaper', None) is None:
                 raise self.printer.command_error(
                     "NEBULAOS_INPUT_SHAPER_CALIBRATE: no [input_shaper] is "
                     "configured on this printer")
 
             advance('home', time.time())
-            run('G28')
+            self.gcode.run_script_from_command('G28')
+        except Exception as e:
+            self.input_shaper_state = 'error'
+            self.input_shaper_error = _sanitize_error(e)
+            calibration_journal.mark_error(
+                journal, self.input_shaper_error, time.time())
+            calibration_journal.write_journal(
+                journal, path=self.input_shaper_journal_path)
+            raise
 
-            advance('measure', time.time())
-            run('SHAPER_CALIBRATE')
+        self.input_shaper_state = 'awaiting_x_mount'
+        self.gcode.respond_info(
+            "NEBULAOS_INPUT_SHAPER_CALIBRATE: homed. Mount the "
+            "accelerometer RIGIDLY on the TOOLHEAD now, then call "
+            "NEBULAOS_INPUT_SHAPER_CALIBRATE CONTINUE=1 to measure X.")
+
+    def _input_shaper_measure_axis(self, gcmd, axis):
+        journal = self._input_shaper_active_journal
+        stage = 'measure_%s' % (axis,)
+
+        def advance(s, t):
+            self.input_shaper_stage = s
+            calibration_journal.advance_stage(
+                journal, s, t, stages=calibration_journal.INPUT_SHAPER_STAGES)
+            calibration_journal.write_journal(
+                journal, path=self.input_shaper_journal_path)
+
+        try:
+            advance(stage, time.time())
+            self.gcode.run_script_from_command(
+                'SHAPER_CALIBRATE AXIS=%s' % (axis.upper(),))
+            input_shaper_obj = self.printer.lookup_object('input_shaper')
             shapers_by_axis = {
                 s.axis: s for s in input_shaper_obj.get_shapers()}
-            shaper_x = shapers_by_axis.get('x')
-            shaper_y = shapers_by_axis.get('y')
-            if (shaper_x is None or shaper_y is None
-                    or not shaper_x.params.shaper_freq
-                    or not shaper_y.params.shaper_freq):
+            shaper = shapers_by_axis.get(axis)
+            if shaper is None or not shaper.params.shaper_freq:
                 raise self.printer.command_error(
-                    "NEBULAOS_INPUT_SHAPER_CALIBRATE: SHAPER_CALIBRATE did "
-                    "not produce a usable shaper_freq for both X and Y")
+                    "NEBULAOS_INPUT_SHAPER_CALIBRATE: SHAPER_CALIBRATE "
+                    "AXIS=%s did not produce a usable shaper_freq"
+                    % (axis.upper(),))
+
+            if axis == 'x':
+                self._input_shaper_type_x = shaper.params.shaper_type
+                self._input_shaper_freq_x = round(shaper.params.shaper_freq, 3)
+                self.input_shaper_state = 'awaiting_y_mount'
+                self.gcode.respond_info(
+                    "NEBULAOS_INPUT_SHAPER_CALIBRATE: X measured (%s@%.1fHz). "
+                    "Move the SAME accelerometer RIGIDLY to the BED now, "
+                    "then call NEBULAOS_INPUT_SHAPER_CALIBRATE CONTINUE=1 "
+                    "to measure Y and commit."
+                    % (shaper.params.shaper_type, shaper.params.shaper_freq))
+                return
 
             advance('final_validation', time.time())
             expected_values = {
-                'input_shaper.shaper_type_x': shaper_x.params.shaper_type,
-                'input_shaper.shaper_freq_x':
-                    round(shaper_x.params.shaper_freq, 3),
-                'input_shaper.shaper_type_y': shaper_y.params.shaper_type,
+                'input_shaper.shaper_type_x': self._input_shaper_type_x,
+                'input_shaper.shaper_freq_x': self._input_shaper_freq_x,
+                'input_shaper.shaper_type_y': shaper.params.shaper_type,
                 'input_shaper.shaper_freq_y':
-                    round(shaper_y.params.shaper_freq, 3),
+                    round(shaper.params.shaper_freq, 3),
             }
-
             calibration_journal.mark_commit_requested(
                 journal, expected_values, time.time())
             calibration_journal.write_journal(
@@ -1238,9 +1312,9 @@ class NebulaOSCalibration:
                 "NEBULAOS_INPUT_SHAPER_CALIBRATE: shaper_x=%s@%.1fHz "
                 "shaper_y=%s@%.1fHz - committing with SAVE_CONFIG, printer "
                 "will restart"
-                % (shaper_x.params.shaper_type, shaper_x.params.shaper_freq,
-                   shaper_y.params.shaper_type, shaper_y.params.shaper_freq))
-            run('SAVE_CONFIG')
+                % (self._input_shaper_type_x, self._input_shaper_freq_x,
+                   shaper.params.shaper_type, shaper.params.shaper_freq))
+            self.gcode.run_script_from_command('SAVE_CONFIG')
             # See cmd_auto_calibrate's own identical comment/root-cause -
             # returning normally here is correct on this platform.
             return

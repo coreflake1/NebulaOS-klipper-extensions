@@ -1333,10 +1333,13 @@ def _build_input_shaper_calibrate(
     def fake_shaper_calibrate(gcmd):
         if not shaper_calibrate_ok:
             raise fake.CommandError("SHAPER_CALIBRATE: simulated failure")
-        input_shaper_obj.x.params.shaper_type = result_x[0]
-        input_shaper_obj.x.params.shaper_freq = result_x[1]
-        input_shaper_obj.y.params.shaper_type = result_y[0]
-        input_shaper_obj.y.params.shaper_freq = result_y[1]
+        axis = (gcmd.get('AXIS', '') or '').upper()
+        if axis == 'X':
+            input_shaper_obj.x.params.shaper_type = result_x[0]
+            input_shaper_obj.x.params.shaper_freq = result_x[1]
+        elif axis == 'Y':
+            input_shaper_obj.y.params.shaper_type = result_y[0]
+            input_shaper_obj.y.params.shaper_freq = result_y[1]
     gcode.commands['SHAPER_CALIBRATE'] = fake_shaper_calibrate
 
     values = dict(config_overrides or {})
@@ -1349,6 +1352,12 @@ def _build_input_shaper_calibrate(
 
 
 class InputShaperCalibrateTest(unittest.TestCase):
+    """NEBULAOS_INPUT_SHAPER_CALIBRATE's real, 3-call guided workflow for
+    a MOVABLE clip-on accelerometer (corrected live 2026-09-03 - the
+    operator confirmed the sensor is not fixed-mounted, contradicting an
+    earlier draft's assumption): plain call (home) -> CONTINUE=1 (measure
+    X, ask for the bed move) -> CONTINUE=1 (measure Y, commit)."""
+
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
         self.journal_path = os.path.join(self.tmpdir, 'input_shaper_journal.json')
@@ -1362,13 +1371,33 @@ class InputShaperCalibrateTest(unittest.TestCase):
         return _build_input_shaper_calibrate(
             config_overrides=overrides, **kwargs)
 
-    def test_happy_path_runs_g28_then_shaper_calibrate_then_commits(self):
+    def test_first_call_homes_and_asks_for_toolhead_mount(self):
+        printer, gcode, coord, _ = self._build()
+        coord.cmd_input_shaper_calibrate(fake.FakeGCmd({}))
+        self.assertEqual(gcode.scripts_run, ['G28'])
+        self.assertEqual(coord.input_shaper_state, 'awaiting_x_mount')
+        journal = calibration_journal.read_journal(path=self.journal_path)
+        self.assertEqual(journal['stage'], 'home')
+
+    def test_second_call_measures_x_and_asks_for_bed_move(self):
+        printer, gcode, coord, _ = self._build(result_x=('mzv', 45.3))
+        coord.cmd_input_shaper_calibrate(fake.FakeGCmd({}))
+        coord.cmd_input_shaper_calibrate(fake.FakeGCmd({'CONTINUE': '1'}))
+        self.assertEqual(gcode.scripts_run, ['G28', 'SHAPER_CALIBRATE AXIS=X'])
+        self.assertEqual(coord.input_shaper_state, 'awaiting_y_mount')
+        journal = calibration_journal.read_journal(path=self.journal_path)
+        self.assertEqual(journal['stage'], 'measure_x')
+
+    def test_third_call_measures_y_and_commits(self):
         printer, gcode, coord, _ = self._build(
             result_x=('mzv', 45.3), result_y=('ei', 38.7))
+        coord.cmd_input_shaper_calibrate(fake.FakeGCmd({}))
+        coord.cmd_input_shaper_calibrate(fake.FakeGCmd({'CONTINUE': '1'}))
         with self.assertRaises(RestartTriggered):
-            coord.cmd_input_shaper_calibrate(fake.FakeGCmd({}))
+            coord.cmd_input_shaper_calibrate(fake.FakeGCmd({'CONTINUE': '1'}))
         self.assertEqual(gcode.scripts_run,
-                          ['G28', 'SHAPER_CALIBRATE', 'SAVE_CONFIG'])
+                          ['G28', 'SHAPER_CALIBRATE AXIS=X',
+                           'SHAPER_CALIBRATE AXIS=Y', 'SAVE_CONFIG'])
         journal = calibration_journal.read_journal(path=self.journal_path)
         self.assertEqual(
             journal['state'], calibration_journal.STATE_COMMIT_REQUESTED)
@@ -1379,6 +1408,12 @@ class InputShaperCalibrateTest(unittest.TestCase):
             'input_shaper.shaper_freq_y': 38.7,
         })
         self.assertEqual(coord.input_shaper_stage, 'commit')
+
+    def test_continue_without_a_start_is_rejected(self):
+        printer, gcode, coord, _ = self._build()
+        with self.assertRaises(fake.CommandError):
+            coord.cmd_input_shaper_calibrate(fake.FakeGCmd({'CONTINUE': '1'}))
+        self.assertEqual(gcode.scripts_run, [])
 
     def test_missing_resonance_tester_raises_before_any_motion(self):
         printer, gcode, coord, _ = self._build(include_resonance_tester=False)
@@ -1393,29 +1428,66 @@ class InputShaperCalibrateTest(unittest.TestCase):
             coord.cmd_input_shaper_calibrate(fake.FakeGCmd({}))
         self.assertEqual(gcode.scripts_run, [])
 
-    def test_zero_freq_result_on_one_axis_is_rejected_before_commit(self):
-        printer, gcode, coord, _ = self._build(result_y=('mzv', 0.0))
+    def test_zero_freq_result_on_x_is_rejected_before_asking_for_bed_move(self):
+        printer, gcode, coord, _ = self._build(result_x=('mzv', 0.0))
+        coord.cmd_input_shaper_calibrate(fake.FakeGCmd({}))
         with self.assertRaises(fake.CommandError):
-            coord.cmd_input_shaper_calibrate(fake.FakeGCmd({}))
+            coord.cmd_input_shaper_calibrate(fake.FakeGCmd({'CONTINUE': '1'}))
+        self.assertEqual(coord.input_shaper_state, 'error')
+        journal = calibration_journal.read_journal(path=self.journal_path)
+        self.assertEqual(journal['state'], calibration_journal.STATE_ERROR)
+
+    def test_zero_freq_result_on_y_is_rejected_before_commit(self):
+        printer, gcode, coord, _ = self._build(result_y=('mzv', 0.0))
+        coord.cmd_input_shaper_calibrate(fake.FakeGCmd({}))
+        coord.cmd_input_shaper_calibrate(fake.FakeGCmd({'CONTINUE': '1'}))
+        with self.assertRaises(fake.CommandError):
+            coord.cmd_input_shaper_calibrate(fake.FakeGCmd({'CONTINUE': '1'}))
         self.assertNotIn('SAVE_CONFIG', gcode.scripts_run)
         self.assertEqual(coord.input_shaper_state, 'error')
         journal = calibration_journal.read_journal(path=self.journal_path)
         self.assertEqual(journal['state'], calibration_journal.STATE_ERROR)
 
-    def test_shaper_calibrate_failure_never_reaches_commit(self):
+    def test_shaper_calibrate_failure_on_x_never_asks_for_bed_move(self):
         printer, gcode, coord, _ = self._build(shaper_calibrate_ok=False)
+        coord.cmd_input_shaper_calibrate(fake.FakeGCmd({}))
         with self.assertRaises(fake.CommandError):
-            coord.cmd_input_shaper_calibrate(fake.FakeGCmd({}))
-        self.assertEqual(gcode.scripts_run, ['G28', 'SHAPER_CALIBRATE'])
+            coord.cmd_input_shaper_calibrate(fake.FakeGCmd({'CONTINUE': '1'}))
+        self.assertEqual(gcode.scripts_run, ['G28', 'SHAPER_CALIBRATE AXIS=X'])
+        self.assertEqual(coord.input_shaper_state, 'error')
         journal = calibration_journal.read_journal(path=self.journal_path)
         self.assertEqual(journal['state'], calibration_journal.STATE_ERROR)
 
-    def test_cannot_start_second_run_while_one_is_in_progress(self):
+    def test_cannot_start_second_run_while_awaiting_a_sensor_move(self):
         printer, gcode, coord, _ = self._build()
-        coord.input_shaper_state = 'running'
+        coord.cmd_input_shaper_calibrate(fake.FakeGCmd({}))
         with self.assertRaises(fake.CommandError):
             coord.cmd_input_shaper_calibrate(fake.FakeGCmd({}))
-        self.assertEqual(gcode.scripts_run, [])
+        self.assertEqual(gcode.scripts_run, ['G28'])
+
+    def test_can_start_a_new_run_after_a_real_restart(self):
+        # A real restart replaces the whole process - the in-memory
+        # input_shaper_state on the OLD coordinator instance staying at
+        # whatever it was mid-flight (here 'awaiting_y_mount', since
+        # nothing along the commit/SAVE_CONFIG path updates it further -
+        # matching cmd_auto_calibrate's own identical behavior) is
+        # correct and expected, not a bug: __init__ on the NEW instance
+        # naturally resets to 'idle', which is what makes a next run
+        # startable, not calling the old instance again.
+        printer, gcode, coord, _ = self._build(
+            result_x=('mzv', 45.3), result_y=('ei', 38.7))
+        coord.cmd_input_shaper_calibrate(fake.FakeGCmd({}))
+        coord.cmd_input_shaper_calibrate(fake.FakeGCmd({'CONTINUE': '1'}))
+        with self.assertRaises(RestartTriggered):
+            coord.cmd_input_shaper_calibrate(fake.FakeGCmd({'CONTINUE': '1'}))
+        self.assertEqual(coord.input_shaper_state, 'awaiting_y_mount')
+
+        fresh_printer, fresh_gcode, fresh_coord, _ = self._build(
+            result_x=('mzv', 45.3), result_y=('ei', 38.7))
+        self.assertEqual(fresh_coord.input_shaper_state, 'idle')
+        fresh_coord.cmd_input_shaper_calibrate(fake.FakeGCmd({}))
+        self.assertEqual(fresh_gcode.scripts_run, ['G28'])
+        self.assertEqual(fresh_coord.input_shaper_state, 'awaiting_x_mount')
 
     def test_status_fields_present_and_idle_by_default(self):
         printer, gcode, coord, _ = self._build()
