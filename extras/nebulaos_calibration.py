@@ -337,6 +337,30 @@ class NebulaOSCalibration:
             'input_shaper_journal_path', default=(
                 calibration_journal.DEFAULT_JOURNAL_DIR
                 + "/input_shaper_journal.json"))
+        # shaper_freq_end / shaper_accel_per_hz (mission Phase 2, overnight
+        # 2026-09-03/04 prep, NOT hardware-qualified yet - deliberately left
+        # unset/None below): this guided workflow previously called plain
+        # `SHAPER_CALIBRATE AXIS=X`/`AXIS=Y` with no parameters of its own,
+        # meaning its actual test envelope was WHATEVER [resonance_tester]'s
+        # own max_freq/accel_per_hz happened to be configured to at the
+        # time - correct behavior when this command was first built (it
+        # matched the same values a plain manual SHAPER_CALIBRATE would
+        # use), but an accidental coupling: a future change to
+        # [resonance_tester]'s own defaults (for a completely unrelated
+        # reason) would silently change this guided workflow's own test
+        # envelope too. These two options let this workflow own its own,
+        # deliberately-chosen values instead, independent of whatever
+        # [resonance_tester] itself defaults to. Left unset (None) by
+        # default so the exact current, live-proven-safe behavior (plain
+        # `SHAPER_CALIBRATE AXIS=<x>`, using [resonance_tester]'s own
+        # max_freq=60/accel_per_hz=70) is completely unchanged until real
+        # hardware qualification of a specific wider envelope (see
+        # _evidence/ for the 2026-09-03 math verification of an 80Hz/
+        # accel_per_hz=50 candidate) promotes real numbers here.
+        self.shaper_freq_end = config.getfloat(
+            'shaper_freq_end', default=None, above=0.)
+        self.shaper_accel_per_hz = config.getfloat(
+            'shaper_accel_per_hz', default=None, above=0.)
 
         self.z_offset_state = 'idle'
         self.z_offset_id = 0
@@ -1258,6 +1282,25 @@ class NebulaOSCalibration:
             "accelerometer RIGIDLY on the TOOLHEAD now, then call "
             "NEBULAOS_INPUT_SHAPER_CALIBRATE CONTINUE=1 to measure X.")
 
+    def _build_shaper_calibrate_script(self, axis):
+        """The exact upstream SHAPER_CALIBRATE invocation this workflow
+        runs for one axis. Deliberately just a plain string builder - no
+        resonance/shaper analysis of any kind lives here, that stays
+        entirely upstream in resonance_tester.py/shaper_calibrate.py.
+        FREQ_END=/ACCEL_PER_HZ= are appended only when this section's own
+        shaper_freq_end/shaper_accel_per_hz are configured; left unset,
+        the command is bare `SHAPER_CALIBRATE AXIS=<x>`, which upstream
+        itself then resolves against [resonance_tester]'s own max_freq/
+        accel_per_hz - byte-for-byte the same command this workflow has
+        always sent, so the unset case is a pure no-op change from the
+        live-proven-safe 2026-09-03 behavior."""
+        parts = ['SHAPER_CALIBRATE', 'AXIS=%s' % (axis.upper(),)]
+        if self.shaper_freq_end is not None:
+            parts.append('FREQ_END=%.1f' % (self.shaper_freq_end,))
+        if self.shaper_accel_per_hz is not None:
+            parts.append('ACCEL_PER_HZ=%.1f' % (self.shaper_accel_per_hz,))
+        return ' '.join(parts)
+
     def _input_shaper_measure_axis(self, gcmd, axis):
         journal = self._input_shaper_active_journal
         stage = 'measure_%s' % (axis,)
@@ -1272,7 +1315,7 @@ class NebulaOSCalibration:
         try:
             advance(stage, time.time())
             self.gcode.run_script_from_command(
-                'SHAPER_CALIBRATE AXIS=%s' % (axis.upper(),))
+                self._build_shaper_calibrate_script(axis))
             input_shaper_obj = self.printer.lookup_object('input_shaper')
             shapers_by_axis = {
                 s.axis: s for s in input_shaper_obj.get_shapers()}

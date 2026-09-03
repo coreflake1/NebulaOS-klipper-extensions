@@ -1498,6 +1498,90 @@ class InputShaperCalibrateTest(unittest.TestCase):
         self.assertIsNone(status['input_shaper_result'])
 
 
+class InputShaperExplicitParamsTest(unittest.TestCase):
+    """Mission Phase 2, overnight 2026-09-03/04 prep: this guided workflow
+    must be able to own its own explicit FREQ_END=/ACCEL_PER_HZ= instead
+    of accidentally depending on whatever [resonance_tester] itself
+    happens to default to - proves the EXACT upstream command string
+    generated in both the unset (unchanged, live-proven-safe) case and
+    the explicit-parameters case. No resonance/shaper analysis is
+    duplicated here - only command-string generation is tested."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.journal_path = os.path.join(self.tmpdir, 'input_shaper_journal.json')
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _build(self, shaper_freq_end=None, shaper_accel_per_hz=None, **kwargs):
+        overrides = {'input_shaper_journal_path': self.journal_path}
+        if shaper_freq_end is not None:
+            overrides['shaper_freq_end'] = shaper_freq_end
+        if shaper_accel_per_hz is not None:
+            overrides['shaper_accel_per_hz'] = shaper_accel_per_hz
+        overrides.update(kwargs.pop('config_overrides', None) or {})
+        return _build_input_shaper_calibrate(config_overrides=overrides, **kwargs)
+
+    def test_default_unset_produces_the_exact_bare_command(self):
+        # Byte-for-byte the same command this workflow has always sent -
+        # proves the new options are a pure no-op when left unconfigured.
+        printer, gcode, coord, _ = self._build()
+        self.assertEqual(
+            coord._build_shaper_calibrate_script('x'), 'SHAPER_CALIBRATE AXIS=X')
+        self.assertEqual(
+            coord._build_shaper_calibrate_script('y'), 'SHAPER_CALIBRATE AXIS=Y')
+
+    def test_freq_end_only(self):
+        printer, gcode, coord, _ = self._build(shaper_freq_end='80')
+        self.assertEqual(
+            coord._build_shaper_calibrate_script('x'),
+            'SHAPER_CALIBRATE AXIS=X FREQ_END=80.0')
+
+    def test_accel_per_hz_only(self):
+        printer, gcode, coord, _ = self._build(shaper_accel_per_hz='50')
+        self.assertEqual(
+            coord._build_shaper_calibrate_script('x'),
+            'SHAPER_CALIBRATE AXIS=X ACCEL_PER_HZ=50.0')
+
+    def test_both_params_together_x_and_y(self):
+        printer, gcode, coord, _ = self._build(
+            shaper_freq_end='80', shaper_accel_per_hz='50')
+        self.assertEqual(
+            coord._build_shaper_calibrate_script('x'),
+            'SHAPER_CALIBRATE AXIS=X FREQ_END=80.0 ACCEL_PER_HZ=50.0')
+        self.assertEqual(
+            coord._build_shaper_calibrate_script('y'),
+            'SHAPER_CALIBRATE AXIS=Y FREQ_END=80.0 ACCEL_PER_HZ=50.0')
+
+    def test_full_guided_run_sends_the_explicit_command_for_both_axes(self):
+        # End-to-end: the actual gcode scripts run_script_from_command
+        # receives during a real 3-call guided sequence, not just the
+        # builder in isolation.
+        printer, gcode, coord, _ = self._build(
+            shaper_freq_end='80', shaper_accel_per_hz='50',
+            result_x=('mzv', 55.1), result_y=('mzv', 34.9))
+        coord.cmd_input_shaper_calibrate(fake.FakeGCmd({}))
+        coord.cmd_input_shaper_calibrate(fake.FakeGCmd({'CONTINUE': '1'}))
+        with self.assertRaises(RestartTriggered):
+            coord.cmd_input_shaper_calibrate(fake.FakeGCmd({'CONTINUE': '1'}))
+        self.assertEqual(gcode.scripts_run, [
+            'G28',
+            'SHAPER_CALIBRATE AXIS=X FREQ_END=80.0 ACCEL_PER_HZ=50.0',
+            'SHAPER_CALIBRATE AXIS=Y FREQ_END=80.0 ACCEL_PER_HZ=50.0',
+            'SAVE_CONFIG',
+        ])
+
+    def test_config_values_are_not_silently_reused_as_defaults_elsewhere(self):
+        # shaper_freq_end/shaper_accel_per_hz must only ever affect the
+        # command this workflow itself builds - never [resonance_tester]'s
+        # own config, which this module never touches.
+        printer, gcode, coord, _ = self._build(
+            shaper_freq_end='80', shaper_accel_per_hz='50')
+        self.assertFalse(hasattr(coord, 'max_freq'))
+        self.assertFalse(hasattr(coord, 'accel_per_hz'))
+
+
 class InputShaperPostRestartVerificationTest(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
