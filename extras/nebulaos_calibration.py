@@ -936,16 +936,21 @@ class NebulaOSCalibration:
                 "printer will restart"
                 % (z_offset_result, mesh_status['profile_name']))
             run('SAVE_CONFIG')
-            # SAVE_CONFIG restarts klippy - if we ever reach the next line,
-            # SAVE_CONFIG itself refused (e.g. nothing was staged) rather
-            # than restarting, which upstream configfile.py treats as a
-            # command_error, not a silent return - so this is unreachable
-            # in the success path, kept only so a future upstream change
-            # in that behavior fails loudly here instead of leaving
-            # auto_calibrate_state stuck at 'running' forever.
-            raise self.printer.command_error(
-                "NEBULAOS_AUTO_CALIBRATE: SAVE_CONFIG returned without "
-                "restarting - this should never happen")
+            # On upstream Klipper, SAVE_CONFIG's own restart never returns
+            # control here at all. Root-caused live 2026-09-03: on this
+            # platform's own reactor, the restart is queued and this
+            # gcode handler DOES return normally, moments before the
+            # actual restart happens - confirmed by the Moonraker HTTP
+            # caller seeing a clean response here immediately followed by
+            # a real klippy restart. Either way, returning normally here
+            # is correct: the journal's commit_requested/restart_pending/
+            # verification_pending were already written to disk above,
+            # before SAVE_CONFIG ran, so _handle_ready() on the next boot
+            # (whichever process reaches it) is what actually verifies
+            # and finalizes auto_calibrate_state - this function's own
+            # in-memory state staying at 'running' in the old process
+            # until it's replaced is expected, not a bug.
+            return
         except Exception as e:
             if journal.get('commit_requested'):
                 # mark_commit_requested() already ran and was written to
@@ -1236,12 +1241,9 @@ class NebulaOSCalibration:
                 % (shaper_x.params.shaper_type, shaper_x.params.shaper_freq,
                    shaper_y.params.shaper_type, shaper_y.params.shaper_freq))
             run('SAVE_CONFIG')
-            # See cmd_auto_calibrate's own identical comment - unreachable
-            # in the success path (SAVE_CONFIG restarts klippy), kept only
-            # so a future upstream behavior change fails loudly here.
-            raise self.printer.command_error(
-                "NEBULAOS_INPUT_SHAPER_CALIBRATE: SAVE_CONFIG returned "
-                "without restarting - this should never happen")
+            # See cmd_auto_calibrate's own identical comment/root-cause -
+            # returning normally here is correct on this platform.
+            return
         except Exception as e:
             if journal.get('commit_requested'):
                 raise
@@ -1274,14 +1276,31 @@ class NebulaOSCalibration:
                         % (expected_z_offset, actual))
         expected_profile = expected.get('bed_mesh.profile')
         if expected_profile is not None:
+            # Checks that the profile was SAVED (present in configfile's
+            # own per-profile section, reflected in bed_mesh's own
+            # in-memory `profiles` dict on every boot regardless of
+            # whether it's active), not that it's the currently ACTIVE
+            # mesh - upstream bed_mesh does not auto-load any saved
+            # profile as active at klippy startup on its own (that is a
+            # print-time step, e.g. a START_PRINT macro's own explicit
+            # BED_MESH_PROFILE LOAD=<name>). Root-caused live
+            # 2026-09-03: a real AUTO_CALIBRATE run saved a genuine 9x9
+            # mesh under 'default' (confirmed present in both
+            # configfile.settings.bed_mesh and bed_mesh's own `profiles`
+            # status field after restart) but bed_mesh's own
+            # profile_name/mesh_matrix stayed empty since nothing had
+            # loaded it yet - the original check here compared against
+            # profile_name and produced a false-negative "verification
+            # failed" for an actually-correct save.
             bed_mesh = self.printer.lookup_object('bed_mesh', None)
-            actual_profile = (
-                bed_mesh.get_status(self.reactor.monotonic()).get('profile_name')
-                if bed_mesh is not None else None)
-            if actual_profile != expected_profile:
+            profiles = (
+                bed_mesh.get_status(self.reactor.monotonic()).get('profiles')
+                if bed_mesh is not None else None) or {}
+            if expected_profile not in profiles:
                 errors.append(
-                    'bed_mesh.profile: expected %r, found %r'
-                    % (expected_profile, actual_profile))
+                    'bed_mesh.profile: expected saved profile %r, found '
+                    'saved profiles %r'
+                    % (expected_profile, sorted(profiles.keys())))
         input_shaper_keys = (
             'input_shaper.shaper_type_x', 'input_shaper.shaper_freq_x',
             'input_shaper.shaper_type_y', 'input_shaper.shaper_freq_y')

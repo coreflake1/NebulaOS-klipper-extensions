@@ -863,13 +863,25 @@ class FakeBedMesh:
     """Stands in for the real registered 'bed_mesh' object. profile_name
     is settable directly by a test to simulate BED_MESH_CALIBRATE having
     already run (that upstream algorithm is out of this module's own test
-    scope - see nebulaos_calibration.py's own header)."""
+    scope - see nebulaos_calibration.py's own header). `profiles` models
+    upstream's own SAVED-profiles dict (populated from configfile on every
+    boot regardless of which one, if any, is currently ACTIVE) - defaults
+    to containing profile_name itself (matching real behavior right after
+    a calibration run, before any restart); a test proving the post-
+    restart "saved but not active" case passes profile_name='' with an
+    explicit non-empty `profiles` instead."""
 
-    def __init__(self, profile_name='default'):
+    def __init__(self, profile_name='default', profiles=None):
         self.profile_name = profile_name
+        if profiles is not None:
+            self.profiles = profiles
+        elif profile_name:
+            self.profiles = {profile_name: {'points': []}}
+        else:
+            self.profiles = {}
 
     def get_status(self, eventtime):
-        return {'profile_name': self.profile_name}
+        return {'profile_name': self.profile_name, 'profiles': self.profiles}
 
 
 def _build_auto_calibrate(z_offset_probe=None, probe_obj=None,
@@ -1210,6 +1222,42 @@ class PostRestartVerificationTest(unittest.TestCase):
         probe_obj = FakeProbeObj(z_offset=1.234)
         printer, gcode, coord = _build_auto_calibrate(
             probe_obj=probe_obj, bed_mesh=FakeBedMesh(profile_name='some_other_profile'),
+            config_overrides={'journal_path': self.journal_path})
+        printer.send_event('klippy:ready')
+        journal = calibration_journal.read_journal(path=self.journal_path)
+        self.assertEqual(journal['state'], calibration_journal.STATE_ERROR)
+        self.assertIn('bed_mesh.profile', journal['error'])
+
+    def test_saved_but_not_currently_active_profile_still_verifies_complete(self):
+        # Root-caused live 2026-09-03: upstream bed_mesh does not
+        # auto-load any saved profile as ACTIVE at klippy startup on its
+        # own (that's a print-time step, e.g. START_PRINT's own explicit
+        # BED_MESH_PROFILE LOAD=<name>) - a real AUTO_CALIBRATE run saved
+        # a genuine mesh under 'default' (present in bed_mesh's own
+        # `profiles` status field after restart) but profile_name/
+        # mesh_matrix stayed empty since nothing had loaded it yet. This
+        # must verify as COMPLETE, not error - the original check (which
+        # compared against profile_name) produced a false-negative here.
+        self._write_pending_journal(
+            {'bltouch.z_offset': 1.234, 'bed_mesh.profile': 'default'})
+        probe_obj = FakeProbeObj(z_offset=1.234)
+        bed_mesh = FakeBedMesh(
+            profile_name='', profiles={'default': {'points': [[1, 2], [3, 4]]}})
+        printer, gcode, coord = _build_auto_calibrate(
+            probe_obj=probe_obj, bed_mesh=bed_mesh,
+            config_overrides={'journal_path': self.journal_path})
+        printer.send_event('klippy:ready')
+        journal = calibration_journal.read_journal(path=self.journal_path)
+        self.assertEqual(journal['state'], calibration_journal.STATE_COMPLETE)
+        self.assertIsNone(journal['error'])
+
+    def test_profile_missing_entirely_from_saved_profiles_marks_error(self):
+        self._write_pending_journal(
+            {'bltouch.z_offset': 1.234, 'bed_mesh.profile': 'default'})
+        probe_obj = FakeProbeObj(z_offset=1.234)
+        bed_mesh = FakeBedMesh(profile_name='', profiles={})
+        printer, gcode, coord = _build_auto_calibrate(
+            probe_obj=probe_obj, bed_mesh=bed_mesh,
             config_overrides={'journal_path': self.journal_path})
         printer.send_event('klippy:ready')
         journal = calibration_journal.read_journal(path=self.journal_path)
