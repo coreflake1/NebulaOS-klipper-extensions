@@ -4,7 +4,7 @@
 # cover the two halves of that fix directly: (1) klippy:connect succeeds
 # with no [nebulaos_z_offset_probe] object registered at all (the printer
 # reaches `ready`), and (2) each of the two commands that actually need it
-# (Z_OFFSET_CALIBRATION, CRTENSE_NOZZLE_CLEAR) raises a clear, specific
+# (Z_OFFSET_CALIBRATION, _NEBULAOS_NOZZLE_CLEAN) raises a clear, specific
 # command_error naming the real problem, rather than either silently
 # succeeding or crashing with an unrelated AttributeError.
 #
@@ -89,7 +89,7 @@ class CommandsRequiringLoadCellFailPreflightClearly(unittest.TestCase):
             zc.cmd_nozzle_clear(gcmd)
         msg = str(ctx.exception)
         self.assertIn('no [nebulaos_z_offset_probe]', msg)
-        self.assertIn('CRTENSE_NOZZLE_CLEAR', msg)
+        self.assertIn('_NEBULAOS_NOZZLE_CLEAN', msg)
 
     def test_error_message_points_at_the_real_manual_alternative(self):
         # Z_OFFSET_CALIBRATION itself has never had a METHOD=MANUAL of its
@@ -119,31 +119,32 @@ class WithLoadCellConfiguredBehaviorIsUnchanged(unittest.TestCase):
         self.assertEqual(zc.calibration_state, 'complete')
 
 
-class NozzleCleanCanonicalAliasTest(unittest.TestCase):
-    """Phase 2 calibration-framework mission: _NEBULAOS_NOZZLE_CLEAN is the
-    private backend; CRTENSE_NOZZLE_CLEAR must keep working unchanged
-    because GuppyScreen's RecalibrationWizardPanel already calls it.
-    The public NEBULAOS_NOZZLE_CLEAN name is a gcode_macro wrapper in
-    calibration.cfg that calls _NEBULAOS_NOZZLE_CLEAN."""
+class NozzleCleanRegistrationTest(unittest.TestCase):
+    """Phase 2 RC: _NEBULAOS_NOZZLE_CLEAN is the only registered name.
+    CRTENSE_NOZZLE_CLEAR (legacy GuppyScreen compat) is removed from the
+    core API; GuppyScreen adaptation will call the canonical name."""
 
-    def test_both_names_are_registered_to_the_same_handler(self):
+    def test_private_backend_is_registered(self):
         printer, mcu, _pins, _values = fake.build_environment()
         zc_config = fake.make_z_compensate_config(printer, dict(fake.REAL_Z_COMPENSATE_CONFIG))
         zc = z_compensate.ZCompensate(zc_config)
         fake.connect(printer, mcu)
         gcode = printer.lookup_object('gcode')
-        self.assertIn('CRTENSE_NOZZLE_CLEAR', gcode.commands)
         self.assertIn('_NEBULAOS_NOZZLE_CLEAN', gcode.commands)
-        a = gcode.commands['CRTENSE_NOZZLE_CLEAR']
-        b = gcode.commands['_NEBULAOS_NOZZLE_CLEAN']
-        self.assertIs(a.__func__, b.__func__)
-        self.assertIs(a.__self__, b.__self__)
 
-    def test_canonical_name_raises_the_same_preflight_error_without_a_load_cell(self):
+    def test_legacy_crtense_name_is_not_registered(self):
+        printer, mcu, _pins, _values = fake.build_environment()
+        zc_config = fake.make_z_compensate_config(printer, dict(fake.REAL_Z_COMPENSATE_CONFIG))
+        zc = z_compensate.ZCompensate(zc_config)
+        fake.connect(printer, mcu)
+        gcode = printer.lookup_object('gcode')
+        self.assertNotIn('CRTENSE_NOZZLE_CLEAR', gcode.commands)
+
+    def test_nozzle_clean_preflight_error_without_load_cell(self):
         _, _, zc = _build_without_load_cell()
         with self.assertRaises(fake.CommandError) as ctx:
             zc.cmd_nozzle_clear(fake.FakeGCmd())
-        self.assertIn('CRTENSE_NOZZLE_CLEAR', str(ctx.exception))
+        self.assertIn('_NEBULAOS_NOZZLE_CLEAN', str(ctx.exception))
 
 
 if __name__ == '__main__':

@@ -30,11 +30,8 @@
 # where their effect is genuinely unconfirmed (see "accepted but not wired" below) - pasting the
 # real section in without this would make Klipper refuse to even start.
 #
-# Because CRTENSE_NOZZLE_CLEAR must use *this* section's tuning and wipe-geometry keys, this
-# module calls nozzle_clear.clear_nozzle() directly with its own `config` object. Phase 1.8B
-# integration candidate: this used to delegate to prtouch_nozzle.clear_nozzle() (PRTouch's
-# own custom MCU commands); PRTouch has been removed from this module entirely - see
-# extras/PRTOUCH_REMOVAL_PLAN.md.
+# _NEBULAOS_NOZZLE_CLEAN uses *this* section's tuning and wipe-geometry keys, so this
+# module calls nozzle_clear.clear_nozzle() directly with its own `config` object.
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging
@@ -42,10 +39,6 @@ import math
 
 from . import nozzle_clear
 
-# Phase 1.8B: native nozzle-clear replacement (NOT YET QUALIFIED FOR HARDWARE USE).
-# When hardware-qualified, this import replaces the prtouch_nozzle dependency for
-# CRTENSE_NOZZLE_CLEAR. See extras/nozzle_clear.py and extras/PRTOUCH_REMOVAL_PLAN.md.
-# from . import nozzle_clear
 
 #: Structured status contract, version 1 - see docs/z_compensate_status_api.md. Consumed by
 #: GuppyScreen's recalibration wizard via printer.objects.subscribe, replacing its previous
@@ -194,15 +187,6 @@ class ZCompensate:
 
         self.printer.register_event_handler("klippy:connect", self._handle_connect)
 
-        self.gcode.register_command('CRTENSE_NOZZLE_CLEAR', self.cmd_nozzle_clear,
-                                     desc=self.cmd_nozzle_clear_help)
-        # Phase 2 calibration-framework mission: NEBULAOS_NOZZLE_CLEAN is
-        # the new canonical name for the exact same command -
-        # CRTENSE_NOZZLE_CLEAR is kept, unchanged, as a compatibility
-        # alias because GuppyScreen's RecalibrationWizardPanel already
-        # calls it by that name (see docs/NEBULAOS_CALIBRATION_PUBLIC_API.md).
-        # Both names share one handler/help string on purpose - there is
-        # exactly one implementation, never two to keep in sync.
         self.gcode.register_command('_NEBULAOS_NOZZLE_CLEAN', self.cmd_nozzle_clear,
                                      desc=self.cmd_nozzle_clear_help)
         self.gcode.register_command('Z_OFFSET_CALIBRATION', self.cmd_z_offset_calibration,
@@ -218,7 +202,7 @@ class ZCompensate:
         # a hard klippy:connect failure - the whole printer would refuse to
         # reach `ready` on any build/config that didn't happen to include
         # it, regardless of whether anyone had ever tried to use
-        # Z_OFFSET_CALIBRATION or CRTENSE_NOZZLE_CLEAR at all. Load-cell
+        # Z_OFFSET_CALIBRATION or _NEBULAOS_NOZZLE_CLEAN at all. Load-cell
         # availability (and, separately, load-cell CALIBRATION - see
         # ZOffsetProbe.get_status()'s is_calibrated field) is now a
         # per-command preflight condition instead, exactly like the
@@ -371,13 +355,11 @@ class ZCompensate:
         call site in custom_macro.py's CX_PRINT_LEVELING_CALIBRATION exactly. Calls
         nozzle_clear.clear_nozzle() with this section's own config (see module docstring).
 
-        Phase 1.8B integration candidate: this is now the ONLY implementation of
-        CRTENSE_NOZZLE_CLEAR. It uses nebulaos_z_offset_probe.touch_probe() (upstream Klipper's
-        HX711/LoadCell/trigger_analog/LCBestFit) for Z positioning on the wipe pad, replacing
-        PRTouch's custom MCU commands entirely - [prtouch_v2] is no longer a dependency of this
-        command, or of this module at all. See extras/nozzle_clear.py and
-        extras/PRTOUCH_REMOVAL_PLAN.md for the full parity review and removal accounting."""
-        self._require_load_cell('CRTENSE_NOZZLE_CLEAR')
+        Phase 2 release candidate: _NEBULAOS_NOZZLE_CLEAN (private backend).
+        Uses nebulaos_z_offset_probe.touch_probe() (upstream Klipper's
+        HX711/LoadCell/trigger_analog/LCBestFit) for Z positioning on the wipe pad.
+        [prtouch_v2] is no longer a dependency of this command or module."""
+        self._require_load_cell('_NEBULAOS_NOZZLE_CLEAN')
         hot_start_temp = gcmd.get_float('HOT_START_TEMP', self.hot_start_temp)
         hot_rub_temp = gcmd.get_float('HOT_RUB_TEMP', self.hot_rub_temp)
         hot_end_temp = gcmd.get_float('HOT_END_TEMP', self.hot_end_temp)
