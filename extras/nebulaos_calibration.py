@@ -439,22 +439,23 @@ class NebulaOSCalibration:
         self._input_shaper_active_journal = None
 
         self.gcode.register_command(
-            'NEBULAOS_Z_OFFSET_CALIBRATE', self.cmd_z_offset_calibrate,
+            '_NEBULAOS_Z_OFFSET_CALIBRATE', self.cmd_z_offset_calibrate,
             desc=self.cmd_z_offset_calibrate_help)
         self.gcode.register_command(
             'NEBULAOS_CALIBRATION_STATUS', self.cmd_calibration_status,
             desc=self.cmd_calibration_status_help)
         self.gcode.register_command(
-            'NEBULAOS_AUTO_CALIBRATE', self.cmd_auto_calibrate,
+            '_NEBULAOS_AUTO_CALIBRATE', self.cmd_auto_calibrate,
             desc=self.cmd_auto_calibrate_help)
         self.gcode.register_command(
-            'NEBULAOS_CALIBRATION_CANCEL', self.cmd_calibration_cancel,
+            '_NEBULAOS_CALIBRATION_CANCEL', self.cmd_calibration_cancel,
             desc=self.cmd_calibration_cancel_help)
         self.gcode.register_command(
-            'NEBULAOS_ESTEPS_CALIBRATE', self.cmd_esteps_calibrate,
+            '_NEBULAOS_ESTEPS_CALIBRATE', self.cmd_esteps_calibrate,
             desc=self.cmd_esteps_calibrate_help)
         self.gcode.register_command(
-            'NEBULAOS_INPUT_SHAPER_CALIBRATE', self.cmd_input_shaper_calibrate,
+            '_NEBULAOS_INPUT_SHAPER_CALIBRATE',
+            self.cmd_input_shaper_calibrate,
             desc=self.cmd_input_shaper_calibrate_help)
         self.printer.register_event_handler(
             "klippy:ready", self._handle_ready)
@@ -900,7 +901,7 @@ class NebulaOSCalibration:
             self._auto_calibrate_check_cancel(journal, time.time())
 
             self._auto_calibrate_advance(journal, 'nozzle_clean', time.time())
-            run('NEBULAOS_NOZZLE_CLEAN')
+            run('_NEBULAOS_NOZZLE_CLEAN')
             self._auto_calibrate_check_cancel(journal, time.time())
 
             # z_offset_reference_temp (NOT pid_hotend_target/230C) -
@@ -927,7 +928,7 @@ class NebulaOSCalibration:
 
             self._auto_calibrate_advance(
                 journal, 'localized_z_offset', time.time())
-            run('NEBULAOS_Z_OFFSET_CALIBRATE')
+            run('_NEBULAOS_Z_OFFSET_CALIBRATE')
             if self.z_offset_state != 'complete' or self.z_offset_result is None:
                 raise self.printer.command_error(
                     "NEBULAOS_AUTO_CALIBRATE: localized Z-offset did not "

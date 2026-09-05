@@ -120,9 +120,11 @@ class WithLoadCellConfiguredBehaviorIsUnchanged(unittest.TestCase):
 
 
 class NozzleCleanCanonicalAliasTest(unittest.TestCase):
-    """Phase 2 calibration-framework mission: NEBULAOS_NOZZLE_CLEAN is the
-    canonical name; CRTENSE_NOZZLE_CLEAR must keep working unchanged
-    because GuppyScreen's RecalibrationWizardPanel already calls it."""
+    """Phase 2 calibration-framework mission: _NEBULAOS_NOZZLE_CLEAN is the
+    private backend; CRTENSE_NOZZLE_CLEAR must keep working unchanged
+    because GuppyScreen's RecalibrationWizardPanel already calls it.
+    The public NEBULAOS_NOZZLE_CLEAN name is a gcode_macro wrapper in
+    calibration.cfg that calls _NEBULAOS_NOZZLE_CLEAN."""
 
     def test_both_names_are_registered_to_the_same_handler(self):
         printer, mcu, _pins, _values = fake.build_environment()
@@ -131,14 +133,9 @@ class NozzleCleanCanonicalAliasTest(unittest.TestCase):
         fake.connect(printer, mcu)
         gcode = printer.lookup_object('gcode')
         self.assertIn('CRTENSE_NOZZLE_CLEAR', gcode.commands)
-        self.assertIn('NEBULAOS_NOZZLE_CLEAN', gcode.commands)
-        # Two freshly-created bound-method objects for the SAME underlying
-        # function/instance are never `is`-identical in Python (each
-        # attribute access makes a new bound-method wrapper) - compare the
-        # underlying function and instance instead, which is what actually
-        # matters here: one implementation, two registered names.
+        self.assertIn('_NEBULAOS_NOZZLE_CLEAN', gcode.commands)
         a = gcode.commands['CRTENSE_NOZZLE_CLEAR']
-        b = gcode.commands['NEBULAOS_NOZZLE_CLEAN']
+        b = gcode.commands['_NEBULAOS_NOZZLE_CLEAN']
         self.assertIs(a.__func__, b.__func__)
         self.assertIs(a.__self__, b.__self__)
 

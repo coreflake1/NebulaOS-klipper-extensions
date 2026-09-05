@@ -621,10 +621,11 @@ class UpstreamFirstCleanupTest(unittest.TestCase):
         printer, gcode, coord = _build()
         self.assertEqual(
             sorted(gcode.commands.keys()),
-            ['NEBULAOS_AUTO_CALIBRATE',
-             'NEBULAOS_CALIBRATION_CANCEL', 'NEBULAOS_CALIBRATION_STATUS',
-             'NEBULAOS_ESTEPS_CALIBRATE', 'NEBULAOS_INPUT_SHAPER_CALIBRATE',
-             'NEBULAOS_Z_OFFSET_CALIBRATE'])
+            ['NEBULAOS_CALIBRATION_STATUS',
+             '_NEBULAOS_AUTO_CALIBRATE',
+             '_NEBULAOS_CALIBRATION_CANCEL',
+             '_NEBULAOS_ESTEPS_CALIBRATE', '_NEBULAOS_INPUT_SHAPER_CALIBRATE',
+             '_NEBULAOS_Z_OFFSET_CALIBRATE'])
 
     def test_no_axis_twist_calibrate_command_or_state(self):
         # Mission §21: NEBULAOS_AXIS_TWIST_CALIBRATE and every axis_twist_*
@@ -837,9 +838,9 @@ class DispatchingFakeGCode(fake.FakeGCode):
     handler is registered there, parsing simple KEY=value params.
     Required because cmd_auto_calibrate() deliberately calls OTHER
     commands via run_script_from_command() exactly like a real user would
-    - including NEBULAOS_NOZZLE_CLEAN, which in production is registered
+    - including _NEBULAOS_NOZZLE_CLEAN, which in production is registered
     by a different class (z_compensate.py's ZCompensate) sharing the same
-    real gcode object, and NEBULAOS_Z_OFFSET_CALIBRATE, which IS this same
+    real gcode object, and _NEBULAOS_Z_OFFSET_CALIBRATE, which IS this same
     coordinator's own already-tested command."""
 
     def run_script_from_command(self, script):
@@ -923,8 +924,8 @@ class AutoCalibrateTest(unittest.TestCase):
 
         def fake_nozzle_clean(gcmd):
             if not nozzle_clean_ok:
-                raise fake.CommandError("NEBULAOS_NOZZLE_CLEAN: simulated failure")
-        gcode.commands['NEBULAOS_NOZZLE_CLEAN'] = fake_nozzle_clean
+                raise fake.CommandError("_NEBULAOS_NOZZLE_CLEAN: simulated failure")
+        gcode.commands['_NEBULAOS_NOZZLE_CLEAN'] = fake_nozzle_clean
 
         orig = nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair
         nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = \
@@ -941,9 +942,9 @@ class AutoCalibrateTest(unittest.TestCase):
 
         script_names = [s.split()[0] for s in gcode.scripts_run]
         self.assertEqual(script_names, [
-            'G28', 'PID_CALIBRATE', 'PID_CALIBRATE', 'NEBULAOS_NOZZLE_CLEAN',
+            'G28', 'PID_CALIBRATE', 'PID_CALIBRATE', '_NEBULAOS_NOZZLE_CLEAN',
             'M140', 'M104', 'M190', 'M109', 'G4',
-            'NEBULAOS_Z_OFFSET_CALIBRATE', 'BED_MESH_CALIBRATE',
+            '_NEBULAOS_Z_OFFSET_CALIBRATE', 'BED_MESH_CALIBRATE',
             'SAVE_CONFIG',
         ])
         # Both PID_CALIBRATE invocations target the right heater at the
@@ -988,7 +989,7 @@ class AutoCalibrateTest(unittest.TestCase):
             coord.cmd_auto_calibrate(fake.FakeGCmd({}))
         script_names = [s.split()[0] for s in gcode.scripts_run]
         self.assertEqual(
-            script_names, ['G28', 'PID_CALIBRATE', 'PID_CALIBRATE', 'NEBULAOS_NOZZLE_CLEAN'])
+            script_names, ['G28', 'PID_CALIBRATE', 'PID_CALIBRATE', '_NEBULAOS_NOZZLE_CLEAN'])
         self.assertNotIn('M140', script_names)
         journal = calibration_journal.read_journal(path=self.journal_path)
         self.assertEqual(journal['state'], calibration_journal.STATE_ERROR)
@@ -1084,7 +1085,7 @@ class NozzleContaminationFixOrderingTest(unittest.TestCase):
         probe_obj = FakeProbeObj(z_offset=1.155)
         printer, gcode, coord = _build_auto_calibrate(
             z_probe, probe_obj, config_overrides=overrides)
-        gcode.commands['NEBULAOS_NOZZLE_CLEAN'] = lambda gcmd: None
+        gcode.commands['_NEBULAOS_NOZZLE_CLEAN'] = lambda gcmd: None
         orig = nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair
         nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = \
             _stub_pair(probe_trigger_z=2.5, nozzle_contact_z=0.831)
@@ -1099,21 +1100,13 @@ class NozzleContaminationFixOrderingTest(unittest.TestCase):
             coord.cmd_auto_calibrate(fake.FakeGCmd({}))
         scripts = gcode.scripts_run
         script_names = [s.split()[0] for s in scripts]
-        # The exact ordering the mission requires: PID hotend -> nozzle
-        # clean -> M104/M109 (reference temp) -> stabilization (G4) ->
-        # localized Z-offset. Sliced out of the full sequence so this
-        # test fails specifically on a reordering of THIS sub-sequence,
-        # not on unrelated later stages (bed_mesh, commit). Found by the
-        # full command text (not a positional "second PID_CALIBRATE"
-        # guess) so this stays correct even if an earlier stage's own
-        # command count changes.
         pid_hotend_idx = scripts.index('PID_CALIBRATE HEATER=extruder TARGET=230.0')
-        z_offset_idx = script_names.index('NEBULAOS_Z_OFFSET_CALIBRATE')
+        z_offset_idx = script_names.index('_NEBULAOS_Z_OFFSET_CALIBRATE')
         sub_sequence = script_names[pid_hotend_idx:z_offset_idx + 1]
         self.assertEqual(sub_sequence, [
-            'PID_CALIBRATE', 'NEBULAOS_NOZZLE_CLEAN',
+            'PID_CALIBRATE', '_NEBULAOS_NOZZLE_CLEAN',
             'M140', 'M104', 'M190', 'M109', 'G4',
-            'NEBULAOS_Z_OFFSET_CALIBRATE',
+            '_NEBULAOS_Z_OFFSET_CALIBRATE',
         ])
 
     def test_reference_temp_is_140_not_230(self):
@@ -1130,8 +1123,8 @@ class NozzleContaminationFixOrderingTest(unittest.TestCase):
         with self.assertRaises(RestartTriggered):
             coord.cmd_auto_calibrate(fake.FakeGCmd({}))
         scripts = gcode.scripts_run
-        nozzle_clean_idx = scripts.index('NEBULAOS_NOZZLE_CLEAN')
-        z_offset_idx = scripts.index('NEBULAOS_Z_OFFSET_CALIBRATE')
+        nozzle_clean_idx = scripts.index('_NEBULAOS_NOZZLE_CLEAN')
+        z_offset_idx = scripts.index('_NEBULAOS_Z_OFFSET_CALIBRATE')
         between = scripts[nozzle_clean_idx + 1:z_offset_idx]
         hotend_commands = [s for s in between if s.startswith(('M104', 'M109'))]
         self.assertEqual(hotend_commands, ['M104 S140.0', 'M109 S140.0'])
@@ -1164,7 +1157,7 @@ class NozzleContaminationFixOrderingTest(unittest.TestCase):
             FakeProbeObj(z_offset=1.155),
             config_overrides={'journal_path': self.journal_path,
                                'z_offset_reference_temp': '150'})
-        gcode.commands['NEBULAOS_NOZZLE_CLEAN'] = lambda gcmd: None
+        gcode.commands['_NEBULAOS_NOZZLE_CLEAN'] = lambda gcmd: None
         orig = nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair
         nebulaos_calibration.nebulaos_probe_pair.measure_probe_nozzle_pair = \
             _stub_pair(probe_trigger_z=2.5, nozzle_contact_z=0.831)
