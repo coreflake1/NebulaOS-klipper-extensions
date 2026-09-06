@@ -189,6 +189,18 @@ class ZCompensate:
 
         self.gcode.register_command('_NEBULAOS_NOZZLE_CLEAN', self.cmd_nozzle_clear,
                                      desc=self.cmd_nozzle_clear_help)
+        # Final pre-hardware closure (2026-09-06): this name is NOT a stale
+        # alias or dead surface, despite having no [gcode_macro] wrapper and
+        # no caller anywhere in this project's own composed config - it is a
+        # real, currently load-bearing external API. NebulaOS-guppyscreen's
+        # recalibration_wizard_panel.cpp calls it directly over the Moonraker
+        # websocket (`ws.gcode_script("Z_OFFSET_CALIBRATION", ...)`),
+        # bypassing the printer.cfg macro layer entirely - the "no composed
+        # config caller" heuristic that flags most orphaned commands does
+        # not catch a caller living in a sibling repo's compiled UI binary.
+        # Do not rename or remove this without first updating and
+        # rebuilding NebulaOS-guppyscreen; kept public and console-visible
+        # deliberately, not by oversight. See docs/NEBULAOS_CORE_PUBLIC_API.md.
         self.gcode.register_command('Z_OFFSET_CALIBRATION', self.cmd_z_offset_calibration,
                                      desc=self.cmd_z_offset_calibration_help)
         # Z_OFFSET_AUTO: registered by the real z_compensate_wrapper.so but never actually
@@ -373,7 +385,11 @@ class ZCompensate:
             hot_start_temp, hot_rub_temp, bed_target + bed_add_temp,
             hot_end_temp=hot_end_temp)
 
-    cmd_z_offset_calibration_help = "Auto-tune Z offset via the load-cell nozzle touch"
+    cmd_z_offset_calibration_help = (
+        "GuppyScreen recalibration-wizard primitive: one load-cell nozzle-"
+        "touch reading, applied as this print's Z offset. Not the guided "
+        "console workflow - see NEBULAOS_Z_OFFSET_CALIBRATE for that."
+    )
 
     def cmd_z_offset_calibration(self, gcmd):
         """Touch-probe at the point BLTouch already homed (self.home_x/self.home_y - see

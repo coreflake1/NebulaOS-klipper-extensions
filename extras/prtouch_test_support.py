@@ -543,10 +543,12 @@ class FakeGCode:
 
     def __init__(self):
         self.commands = {}
+        self.command_descs = {}
         self.scripts_run = []
 
     def register_command(self, name, handler, desc=None):
         self.commands[name] = handler
+        self.command_descs[name] = desc
 
     def run_script_from_command(self, script):
         self.scripts_run.append(script)
