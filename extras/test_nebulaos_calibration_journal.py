@@ -79,7 +79,7 @@ class AdvanceStageTest(unittest.TestCase):
     def test_auto_calibrate_stage_rejected_against_input_shaper_stages(self):
         j = journal.new_journal(1, 'auto_calibrate', now=0.0)
         with self.assertRaises(ValueError):
-            journal.advance_stage(j, 'pid_bed', now=1.0,
+            journal.advance_stage(j, 'nozzle_clean', now=1.0,
                                    stages=journal.INPUT_SHAPER_STAGES)
 
     def test_input_shaper_stages_full_walk_accumulates_in_order(self):
@@ -141,17 +141,17 @@ class CommitAndVerificationTest(unittest.TestCase):
 
     def test_mark_error_before_commit_leaves_commit_flags_false(self):
         j = journal.new_journal(1, 'auto_calibrate', now=0.0)
-        journal.advance_stage(j, 'pid_bed', now=1.0)
-        journal.mark_error(j, 'PID_CALIBRATE failed: heater fault', now=2.0)
+        journal.advance_stage(j, 'nozzle_clean', now=1.0)
+        journal.mark_error(j, 'nozzle clean failed', now=2.0)
         self.assertEqual(j['state'], journal.STATE_ERROR)
         self.assertFalse(j['commit_requested'])
         self.assertFalse(j['restart_pending'])
         self.assertFalse(j['verification_pending'])
-        self.assertEqual(j['error'], 'PID_CALIBRATE failed: heater fault')
+        self.assertEqual(j['error'], 'nozzle clean failed')
 
     def test_mark_cancelled(self):
         j = journal.new_journal(1, 'auto_calibrate', now=0.0)
-        journal.advance_stage(j, 'pid_bed', now=1.0)
+        journal.advance_stage(j, 'nozzle_clean', now=1.0)
         journal.mark_cancelled(j, now=2.0)
         self.assertEqual(j['state'], journal.STATE_CANCELLED)
 
@@ -172,7 +172,7 @@ class ReadWriteRoundTripTest(unittest.TestCase):
 
     def test_round_trip_preserves_content(self):
         j = journal.new_journal(7, 'auto_calibrate', now=123.5)
-        journal.advance_stage(j, 'pid_bed', now=124.0)
+        journal.advance_stage(j, 'nozzle_clean', now=124.0)
         journal.write_journal(j, path=self.path)
         loaded = journal.read_journal(path=self.path)
         self.assertEqual(loaded, j)

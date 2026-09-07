@@ -92,7 +92,7 @@ class ZCompensate:
         self.home_y = None
         self.mesh_min, self.mesh_max = self._read_configured_mesh_bounds(config)
 
-        self.hot_start_temp = config.getfloat('hot_start_temp', default=140, minval=80, maxval=200)
+        self.hot_start_temp = config.getfloat('hot_start_temp', default=150, minval=80, maxval=200)
         self.hot_rub_temp = config.getfloat('hot_rub_temp', default=180, minval=80, maxval=300)
         # hot_end_temp (real key): final nozzle temp after the wipe - threaded through to
         # prtouch_nozzle.clear_nozzle()'s hot_end_temp param.

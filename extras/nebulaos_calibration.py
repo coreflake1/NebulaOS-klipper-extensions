@@ -6,7 +6,7 @@
 # NEBULAOS_Z_OFFSET_CALIBRATE (LOAD_CELL only, bounded-descent envelope +
 # measurement-quality/repeatability gating, plus its SIMULATE_BOOTSTRAP=1
 # qualification aid - mission §8); NEBULAOS_AUTO_CALIBRATE, the
-# fully-automatic preflight->home->PID->nozzle-clean->Z-offset->bed-mesh->
+# geometry-only preflight->home->nozzle-clean->Z-offset->bed-mesh->
 # one-SAVE_CONFIG-restart-and-verify sequence (mission §11), backed by
 # nebulaos_calibration_journal.py's persistent transaction journal (mission
 # §12) and NEBULAOS_CALIBRATION_CANCEL. Automatic Axis Twist is a final
@@ -248,11 +248,11 @@ class NebulaOSCalibration:
         # nozzle-clean cycle) was found to bias the load-cell contact
         # measurement low by ~0.6mm (a reproducible ~1.01-1.15mm cluster,
         # against a normal ~1.73-1.80mm cluster) - proven by measuring
-        # immediately after a fresh nozzle clean, at 140C instead of
+        # immediately after a fresh nozzle clean, at 150C instead of
         # 230C: 3/3 clean runs landed back in the normal cluster
         # (1.733-1.742mm, range 0.0095mm) on the SAME unit, SAME
         # persisted prior, SAME contact algorithm - nothing else changed.
-        # 140C default matches nozzle_clean's own hot_end_temp resting
+        # 150C default matches nozzle_clean's own hot_start_temp resting
         # temperature ([z_compensate] config), so this is normally a
         # no-op confirmation of a state nozzle_clean already reached, not
         # a second real heat cycle. The contact algorithm and safety
@@ -272,7 +272,7 @@ class NebulaOSCalibration:
         self.pid_hotend_target = config.getfloat(
             'pid_hotend_target', default=230., minval=0., maxval=320.)
         self.z_offset_reference_temp = config.getfloat(
-            'z_offset_reference_temp', default=140., minval=0., maxval=320.)
+            'z_offset_reference_temp', default=150., minval=0., maxval=320.)
         self.thermal_soak_seconds = config.getfloat(
             'thermal_soak_seconds', default=15., minval=0., maxval=300.)
         self.bed_mesh_profile = config.get('bed_mesh_profile', default='default')
@@ -806,21 +806,18 @@ class NebulaOSCalibration:
             % (result, x, y, envelope, measurement.commanded_floor_z))
 
     # ------------------------------------------------------------------
-    # NEBULAOS_AUTO_CALIBRATE / NEBULAOS_CALIBRATION_CANCEL (mission
-    # §11/§12): a single orchestrated sequence - preflight, home, PID bed,
-    # PID hotend, nozzle clean, establish the calibration thermal state,
-    # stabilize, localized Z-offset, upstream bed mesh, final validation,
-    # ONE persistence transaction (SAVE_CONFIG), restart, post-restart
-    # verification. Every real algorithm (PID_CALIBRATE, BED_MESH_
-    # CALIBRATE, G28, SAVE_CONFIG) stays pristine upstream, dispatched via
-    # gcode.run_script_from_command() exactly like nozzle_clear.py's own
-    # _move() helper dispatches G1 - this module owns only the sequencing,
-    # the journal, and reading back each stage's own already-existing
-    # status fields (self.z_offset_result, etc.) to build the one
+    # NEBULAOS_AUTO_CALIBRATE / NEBULAOS_CALIBRATION_CANCEL: geometry-
+    # only calibration sequence - preflight, home, nozzle clean, establish
+    # the calibration thermal state, stabilize, localized Z-offset,
+    # upstream bed mesh, final validation, ONE persistence transaction
+    # (SAVE_CONFIG), restart, post-restart verification. PID tuning is
+    # deliberately excluded (separate PID_BED/PID_HOTEND macros). Every
+    # real algorithm (BED_MESH_CALIBRATE, G28, SAVE_CONFIG) stays pristine
+    # upstream, dispatched via gcode.run_script_from_command() - this
+    # module owns only the sequencing, the journal, and reading back each
+    # stage's own already-existing status fields to build the one
     # expected_values dict the post-restart verification checks. Axis
-    # Twist is deliberately NOT part of this sequence - manual Axis Twist
-    # is separate, owner-initiated upstream AXIS_TWIST_COMPENSATION_
-    # CALIBRATE maintenance, not part of automatic calibration.
+    # Twist is deliberately NOT part of this sequence.
     # ------------------------------------------------------------------
     def _auto_calibrate_advance(self, journal, stage, now):
         """Advance both the in-memory status (what NEBULAOS_CALIBRATION_
@@ -843,9 +840,9 @@ class NebulaOSCalibration:
             "NEBULAOS_AUTO_CALIBRATE: cancelled by NEBULAOS_CALIBRATION_CANCEL")
 
     cmd_auto_calibrate_help = (
-        "Fully automatic calibration: PID (bed+hotend), nozzle clean, "
-        "localized Z-offset, upstream bed mesh, one SAVE_CONFIG+restart. "
-        "Axis Twist is NOT included - see AXIS_TWIST_COMPENSATION_CALIBRATE")
+        "Guided geometry calibration: nozzle clean, localized Z-offset, "
+        "upstream bed mesh, one SAVE_CONFIG+restart. PID tuning is "
+        "separate (PID_BED/PID_HOTEND). Axis Twist is NOT included.")
 
     def cmd_auto_calibrate(self, gcmd):
         if self.auto_calibrate_state == 'running':
@@ -890,32 +887,20 @@ class NebulaOSCalibration:
             run('G28')
             self._auto_calibrate_check_cancel(journal, time.time())
 
-            self._auto_calibrate_advance(journal, 'pid_bed', time.time())
-            run('PID_CALIBRATE HEATER=heater_bed TARGET=%.1f'
-                % (self.pid_bed_target,))
-            self._auto_calibrate_check_cancel(journal, time.time())
-
-            self._auto_calibrate_advance(journal, 'pid_hotend', time.time())
-            run('PID_CALIBRATE HEATER=extruder TARGET=%.1f'
-                % (self.pid_hotend_target,))
-            self._auto_calibrate_check_cancel(journal, time.time())
+            # Start bed heating early so it soaks during nozzle_clean.
+            run('M140 S%.1f' % (self.pid_bed_target,))
 
             self._auto_calibrate_advance(journal, 'nozzle_clean', time.time())
             run('_NEBULAOS_NOZZLE_CLEAN')
             self._auto_calibrate_check_cancel(journal, time.time())
 
-            # z_offset_reference_temp (NOT pid_hotend_target/230C) -
-            # root-caused 2026-09-02/03: measuring Z-offset shortly after
-            # a long hot dwell biased the load-cell contact reading low
-            # by ~0.6mm (nozzle ooze/contamination accumulated during
-            # PID-hotend tune + hot nozzle-clean). The bed stays at its
-            # intended calibration/mesh temperature (pid_bed_target) -
-            # only the nozzle reference for THIS specific measurement is
-            # lower. See this module's own __init__ comment for the full
-            # evidence and this constant's own header.
+            # Confirm exact calibration temperatures. The nozzle is set
+            # to z_offset_reference_temp (150C) — nozzle_clean's own
+            # hot_start_temp rests at the same value, so this is normally
+            # a confirmation, not a second heat cycle. The bed waits for
+            # pid_bed_target (65C), started before nozzle_clean above.
             self._auto_calibrate_advance(
                 journal, 'establish_thermal_state', time.time())
-            run('M140 S%.1f' % (self.pid_bed_target,))
             run('M104 S%.1f' % (self.z_offset_reference_temp,))
             run('M190 S%.1f' % (self.pid_bed_target,))
             run('M109 S%.1f' % (self.z_offset_reference_temp,))

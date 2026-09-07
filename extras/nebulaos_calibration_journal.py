@@ -47,8 +47,6 @@ DEFAULT_JOURNAL_PATH = DEFAULT_JOURNAL_DIR + "/auto_calibrate_journal.json"
 STAGES = (
     'preflight',
     'home',
-    'pid_bed',
-    'pid_hotend',
     'nozzle_clean',
     'establish_thermal_state',
     'stabilize',

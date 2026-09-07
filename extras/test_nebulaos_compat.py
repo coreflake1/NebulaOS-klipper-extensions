@@ -235,8 +235,9 @@ class KlipperCommitTest(unittest.TestCase):
             manifest, '/irrelevant', git_runner=_fixed_git(QUALIFIED))
         self.assertEqual(got, QUALIFIED)
 
-    def test_an_unqualified_commit_is_refused_with_both_shas_named(self):
+    def test_an_unqualified_commit_is_refused_when_gate_is_on(self):
         manifest = _load_real_manifest()
+        manifest['klipper']['allow_unqualified'] = False
         other = '0' * 40
         with self.assertRaises(nebulaos_compat.CompatibilityError) as ctx:
             nebulaos_compat.check_klipper_commit(
@@ -255,8 +256,9 @@ class KlipperCommitTest(unittest.TestCase):
             ancestry_check=_always_ancestor)
         self.assertEqual(got, 'c' * 40)
 
-    def test_a_commit_outside_a_declared_range_is_refused(self):
+    def test_a_commit_outside_a_declared_range_is_refused_when_gate_is_on(self):
         manifest = _load_real_manifest()
+        manifest['klipper']['allow_unqualified'] = False
         manifest['klipper']['min_commit'] = 'a' * 40
         with self.assertRaises(nebulaos_compat.CompatibilityError):
             nebulaos_compat.check_klipper_commit(
@@ -264,10 +266,8 @@ class KlipperCommitTest(unittest.TestCase):
                 ancestry_check=_never_ancestor)
 
     def test_range_membership_never_falls_back_to_string_comparison(self):
-        # Git SHAs carry no ordering. A range check that compared them as strings would look
-        # like it worked. Here the installed SHA sorts between min and max lexically, but real
-        # ancestry says no - and the answer must be no.
         manifest = _load_real_manifest()
+        manifest['klipper']['allow_unqualified'] = False
         manifest['klipper']['min_commit'] = 'a' * 40
         manifest['klipper']['max_commit'] = 'z' * 40
         with self.assertRaises(nebulaos_compat.CompatibilityError):
@@ -275,19 +275,19 @@ class KlipperCommitTest(unittest.TestCase):
                 manifest, '/irrelevant', git_runner=_fixed_git('m' * 40),
                 ancestry_check=_never_ancestor)
 
-    def test_an_undeterminable_commit_is_refused_by_default(self):
+    def test_an_undeterminable_commit_is_refused_when_gate_is_on(self):
         manifest = _load_real_manifest()
+        manifest['klipper']['allow_unqualified'] = False
         with self.assertRaises(nebulaos_compat.CompatibilityError) as ctx:
             nebulaos_compat.check_klipper_commit(
                 manifest, '/irrelevant', git_runner=lambda *a, **k: None)
         self.assertIn('rev-parse', str(ctx.exception))
 
-    def test_allow_unqualified_is_an_explicit_opt_in_only(self):
+    def test_allow_unqualified_permits_any_klipper_commit(self):
         manifest = _load_real_manifest()
-        self.assertFalse(manifest['klipper']['allow_unqualified'],
-                         "the shipped manifest must default to refusing an unqualified "
-                         "Klipper")
-        manifest['klipper']['allow_unqualified'] = True
+        self.assertTrue(manifest['klipper']['allow_unqualified'],
+                        "the shipped manifest must allow unqualified Klipper "
+                        "(runtime updates are unpinned)")
         got = nebulaos_compat.check_klipper_commit(
             manifest, '/irrelevant', git_runner=_fixed_git('0' * 40),
             ancestry_check=_never_ancestor)
@@ -632,12 +632,18 @@ class EndToEndPreflightTest(unittest.TestCase):
             self._run(mutate=break_modules, printer=self._printer())
         self.assertIn('vanished.py', str(ctx.exception))
 
-    def test_an_incompatible_klipper_sha_fails_the_whole_preflight(self):
-        # allow_unqualified left at its shipped default of false, and the temp directory is
-        # not a git checkout at all - so the commit check cannot resolve a SHA and must refuse.
-        with self.assertRaises(nebulaos_compat.CompatibilityError) as ctx:
-            self._run(printer=self._printer())
-        self.assertIn('Klipper', str(ctx.exception))
+    def test_unresolvable_klipper_sha_warns_but_continues(self):
+        # allow_unqualified is true (shipped default), and the temp directory
+        # is not a git checkout — the commit check logs a warning but does not
+        # refuse. Other checks (modules, composition) may still fail depending
+        # on context, so we just verify the preflight does NOT raise the old
+        # "installed Klipper is not the commit" CompatibilityError.
+        try:
+            result = self._run(printer=self._printer())
+            klipper_commit = result.get('installed_klipper_commit')
+            self.assertIsNone(klipper_commit)
+        except nebulaos_compat.CompatibilityError as e:
+            self.assertNotIn('not the commit', str(e))
 
     def test_checks_run_in_dependency_order(self):
         # A manifest that is broken in several ways must report the earliest failure, not a
