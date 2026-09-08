@@ -705,10 +705,14 @@ class NebulaOSCalibration:
         self.z_offset_error = None
         self.gcode.respond_info(
             "NEBULAOS_Z_OFFSET_CALIBRATE: measured %.5f mm (probe trigger "
-            "%.5f, nozzle contact %.5f at X=%.3f Y=%.3f), applied live. "
-            "The SAVE_CONFIG command will make this permanent."
+            "%.5f, nozzle contact %.5f at X=%.3f Y=%.3f), applied live."
             % (new_offset, measurement.raw_probe_trigger_z,
                measurement.raw_nozzle_contact_z, x, y))
+        if self.auto_calibrate_state != 'running':
+            self.gcode.respond_info(
+                "NEBULAOS_Z_OFFSET_CALIBRATE: committing with SAVE_CONFIG, "
+                "printer will restart")
+            self.gcode.run_script_from_command('SAVE_CONFIG')
 
     # ------------------------------------------------------------------
     # NEBULAOS_Z_OFFSET_CALIBRATE SIMULATE_BOOTSTRAP=1 (mission §8: a
@@ -1191,6 +1195,20 @@ class NebulaOSCalibration:
     #      SAVE_CONFIG+restart+post-restart verification, same journal
     #      pattern as NEBULAOS_AUTO_CALIBRATE.
     # ------------------------------------------------------------------
+    def _send_action_prompt(self, title, text_lines, buttons=None):
+        self.gcode.respond_raw("// action:prompt_end")
+        self.gcode.respond_raw("// action:prompt_begin %s" % (title,))
+        for line in text_lines:
+            self.gcode.respond_raw("// action:prompt_text %s" % (line,))
+        if buttons:
+            for label, gcode_cmd in buttons:
+                self.gcode.respond_raw(
+                    "// action:prompt_button %s|%s" % (label, gcode_cmd))
+        self.gcode.respond_raw("// action:prompt_show")
+
+    def _dismiss_action_prompt(self):
+        self.gcode.respond_raw("// action:prompt_end")
+
     cmd_input_shaper_calibrate_help = (
         "Guided Input Shaper calibration for a MOVABLE clip-on "
         "accelerometer - call with no params to home and preflight; call "
@@ -1263,10 +1281,12 @@ class NebulaOSCalibration:
             raise
 
         self.input_shaper_state = 'awaiting_x_mount'
-        self.gcode.respond_info(
-            "NEBULAOS_INPUT_SHAPER_CALIBRATE: homed. Mount the "
-            "accelerometer RIGIDLY on the TOOLHEAD now, then call "
-            "NEBULAOS_INPUT_SHAPER_CALIBRATE CONTINUE=1 to measure X.")
+        self._send_action_prompt(
+            "Input Shaper Calibration",
+            ["Homed successfully.",
+             "Mount the accelerometer RIGIDLY on the TOOLHEAD now."],
+            [("Continue",
+              "_NEBULAOS_INPUT_SHAPER_CALIBRATE CONTINUE=1")])
 
     def _build_shaper_calibrate_script(self, axis):
         """The exact upstream SHAPER_CALIBRATE invocation this workflow
@@ -1316,12 +1336,14 @@ class NebulaOSCalibration:
                 self._input_shaper_type_x = shaper.params.shaper_type
                 self._input_shaper_freq_x = round(shaper.params.shaper_freq, 3)
                 self.input_shaper_state = 'awaiting_y_mount'
-                self.gcode.respond_info(
-                    "NEBULAOS_INPUT_SHAPER_CALIBRATE: X measured (%s@%.1fHz). "
-                    "Move the SAME accelerometer RIGIDLY to the BED now, "
-                    "then call NEBULAOS_INPUT_SHAPER_CALIBRATE CONTINUE=1 "
-                    "to measure Y and commit."
-                    % (shaper.params.shaper_type, shaper.params.shaper_freq))
+                self._send_action_prompt(
+                    "Input Shaper Calibration",
+                    ["X axis measured: %s @ %.1fHz."
+                     % (shaper.params.shaper_type,
+                        shaper.params.shaper_freq),
+                     "Move the SAME accelerometer RIGIDLY to the BED now."],
+                    [("Continue",
+                      "_NEBULAOS_INPUT_SHAPER_CALIBRATE CONTINUE=1")])
                 return
 
             advance('final_validation', time.time())

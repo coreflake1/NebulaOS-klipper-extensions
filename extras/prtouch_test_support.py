@@ -556,6 +556,9 @@ class FakeGCode:
     def respond_info(self, msg):
         pass
 
+    def respond_raw(self, msg):
+        pass
+
 
 class FakeGCmd:
     def __init__(self, params=None):

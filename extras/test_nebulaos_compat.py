@@ -25,30 +25,9 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(
     nebulaos_compat.__file__)))
 REAL_MANIFEST = os.path.join(REPO_ROOT, nebulaos_compat.MANIFEST_FILENAME)
 
-QUALIFIED = '58bd67db3ce1be1951c3e4a6d1156a79903d4edc'
-
-
 def _load_real_manifest():
     with open(REAL_MANIFEST, 'r') as f:
         return json.load(f)
-
-
-def _fixed_git(sha):
-    """A git_runner stand-in that reports one commit, so commit checks are testable without
-    a real Klipper checkout."""
-    def runner(repo_dir, *args):
-        if args[:1] == ('rev-parse',):
-            return sha
-        return None
-    return runner
-
-
-def _never_ancestor(repo_dir, a, b):
-    return False
-
-
-def _always_ancestor(repo_dir, a, b):
-    return True
 
 
 class _FakeHeaters:
@@ -228,70 +207,18 @@ class RequiredSymbolTest(unittest.TestCase):
             self.assertIn(name, msg)
 
 
-class KlipperCommitTest(unittest.TestCase):
-    def test_the_qualified_commit_is_accepted(self):
+class VersionGateRemovalTest(unittest.TestCase):
+    def test_no_klipper_section_in_manifest(self):
         manifest = _load_real_manifest()
-        got = nebulaos_compat.check_klipper_commit(
-            manifest, '/irrelevant', git_runner=_fixed_git(QUALIFIED))
-        self.assertEqual(got, QUALIFIED)
+        self.assertNotIn('klipper', manifest,
+                         "manifest must not contain a klipper version gate section")
 
-    def test_an_unqualified_commit_is_refused_when_gate_is_on(self):
-        manifest = _load_real_manifest()
-        manifest['klipper']['allow_unqualified'] = False
-        other = '0' * 40
-        with self.assertRaises(nebulaos_compat.CompatibilityError) as ctx:
-            nebulaos_compat.check_klipper_commit(
-                manifest, '/irrelevant', git_runner=_fixed_git(other),
-                ancestry_check=_never_ancestor)
-        msg = str(ctx.exception)
-        self.assertIn(other, msg)
-        self.assertIn(QUALIFIED, msg)
+    def test_no_check_klipper_commit_function(self):
+        self.assertFalse(hasattr(nebulaos_compat, 'check_klipper_commit'),
+                         "check_klipper_commit must be removed entirely")
 
-    def test_a_commit_inside_a_declared_range_is_accepted_by_real_ancestry(self):
-        manifest = _load_real_manifest()
-        manifest['klipper']['min_commit'] = 'a' * 40
-        manifest['klipper']['max_commit'] = 'b' * 40
-        got = nebulaos_compat.check_klipper_commit(
-            manifest, '/irrelevant', git_runner=_fixed_git('c' * 40),
-            ancestry_check=_always_ancestor)
-        self.assertEqual(got, 'c' * 40)
-
-    def test_a_commit_outside_a_declared_range_is_refused_when_gate_is_on(self):
-        manifest = _load_real_manifest()
-        manifest['klipper']['allow_unqualified'] = False
-        manifest['klipper']['min_commit'] = 'a' * 40
-        with self.assertRaises(nebulaos_compat.CompatibilityError):
-            nebulaos_compat.check_klipper_commit(
-                manifest, '/irrelevant', git_runner=_fixed_git('c' * 40),
-                ancestry_check=_never_ancestor)
-
-    def test_range_membership_never_falls_back_to_string_comparison(self):
-        manifest = _load_real_manifest()
-        manifest['klipper']['allow_unqualified'] = False
-        manifest['klipper']['min_commit'] = 'a' * 40
-        manifest['klipper']['max_commit'] = 'z' * 40
-        with self.assertRaises(nebulaos_compat.CompatibilityError):
-            nebulaos_compat.check_klipper_commit(
-                manifest, '/irrelevant', git_runner=_fixed_git('m' * 40),
-                ancestry_check=_never_ancestor)
-
-    def test_an_undeterminable_commit_is_refused_when_gate_is_on(self):
-        manifest = _load_real_manifest()
-        manifest['klipper']['allow_unqualified'] = False
-        with self.assertRaises(nebulaos_compat.CompatibilityError) as ctx:
-            nebulaos_compat.check_klipper_commit(
-                manifest, '/irrelevant', git_runner=lambda *a, **k: None)
-        self.assertIn('rev-parse', str(ctx.exception))
-
-    def test_allow_unqualified_permits_any_klipper_commit(self):
-        manifest = _load_real_manifest()
-        self.assertTrue(manifest['klipper']['allow_unqualified'],
-                        "the shipped manifest must allow unqualified Klipper "
-                        "(runtime updates are unpinned)")
-        got = nebulaos_compat.check_klipper_commit(
-            manifest, '/irrelevant', git_runner=_fixed_git('0' * 40),
-            ancestry_check=_never_ancestor)
-        self.assertEqual(got, '0' * 40)
+    def test_klipper_not_in_required_manifest_keys(self):
+        self.assertNotIn('klipper', nebulaos_compat.REQUIRED_MANIFEST_KEYS)
 
 
 class ChelperVerdictTest(unittest.TestCase):
@@ -593,32 +520,21 @@ class EndToEndPreflightTest(unittest.TestCase):
         })
 
     def test_a_valid_manifest_passes_and_reports_what_it_verified(self):
-        def allow(manifest):
-            # The commit check needs a real checkout; exercise it separately (KlipperCommitTest)
-            # and let this end-to-end run past it.
-            manifest['klipper']['allow_unqualified'] = True
-        status = self._run(mutate=allow, printer=self._printer())
+        status = self._run(printer=self._printer())
         self.assertEqual(status['status'], 'ok')
-        self.assertEqual(status['qualified_klipper_commit'], QUALIFIED)
         self.assertEqual(status['registered_sensor_types'], ['nebulaos_temperature_mcu'])
         self.assertGreater(status['managed_module_count'], 25)
-        # Every runtime module was verified as a link resolving inside this repository.
         runtime = [e for e in _load_real_manifest()['modules']
                    if e.get('role') != 'test']
         self.assertEqual(status['verified_composed_modules'], len(runtime))
 
     def test_an_uncomposed_checkout_fails_the_whole_preflight(self):
-        # The end-to-end shape of the collision guard: a Klipper checkout where the managed
-        # modules are simply not there at all.
-        def allow(manifest):
-            manifest['klipper']['allow_unqualified'] = True
         with self.assertRaises(nebulaos_compat.CompatibilityError) as ctx:
-            self._run(mutate=allow, printer=self._printer(), compose=False)
+            self._run(printer=self._printer(), compose=False)
         self.assertIn('composition is incomplete', str(ctx.exception))
 
     def test_a_missing_required_api_fails_the_whole_preflight(self):
         def break_symbols(manifest):
-            manifest['klipper']['allow_unqualified'] = True
             manifest['required_klipper_symbols'].append('mcu:MCU.gone_in_a_future_klipper')
         with self.assertRaises(nebulaos_compat.CompatibilityError) as ctx:
             self._run(mutate=break_symbols, printer=self._printer())
@@ -626,24 +542,15 @@ class EndToEndPreflightTest(unittest.TestCase):
 
     def test_a_missing_managed_module_source_fails_the_whole_preflight(self):
         def break_modules(manifest):
-            manifest['klipper']['allow_unqualified'] = True
             manifest['modules'].append({'path': 'extras/vanished.py', 'role': 'runtime'})
         with self.assertRaises(nebulaos_compat.CompatibilityError) as ctx:
             self._run(mutate=break_modules, printer=self._printer())
         self.assertIn('vanished.py', str(ctx.exception))
 
-    def test_unresolvable_klipper_sha_warns_but_continues(self):
-        # allow_unqualified is true (shipped default), and the temp directory
-        # is not a git checkout — the commit check logs a warning but does not
-        # refuse. Other checks (modules, composition) may still fail depending
-        # on context, so we just verify the preflight does NOT raise the old
-        # "installed Klipper is not the commit" CompatibilityError.
-        try:
-            result = self._run(printer=self._printer())
-            klipper_commit = result.get('installed_klipper_commit')
-            self.assertIsNone(klipper_commit)
-        except nebulaos_compat.CompatibilityError as e:
-            self.assertNotIn('not the commit', str(e))
+    def test_no_klipper_version_gate_in_preflight(self):
+        status = self._run(printer=self._printer())
+        self.assertNotIn('qualified_klipper_commit', status)
+        self.assertNotIn('installed_klipper_commit', status)
 
     def test_checks_run_in_dependency_order(self):
         # A manifest that is broken in several ways must report the earliest failure, not a

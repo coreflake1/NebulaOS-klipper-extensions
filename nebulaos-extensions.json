@@ -3,13 +3,6 @@
   "extensions_version": "1.2.0-phase1.9b-plr",
   "nebulaos_api_level": 1,
 
-  "klipper": {
-    "qualified_commit": "58bd67db3ce1be1951c3e4a6d1156a79903d4edc",
-    "min_commit": null,
-    "max_commit": null,
-    "allow_unqualified": true
-  },
-
   "required_klipper_symbols": [
     "mcu:MCU.register_serial_response",
     "mcu:MCU.create_oid",
@@ -55,8 +48,6 @@
     {"path": "extras/gcode_shell_command.py", "role": "runtime"},
     {"path": "extras/virtual_pins.py", "role": "runtime"},
     {"path": "extras/calibrate_shaper_config.py", "role": "runtime"},
-    {"path": "extras/guppy_config_helper.py", "role": "runtime"},
-    {"path": "extras/guppy_module_loader.py", "role": "runtime"},
     {"path": "extras/nebulaos_z_offset_probe.py", "role": "runtime"},
     {"path": "extras/nozzle_clear.py", "role": "runtime"},
     {"path": "extras/bl24c16f.py", "role": "runtime"},

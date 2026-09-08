@@ -65,7 +65,6 @@
 import json
 import logging
 import os
-import subprocess
 
 # The manifest schema versions this module knows how to read. A manifest declaring anything
 # else is refused rather than interpreted optimistically - a newer schema may mean a check
@@ -75,7 +74,7 @@ SUPPORTED_SCHEMA_VERSIONS = (1,)
 MANIFEST_FILENAME = 'nebulaos-extensions.json'
 
 REQUIRED_MANIFEST_KEYS = (
-    'compat_schema_version', 'extensions_version', 'klipper',
+    'compat_schema_version', 'extensions_version',
     'required_klipper_symbols', 'modules', 'composition',
 )
 
@@ -259,93 +258,6 @@ def check_required_symbols(manifest):
             "set to one qualified against this Klipper." % ('\n'.join(problems),))
 
 
-def _git(repo_dir, *args):
-    try:
-        out = subprocess.check_output(
-            ['git', '-C', repo_dir] + list(args),
-            stderr=subprocess.STDOUT, timeout=10)
-        return out.decode('utf-8', 'replace').strip()
-    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-        logging.info("nebulaos_compat: git %s failed: %s", ' '.join(args), e)
-        return None
-
-
-def _is_ancestor(repo_dir, maybe_ancestor, descendant):
-    try:
-        subprocess.check_call(
-            ['git', '-C', repo_dir, 'merge-base', '--is-ancestor',
-             maybe_ancestor, descendant],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
-        return True
-    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        return False
-
-
-def check_klipper_commit(manifest, klipper_dir, git_runner=_git,
-                         ancestry_check=_is_ancestor):
-    """Verify the installed Klipper commit against the manifest.
-
-    Accepts the qualified commit outright. If the manifest declares a min/max range, ancestry
-    is decided with real `git merge-base --is-ancestor` calls - never a string comparison,
-    because git SHAs carry no ordering whatsoever and comparing them as strings would produce
-    a check that looks like it works and does not.
-    """
-    spec = manifest.get('klipper') or {}
-    qualified = spec.get('qualified_commit')
-    if not qualified:
-        raise CompatibilityError(
-            "compatibility manifest declares no klipper.qualified_commit")
-
-    installed = git_runner(klipper_dir, 'rev-parse', 'HEAD')
-    if installed is None:
-        if spec.get('allow_unqualified'):
-            logging.warning(
-                "nebulaos_compat: could not determine the installed Klipper commit at %s, "
-                "and klipper.allow_unqualified is set - continuing unverified", klipper_dir)
-            return None
-        raise CompatibilityError(
-            "could not determine the installed Klipper commit: `git -C %s rev-parse HEAD` "
-            "failed. NebulaOS runs Klipper from a real git checkout precisely so this is "
-            "answerable; a non-git or damaged checkout cannot be qualified, so it is refused."
-            % (klipper_dir,))
-
-    if installed == qualified:
-        return installed
-
-    min_commit = spec.get('min_commit')
-    max_commit = spec.get('max_commit')
-    if min_commit or max_commit:
-        in_range = True
-        if min_commit and not ancestry_check(klipper_dir, min_commit, installed):
-            in_range = False
-        if max_commit and not ancestry_check(klipper_dir, installed, max_commit):
-            in_range = False
-        if in_range:
-            logging.warning(
-                "nebulaos_compat: installed Klipper %s is not the qualified commit %s, but "
-                "is within the manifest's declared compatible range - continuing",
-                installed, qualified)
-            return installed
-
-    if spec.get('allow_unqualified'):
-        logging.warning(
-            "nebulaos_compat: installed Klipper %s is not qualified (expected %s), but "
-            "klipper.allow_unqualified is set - continuing", installed, qualified)
-        return installed
-
-    raise CompatibilityError(
-        "installed Klipper is not the commit this NebulaOS extension set was qualified "
-        "against.\n"
-        "  installed:  %s\n"
-        "  qualified:  %s\n"
-        "  checkout:   %s\n"
-        "Refusing to start. This extension set drives a load-cell probe into the bed; running "
-        "it against an unqualified Klipper is a physical-safety change, not a version "
-        "mismatch. Either check out the qualified commit, or - if this is deliberate "
-        "development - set klipper.allow_unqualified in %s."
-        % (installed, qualified, klipper_dir, MANIFEST_FILENAME))
-
-
 def check_composition_integrity(manifest, klipper_dir, repo_root):
     """Verify that every runtime module is reachable as a symlink resolving into THIS
     repository - the collision guard, from inside the running process.
@@ -498,7 +410,6 @@ def run_preflight(manifest_path, klipper_dir, printer=None, config=None,
     repo_root = os.path.dirname(os.path.abspath(manifest_path))
     check_modules_present(manifest, repo_root, include_tests=include_tests)
     check_required_symbols(manifest)
-    installed = check_klipper_commit(manifest, klipper_dir)
     composed = check_composition_integrity(manifest, klipper_dir, repo_root)
     check_chelper_verdict(manifest, klipper_dir)
     sensor_types = []
@@ -508,8 +419,6 @@ def run_preflight(manifest_path, klipper_dir, printer=None, config=None,
         'extensions_version': manifest.get('extensions_version'),
         'nebulaos_api_level': manifest.get('nebulaos_api_level'),
         'compat_schema_version': manifest.get('compat_schema_version'),
-        'qualified_klipper_commit': (manifest.get('klipper') or {}).get('qualified_commit'),
-        'installed_klipper_commit': installed,
         'managed_module_count': len(manifest.get('modules', ())),
         'verified_composed_modules': composed,
         'registered_sensor_types': sensor_types,
@@ -539,11 +448,9 @@ class NebulaOSCompat:
         except CompatibilityError as e:
             raise self.printer.config_error("nebulaos_compat: %s" % (e,))
         logging.info(
-            "nebulaos_compat: PASS - extensions %s (api level %s), %d managed modules, "
-            "Klipper %s",
+            "nebulaos_compat: PASS - extensions %s (api level %s), %d managed modules",
             self.status['extensions_version'], self.status['nebulaos_api_level'],
-            self.status['managed_module_count'],
-            self.status['installed_klipper_commit'] or 'unverified')
+            self.status['managed_module_count'])
 
     def get_status(self, eventtime=None):
         return dict(self.status)
