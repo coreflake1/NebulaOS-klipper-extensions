@@ -1,4 +1,4 @@
-# Regression tests for the 2026-08-10 Z_OFFSET_CALIBRATION non-reentrancy guard (see
+# Regression tests for the z_compensate calibration non-reentrancy guard (see
 # docs/NEBULAOS_PRTOUCH_MCU_TIMER_FORENSICS.md and z_compensate.py's own guard comment) - a
 # second, higher-level guard on top of prtouch_probe.py's own PrtouchProbe._own_raw_operation
 # (see test_prtouch_raw_op_guard.py), protecting the whole multi-step calibration sequence
@@ -107,51 +107,17 @@ class ReentrancyGuardTest(unittest.TestCase):
         self.assertEqual(zc.calibration_state, "complete")
 
 
-# Final pre-hardware closure (2026-09-06): Z_OFFSET_CALIBRATION's public API
-# audit found no [gcode_macro] wrapper and no composed-config caller, which
-# looks identical to a stale alias until NebulaOS-guppyscreen's own source is
-# checked - its recalibration_wizard_panel.cpp calls this exact name over the
-# Moonraker websocket. These tests prove the two commands this mission's
-# audit could otherwise confuse are genuinely distinct, independently
-# registered implementations, not one aliasing the other.
+
 class PublicAPISurfaceTest(unittest.TestCase):
-    def test_z_offset_calibration_is_registered_directly_on_gcode(self):
+    def test_z_offset_calibration_is_not_registered_as_public_command(self):
         printer, mcu, _pins, _values = fake.build_environment()
         zc_config = fake.make_z_compensate_config(printer, dict(fake.REAL_Z_COMPENSATE_CONFIG))
         zc = z_compensate.ZCompensate(zc_config)
         fake.connect(printer, mcu)
 
         gcode = printer.lookup_object('gcode')
-        self.assertIn('Z_OFFSET_CALIBRATION', gcode.commands)
-        self.assertEqual(gcode.commands['Z_OFFSET_CALIBRATION'], zc.cmd_z_offset_calibration)
-
-    def test_z_offset_calibration_help_names_its_real_caller_and_the_canonical_alternative(self):
-        # The exact wording is not load-bearing - only that a reader (or a
-        # future audit) sees GuppyScreen and NEBULAOS_Z_OFFSET_CALIBRATE
-        # named here, so this command is never again misclassified as an
-        # orphaned alias.
-        help_text = z_compensate.ZCompensate.cmd_z_offset_calibration_help
-        self.assertIn('GuppyScreen', help_text)
-        self.assertIn('NEBULAOS_Z_OFFSET_CALIBRATE', help_text)
-
-    def test_z_offset_calibration_and_nebulaos_z_offset_calibrate_backend_are_different_modules(self):
-        # _NEBULAOS_Z_OFFSET_CALIBRATE (the canonical guided workflow's
-        # private backend) lives entirely in nebulaos_calibration.py, not
-        # here - confirms these are two independent implementations behind
-        # similarly-named commands, not one command aliasing the other.
-        # Source-text inspection, not a live import: nebulaos_calibration.py
-        # imports upstream Klipper's real probe.py at module scope, which
-        # only resolves inside a fully composed Klipper tree (see
-        # tests/klipper-config-load-smoke-tests.py for the suite that
-        # exercises this module in that real environment instead).
-        import os
-        this_dir = os.path.dirname(os.path.abspath(__file__))
-        with open(os.path.join(this_dir, 'nebulaos_calibration.py')) as f:
-            calibration_source = f.read()
-        self.assertIn("'_NEBULAOS_Z_OFFSET_CALIBRATE'", calibration_source)
-        self.assertIn('def cmd_z_offset_calibrate(', calibration_source)
-        self.assertFalse(hasattr(z_compensate.ZCompensate, 'cmd_z_offset_calibrate'))
-        self.assertFalse(hasattr(z_compensate.ZCompensate, 'cmd_nebulaos_z_offset_calibrate'))
+        self.assertNotIn('Z_OFFSET_CALIBRATION', gcode.commands)
+        self.assertIn('_NEBULAOS_NOZZLE_CLEAN', gcode.commands)
 
 
 if __name__ == '__main__':

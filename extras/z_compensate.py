@@ -189,20 +189,6 @@ class ZCompensate:
 
         self.gcode.register_command('_NEBULAOS_NOZZLE_CLEAN', self.cmd_nozzle_clear,
                                      desc=self.cmd_nozzle_clear_help)
-        # Final pre-hardware closure (2026-09-06): this name is NOT a stale
-        # alias or dead surface, despite having no [gcode_macro] wrapper and
-        # no caller anywhere in this project's own composed config - it is a
-        # real, currently load-bearing external API. NebulaOS-guppyscreen's
-        # recalibration_wizard_panel.cpp calls it directly over the Moonraker
-        # websocket (`ws.gcode_script("Z_OFFSET_CALIBRATION", ...)`),
-        # bypassing the printer.cfg macro layer entirely - the "no composed
-        # config caller" heuristic that flags most orphaned commands does
-        # not catch a caller living in a sibling repo's compiled UI binary.
-        # Do not rename or remove this without first updating and
-        # rebuilding NebulaOS-guppyscreen; kept public and console-visible
-        # deliberately, not by oversight. See docs/NEBULAOS_CORE_PUBLIC_API.md.
-        self.gcode.register_command('Z_OFFSET_CALIBRATION', self.cmd_z_offset_calibration,
-                                     desc=self.cmd_z_offset_calibration_help)
         # Z_OFFSET_AUTO: registered by the real z_compensate_wrapper.so but never actually
         # called by any macro on this printer (DESIGN.md open question 2, resolved: skip for
         # v1) - not registering unless something turns out to need it.
@@ -386,9 +372,9 @@ class ZCompensate:
             hot_end_temp=hot_end_temp)
 
     cmd_z_offset_calibration_help = (
-        "GuppyScreen recalibration-wizard primitive: one load-cell nozzle-"
-        "touch reading, applied as this print's Z offset. Not the guided "
-        "console workflow - see NEBULAOS_Z_OFFSET_CALIBRATE for that."
+        "Internal: one load-cell nozzle-touch reading, applied as this "
+        "print's Z offset. Use NEBULAOS_Z_OFFSET_CALIBRATE for the "
+        "guided workflow."
     )
 
     def cmd_z_offset_calibration(self, gcmd):
@@ -428,8 +414,8 @@ class ZCompensate:
         # is guaranteed to observe "running" already set.
         if self.calibration_state == "running":
             raise self.printer.command_error(
-                "Z_OFFSET_CALIBRATION: a calibration is already in progress")
-        self._require_load_cell('Z_OFFSET_CALIBRATION')
+                "z_compensate: a calibration is already in progress")
+        self._require_load_cell('z_compensate')
 
         # Structured status: a new attempt always gets a new id and clears any previous
         # result before doing anything else - a caller polling get_status() must never see a
@@ -460,14 +446,14 @@ class ZCompensate:
             # status, is strictly better than silently accepting a broken value.
             if not math.isfinite(measured_z):
                 raise self.printer.command_error(
-                    "Z_OFFSET_CALIBRATION: measured value %r is not a finite number"
+                    "z_compensate: measured value %r is not a finite number"
                     % (measured_z,))
             # A finite but implausibly large candidate (see max_offset_correction_mm's own
             # comment in __init__) gets the same treatment - rejected before it is ever applied
             # or published as a completed result, not silently clamped or accepted.
             if abs(measured_z) > self.max_offset_correction_mm:
                 raise self.printer.command_error(
-                    "Z_OFFSET_CALIBRATION: measured value %.5fmm exceeds "
+                    "z_compensate: measured value %.5fmm exceeds "
                     "max_offset_correction_mm=%.5fmm - refusing to apply an implausibly large "
                     "correction" % (measured_z, self.max_offset_correction_mm))
 
@@ -478,22 +464,15 @@ class ZCompensate:
             self.calibration_error = _sanitize_calibration_error(e)
             raise
 
-        # The calibration itself has now genuinely succeeded - a real measurement was taken
-        # and applied as this print's live Z offset. Publish "complete" here, before the
-        # optional persist_offset block below, deliberately: GuppyScreen's own persistence
-        # step consumes calibration_z_offset directly and does its own save/restart,
-        # entirely independent of persist_offset (which stays a separate, opt-in,
-        # console/config-file concern - see this module's own docstring on why a restart
-        # here would be wrong for the common per-print case). If persist_offset's own extra
-        # steps below fail, that failure still propagates as a normal command_error (existing
-        # behavior, unchanged) but does not retroactively invalidate a result that was
-        # already correct and already applied.
+        # Publish "complete" before the optional persist_offset block: callers
+        # polling get_status() see the result immediately, and persist_offset
+        # failure does not retroactively invalidate an already-applied offset.
         self.calibration_state = "complete"
         self.calibration_z_offset = measured_z
         self.calibration_error = None
 
         gcmd.respond_info(
-            "Z_OFFSET_CALIBRATION: measured %.5f mm, applied as this print's Z offset"
+            "z_compensate: measured %.5f mm, applied as this print's Z offset"
             % measured_z)
 
         if self.persist_offset:

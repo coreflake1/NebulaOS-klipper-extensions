@@ -457,6 +457,18 @@ class NebulaOSCalibration:
             '_NEBULAOS_INPUT_SHAPER_CALIBRATE',
             self.cmd_input_shaper_calibrate,
             desc=self.cmd_input_shaper_calibrate_help)
+        self.gcode.register_command(
+            '_NEBULAOS_INPUT_SHAPER_CANCEL',
+            self.cmd_input_shaper_cancel,
+            desc="Cancel an in-progress Input Shaper calibration")
+        self.gcode.register_command(
+            '_NEBULAOS_ESTEPS_CANCEL',
+            self.cmd_esteps_cancel,
+            desc="Cancel an in-progress E-Steps calibration")
+        self.gcode.register_command(
+            '_NEBULAOS_ESTEPS_CONFIRM',
+            self.cmd_esteps_confirm,
+            desc="Confirm and persist a pending E-Steps result")
         self.printer.register_event_handler(
             "klippy:ready", self._handle_ready)
 
@@ -1082,11 +1094,16 @@ class NebulaOSCalibration:
             raise
 
         self.esteps_state = 'awaiting_continue'
-        self.gcode.respond_info(
-            "NEBULAOS_ESTEPS_CALIBRATE: hotend at %.1fC. Mark the filament "
-            "at the extruder's entry point now. When ready, call "
-            "NEBULAOS_ESTEPS_CALIBRATE CONTINUE=1 to extrude %.1fmm."
-            % (self.esteps_temp, self.esteps_commanded_length_mm))
+        self._send_action_prompt(
+            "E-Steps Calibration",
+            ["Hotend at %.0fC." % (self.esteps_temp,),
+             "Mark the filament at the extruder entry point now.",
+             "When marked, click Start Extrusion to extrude %.0fmm."
+             % (self.esteps_commanded_length_mm,)],
+            [("Start Extrusion",
+              "_NEBULAOS_ESTEPS_CALIBRATE CONTINUE=1"),
+             ("Cancel",
+              "_NEBULAOS_ESTEPS_CANCEL")])
 
     def _esteps_extrude(self, gcmd):
         if self.esteps_state != 'awaiting_continue':
@@ -1115,11 +1132,14 @@ class NebulaOSCalibration:
 
         self.esteps_commanded_length = self.esteps_commanded_length_mm
         self.esteps_state = 'awaiting_measurement'
-        self.gcode.respond_info(
-            "NEBULAOS_ESTEPS_CALIBRATE: extruded %.1fmm (commanded). "
-            "Measure how far your mark actually moved and call "
-            "NEBULAOS_ESTEPS_CALIBRATE MEASURED=<mm>."
-            % (self.esteps_commanded_length,))
+        self._send_action_prompt(
+            "E-Steps Calibration",
+            ["Extruded %.0fmm (commanded)." % (self.esteps_commanded_length,),
+             "Measure how far the mark actually moved.",
+             "Enter measurement via console:",
+             "NEBULAOS_ESTEPS_CALIBRATE MEASURED=<mm>"],
+            [("Cancel",
+              "_NEBULAOS_ESTEPS_CANCEL")])
 
     def _esteps_apply(self, gcmd, measured):
         if self.esteps_state != 'awaiting_measurement':
@@ -1134,7 +1154,6 @@ class NebulaOSCalibration:
                     "finite, positive length in mm" % (measured,))
             commanded = self.esteps_commanded_length
             old_rd = self.esteps_old_rotation_distance
-            # Upstream's own documented measure-and-trim relationship.
             ratio = measured / commanded
             new_rd = old_rd * ratio
             if abs(ratio - 1.0) > self.esteps_max_correction_ratio:
@@ -1146,14 +1165,6 @@ class NebulaOSCalibration:
                     "units/typo mistake in MEASURED=)"
                     % (measured, commanded, (ratio - 1.0) * 100.,
                        self.esteps_max_correction_ratio * 100.))
-
-            extruder_obj = self._esteps_lookup_extruder(self.esteps_extruder_name)
-            self.gcode.run_script_from_command(
-                'SET_EXTRUDER_ROTATION_DISTANCE EXTRUDER=%s DISTANCE=%.6f'
-                % (self.esteps_extruder_name, new_rd))
-            configfile = self.printer.lookup_object('configfile')
-            configfile.set(self.esteps_extruder_name, 'rotation_distance',
-                            "%.6f" % (new_rd,))
         except Exception as e:
             self.esteps_state = 'error'
             self.esteps_error = _sanitize_error(e)
@@ -1161,13 +1172,17 @@ class NebulaOSCalibration:
 
         self.esteps_measured_length = measured
         self.esteps_new_rotation_distance = new_rd
-        self.esteps_state = 'complete'
-        self.esteps_error = None
-        self.gcode.respond_info(
-            "NEBULAOS_ESTEPS_CALIBRATE: rotation_distance %.6f -> %.6f "
-            "(measured %.3fmm vs commanded %.3fmm), applied live. The "
-            "SAVE_CONFIG command will make this permanent."
-            % (old_rd, new_rd, measured, commanded))
+        self.esteps_state = 'awaiting_confirmation'
+        self._send_action_prompt(
+            "E-Steps Calibration — Confirm",
+            ["Old rotation_distance: %.6f" % (old_rd,),
+             "Commanded extrusion: %.1fmm" % (commanded,),
+             "Measured extrusion: %.1fmm" % (measured,),
+             "Proposed rotation_distance: %.6f" % (new_rd,)],
+            [("Apply & Save",
+              "_NEBULAOS_ESTEPS_CONFIRM"),
+             ("Cancel",
+              "_NEBULAOS_ESTEPS_CANCEL")])
 
     # ------------------------------------------------------------------
     # NEBULAOS_INPUT_SHAPER_CALIBRATE (mission §13). Corrected live
@@ -1286,7 +1301,9 @@ class NebulaOSCalibration:
             ["Homed successfully.",
              "Mount the accelerometer RIGIDLY on the TOOLHEAD now."],
             [("Continue",
-              "_NEBULAOS_INPUT_SHAPER_CALIBRATE CONTINUE=1")])
+              "_NEBULAOS_INPUT_SHAPER_CALIBRATE CONTINUE=1"),
+             ("Cancel",
+              "_NEBULAOS_INPUT_SHAPER_CANCEL")])
 
     def _build_shaper_calibrate_script(self, axis):
         """The exact upstream SHAPER_CALIBRATE invocation this workflow
@@ -1343,7 +1360,9 @@ class NebulaOSCalibration:
                         shaper.params.shaper_freq),
                      "Move the SAME accelerometer RIGIDLY to the BED now."],
                     [("Continue",
-                      "_NEBULAOS_INPUT_SHAPER_CALIBRATE CONTINUE=1")])
+                      "_NEBULAOS_INPUT_SHAPER_CALIBRATE CONTINUE=1"),
+                     ("Cancel",
+                      "_NEBULAOS_INPUT_SHAPER_CANCEL")])
                 return
 
             advance('final_validation', time.time())
@@ -1380,6 +1399,63 @@ class NebulaOSCalibration:
                 calibration_journal.write_journal(
                     journal, path=self.input_shaper_journal_path)
             raise
+
+    def cmd_input_shaper_cancel(self, gcmd):
+        if self.input_shaper_state not in ('awaiting_x_mount', 'awaiting_y_mount'):
+            raise self.printer.command_error(
+                "No Input Shaper calibration is in progress to cancel")
+        journal = self._input_shaper_active_journal
+        self.input_shaper_state = 'cancelled'
+        self.input_shaper_error = None
+        self._input_shaper_type_x = None
+        self._input_shaper_freq_x = None
+        self._dismiss_action_prompt()
+        if journal is not None:
+            calibration_journal.mark_cancelled(journal, time.time())
+            calibration_journal.write_journal(
+                journal, path=self.input_shaper_journal_path)
+        self._input_shaper_active_journal = None
+        self.gcode.respond_info(
+            "Input Shaper calibration cancelled.")
+
+    def cmd_esteps_cancel(self, gcmd):
+        if self.esteps_state not in ('awaiting_continue', 'awaiting_measurement',
+                                     'awaiting_confirmation'):
+            raise self.printer.command_error(
+                "No E-Steps calibration is in progress to cancel")
+        self.esteps_state = 'cancelled'
+        self.esteps_error = None
+        self.esteps_new_rotation_distance = None
+        self._dismiss_action_prompt()
+        self.gcode.respond_info(
+            "E-Steps calibration cancelled. Original rotation_distance preserved.")
+
+    def cmd_esteps_confirm(self, gcmd):
+        if self.esteps_state != 'awaiting_confirmation':
+            raise self.printer.command_error(
+                "No E-Steps result is waiting for confirmation")
+        try:
+            new_rd = self.esteps_new_rotation_distance
+            extruder_obj = self._esteps_lookup_extruder(self.esteps_extruder_name)
+            self.gcode.run_script_from_command(
+                'SET_EXTRUDER_ROTATION_DISTANCE EXTRUDER=%s DISTANCE=%.6f'
+                % (self.esteps_extruder_name, new_rd))
+            configfile = self.printer.lookup_object('configfile')
+            configfile.set(self.esteps_extruder_name, 'rotation_distance',
+                            "%.6f" % (new_rd,))
+        except Exception as e:
+            self.esteps_state = 'error'
+            self.esteps_error = _sanitize_error(e)
+            raise
+
+        self.esteps_state = 'complete'
+        self.esteps_error = None
+        self._dismiss_action_prompt()
+        self.gcode.respond_info(
+            "NEBULAOS_ESTEPS_CALIBRATE: rotation_distance %.6f applied "
+            "and staged - committing with SAVE_CONFIG, printer will restart"
+            % (new_rd,))
+        self.gcode.run_script_from_command('SAVE_CONFIG')
 
     def _verify_expected_values(self, expected):
         """Checks a journal's expected_values dict against the real,

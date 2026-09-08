@@ -66,7 +66,7 @@ class CommandsRequiringLoadCellFailPreflightClearly(unittest.TestCase):
             zc.cmd_z_offset_calibration(gcmd)
         msg = str(ctx.exception)
         self.assertIn('no [nebulaos_z_offset_probe]', msg)
-        self.assertIn('Z_OFFSET_CALIBRATION', msg)
+        self.assertIn('z_compensate', msg)
         self.assertIn('PROBE_CALIBRATE', msg)
 
     def test_z_offset_calibration_preflight_failure_does_not_disturb_state(self):
