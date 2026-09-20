@@ -19,14 +19,22 @@ table, are authoritative for the file they appear in.
 | `extras/gcode_shell_command.py` | Eric Callahan, © 2019 | via `pellcorp/klipper` | present upstream, preserved | none beyond the Pellcorp lineage carried in this repo's history |
 | `extras/virtual_pins.py` | Pedro Lamas, © 2023 | via `pellcorp/klipper` | present upstream, preserved | none |
 | `extras/calibrate_shaper_config.py` | ballaswag, © 2023 | `ballaswag/guppyscreen` | **absent upstream — added** | header only |
-| `extras/guppy_config_helper.py` | ballaswag, © 2024 | `ballaswag/guppyscreen` | **absent upstream — added** | header only |
-| `extras/guppy_module_loader.py` | ballaswag, © 2024 | `ballaswag/guppyscreen` | **absent upstream — added** | header only |
+| `extras/guppy_config_helper.py` | ballaswag, © 2024 | `ballaswag/guppyscreen` | **absent upstream — added**; **no longer shipped** (removed from `extras/`, absent from `nebulaos-extensions.json`) | header only |
+| `extras/guppy_module_loader.py` | ballaswag, © 2024 | `ballaswag/guppyscreen` | **absent upstream — added**; **no longer shipped** (removed from `extras/`, absent from `nebulaos-extensions.json`) | header only |
 | `extras/tmcstatus.py` | ballaswag, © 2024 | `ballaswag/guppyscreen` | **absent upstream — added** | header, plus a `klippy:connect` deferral fix |
 | `extras/nebulaos_temperature_mcu.py` | Kevin O'Connor © 2020-2024 (base), NebulaOS © 2026 (GD32 curves) | `Klipper3d/klipper` | derived, both credited | subclass + three GD32 calibration curves |
 | `extras/bl24c16f.py` | Eric Callahan, © 2020 | community Klipper extra, shipped by Creality in the KE's stock firmware | present upstream, preserved | none — byte-identical to the copy pulled from the printer's own stock rootfs partition |
 
-Everything else in `extras/` — the nine `prtouch_*`/`z_compensate` modules, `nebulaos_version`,
-`nebulaos_compat`, and the test suite — is NebulaOS's own work.
+Two of the rows above, `guppy_config_helper.py` and `guppy_module_loader.py`, are **historical**:
+those files were removed from `extras/` and are not in `nebulaos-extensions.json`. Their
+attribution is kept here deliberately — an attribution record should not lose an author because
+the file stopped shipping. Five vendored community modules ship today: `tmcstatus`,
+`gcode_shell_command`, `virtual_pins`, `calibrate_shaper_config`, `bl24c16f`.
+
+Everything else in `extras/` — `z_compensate`, the nozzle-contact/Z-offset/calibration set,
+power-loss recovery, `nebulaos_version`, `nebulaos_compat`, and the test suite — is NebulaOS's
+own work. (The PRTouch runtime modules this sentence once counted were deleted in Phase 1.8B;
+only the unrelated offline test scaffolding `prtouch_test_support.py` still carries the name.)
 
 ## Per-module detail
 
@@ -65,13 +73,13 @@ Note that this is **not** a Pellcorp inheritance, contrary to an earlier NebulaO
 grouped all five community extras together. NebulaOS added it itself, and the real upstream is
 GuppyScreen.
 
-### `guppy_config_helper.py` — ballaswag, © 2024
+### `guppy_config_helper.py` — ballaswag, © 2024 — *historical, no longer shipped*
 
 `_GUPPY_SAVE_CONFIG` / `_GUPPY_DELETE_CONFIG`, driven from GuppyScreen's TMC tuning panel.
 **Had no header.** Traced to `ballaswag/guppyscreen` commit `a20edd7` ("add guppy config
 helper", 2024-01-17). Header added; code otherwise byte-identical.
 
-### `guppy_module_loader.py` — ballaswag, © 2024
+### `guppy_module_loader.py` — ballaswag, © 2024 — *historical, no longer shipped*
 
 `_GUPPY_LOAD_MODULE` / `_GUPPY_UNLOAD_MODULE`. **Had no header.** Traced to
 `ballaswag/guppyscreen` commit `1d7e584` (2024-02-01). Header added; code otherwise
@@ -106,8 +114,10 @@ MCU die-temperature support for the GD32 chips this printer uses. Subclasses Kli
 so the derivation is a live import and upstream fixes are inherited automatically. Both
 copyrights appear in the file header.
 
-The original content is the three GD32 calibration curves, carried forward from
-`NebulaOS-klipper`'s own `temperature_mcu.py` at the shipped `KLIPPER_PIN`.
+The original content is the three GD32 calibration curves, carried forward historically from the
+retired `NebulaOS-klipper` fork's own `temperature_mcu.py`. (That fork is not the shipped host
+Klipper and has no relationship to `KLIPPER_PIN`, which points at official upstream
+`Klipper3d/klipper`; the curves simply originated there before the no-fork migration.)
 
 Upstream contribution is worth doing independently of this repository: the curves are ~15
 lines and mechanically identical in form to the entries mainline already carries. If
@@ -153,10 +163,11 @@ Vendoring with explicit provenance is the honest version of a situation that alr
 ## Filename collision risk
 
 The vendored names are kept as-is for now — `gcode_shell_command`, `virtual_pins`,
-`calibrate_shaper_config`, `guppy_config_helper`, `guppy_module_loader`, `bl24c16f`.
-GuppyScreen's compiled C++ hardcodes several of the gcode commands the first five register, so
-renaming those is a coordinated change across repositories, not a free rename; `bl24c16f`'s own
-name is dictated by the physical chip it drives and by `printer.cfg`'s `[bl24c16f]` section.
+`calibrate_shaper_config`, `tmcstatus`, `bl24c16f`. GuppyScreen's compiled C++ hardcodes several
+of the gcode commands the first four register, so renaming those is a coordinated change across
+repositories, not a free rename; `bl24c16f`'s own name is dictated by the physical chip it
+drives and by `printer.cfg`'s `[bl24c16f]` section. (`guppy_config_helper` and
+`guppy_module_loader` were also on this list; both have since been removed from `extras/`.)
 
 That leaves a real, if unlikely, hazard: if mainline Klipper ever ships a file at one of these
 paths, git will silently replace NebulaOS's symlink with upstream's regular file, and the

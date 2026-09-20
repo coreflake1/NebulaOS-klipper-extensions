@@ -11,15 +11,21 @@ happens when a check fails.
 ## The risk, stated concretely
 
 Klipper publishes no API version and offers no stability guarantee for the host-side
-interfaces extension code uses. Drift is not hypothetical here — it has already happened
-once. Mainline commit `c89393cda` (2026-02-26) renamed `MCU.register_response()` to
-`MCU.register_serial_response()`. `prtouch_mcu.py` called the old name at three sites. Against
-that Klipper, PRTouch fails at load time.
+interfaces extension code uses. Drift is not hypothetical here — it has already happened once.
+
+> **Historical incident (Phase 1, PRTouch era).** Mainline commit `c89393cda` (2026-02-26)
+> renamed `MCU.register_response()` to `MCU.register_serial_response()`. `prtouch_mcu.py`
+> called the old name at three sites, so against that Klipper it failed at load time. Both
+> `prtouch_mcu.py` and the rest of the PRTouch runtime stack were deleted in Phase 1.8B and no
+> longer exist; `MCU.register_serial_response` is today an ordinary entry in this manifest's
+> `required_klipper_symbols`. The incident is kept here because it is the reason the symbol
+> check exists, not because it describes a current hazard.
 
 The important part is what that would have looked like without a gate: no error at config
-parse, no warning at startup, and a failure surfacing during a probe descent. This extension
-set drives a load-cell probe into a heated bed. An unqualified Klipper underneath it is a
-physical-safety change wearing the costume of a version bump.
+parse, no warning at startup, and a failure surfacing during a descent toward the bed. These
+modules drive the nozzle into contact with a heated bed for Z-offset and calibration work. An
+untested Klipper underneath them is a physical-safety change wearing the costume of a version
+bump.
 
 ## Failure policy
 
@@ -29,9 +35,12 @@ specific thing that failed, the value found, the value expected, and what to do 
 There is no degraded mode and no warn-and-continue path. For a printer, *"did not start, and
 said exactly why"* is strictly better than *"started, but the probe is subtly wrong"*.
 
-The one deliberate exception is `klipper.allow_unqualified` in the manifest, which is an
-explicit developer opt-in, defaults to `false` in the shipped manifest, and is asserted to be
-`false` by the test suite.
+There is no developer opt-out. An earlier design carried one, `klipper.allow_unqualified`,
+alongside a pinned `klipper.qualified_commit`; that whole model is **retired**. Neither key
+exists in the manifest any more, and the firmware build refuses to produce an image if either
+reappears — `NebulaOS-firmware/scripts/build/04-cross-compile-app-stack.sh` fails with
+`FATAL: extensions manifest still contains qualified_commit` (likewise `allow_unqualified`) and
+otherwise prints `extensions manifest: no global Klipper version gate (correct)`.
 
 ## Who enforces what
 
@@ -39,7 +48,7 @@ Three layers, each catching what the others structurally cannot.
 
 | Layer | Mechanism | Catches |
 |---|---|---|
-| **Moonraker** | `pinned_commit` on the official `Klipper3d/klipper` remote, in `moonraker.conf` | Stops a normal user ever reaching an unqualified Klipper in the first place. The primary defence — it prevents rather than detects. |
+| **Moonraker** | an ordinary `update_manager` section on the official `Klipper3d/klipper` remote, with **no** `pinned_commit` — Klipper updates independently of this extension set | Nothing, by design. It is not a gate. The offline safety net is the immutable recovery copy on the rootfs: `nebulaos-recover klipper` restores the exact qualified version. See `NebulaOS-firmware`'s `overlay/etc/nebulaos/moonraker/klipper-pin.conf`. |
 | **NebulaOS platform** (`NebulaOS-firmware`, boot-time activation + update supervisor) | Composition integrity, the collision guard, the `c_helper.so` mtime invariant, paired (klipper, extensions) rollback | Everything that is a property of the Klipper checkout or the device, not of this repository |
 | **This repository** (`extras/nebulaos_compat.py`) | Manifest + symbol introspection at config load | API drift on a device the platform pre-flight never saw — a hand-updated checkout, a restored backup, a developer install. Klipper knows nothing about NebulaOS, so this **must** be extension code; there is nowhere else to put it. |
 
@@ -53,9 +62,7 @@ and by the platform's composition and update steps.
 | `compat_schema_version` | Schema version of this file. `nebulaos_compat.py` refuses a version it does not know rather than interpreting it optimistically — a newer schema may imply a check the running build does not know it should perform. |
 | `extensions_version` | Human-readable version of this extension set. |
 | `nebulaos_api_level` | This extension set's contract with the NebulaOS **platform**. Deliberately not a claim about Klipper's API — Klipper publishes no such number, and inventing one nobody else maintains would be fiction. |
-| `klipper.qualified_commit` | The exact Klipper commit this set was qualified against. |
-| `klipper.min_commit` / `max_commit` | Optional compatible ancestry range. Decided with real `git merge-base --is-ancestor`, **never** string comparison — git SHAs carry no ordering, so a string-compared range check would look like it worked and would not. Both `null` today: the qualified commit is the only accepted value. |
-| `klipper.allow_unqualified` | Developer opt-in. `false` in the shipped manifest. |
+| *(retired)* `klipper.*` | A `klipper` block once carried `qualified_commit`, `min_commit`/`max_commit` and `allow_unqualified`. **No such block exists today**, and the firmware build fails if one reappears. Klipper and this extension set are independently updateable; the enforced contract is symbol-level, not commit-level. |
 | `required_klipper_symbols` | Klipper APIs this set depends on, as `module:Attr.attr`. Probed against the Klipper actually loaded in the running process. |
 | `forbidden_klipper_symbols` | APIs this set has migrated **off**. Their reappearance means the installed Klipper is older than the qualified one, or is not official Klipper. |
 | `modules` | Every managed module, with `role`: `runtime` or `test`. A deployment may skip `test` modules; a missing `runtime` module is never legitimate. |
@@ -77,7 +84,10 @@ anything can be checked against it, and its shape understood before its contents
    highest-value check in the file: it is the only one that would have caught the
    `register_response` rename automatically, before any motion. All problems are accumulated
    into one message rather than surfacing one restart at a time.
-4. **The installed Klipper commit** is the qualified one, or inside a declared ancestry range.
+4. *(No Klipper-commit check.)* There is deliberately no global Klipper version gate: Klipper
+   and this extension set update independently, and the firmware build enforces that the
+   manifest carries no `qualified_commit`. Compatibility is decided by what the installed
+   Klipper actually **provides** — check 3 — not by which commit it claims to be.
 5. **Composition integrity** — every runtime module is reachable as a symlink resolving
    inside this repository, so a module silently shadowed by an upstream file is caught
    before any other managed module loads.
@@ -163,9 +173,10 @@ seed archive would be decided by directory-walk order.
 when the file is absent, since its absence means the platform never checked. Setting it back to
 `null` disables this consumer and leaves the invariant entirely to the platform.
 
-## Moving the qualified pin
+## Advancing to a newer Klipper
 
-Advancing to a newer Klipper is a deliberate act, not a side effect of an update. In order:
+There is no pin in this manifest to move, but re-qualifying against a newer Klipper is still a
+deliberate act rather than something an update does to you. In order:
 
 1. Compose the candidate Klipper with this repository and run the full test suite — it must
    pass, and `git status --porcelain` must be empty in **both** checkouts.
@@ -174,8 +185,9 @@ Advancing to a newer Klipper is a deliberate act, not a side effect of an update
 3. Rebuild and re-ship `c_helper.so` for the candidate, and re-establish the mtime invariant.
 4. Re-qualify on real hardware. Static checks cannot clear probe and homing behaviour; that is
    the residual risk this whole architecture concentrates in one place, on purpose.
-5. Update `klipper.qualified_commit` and `extensions_version`, then move Moonraker's
-   `pinned_commit` to match.
+5. Update `extensions_version`. There is no `klipper.qualified_commit` to update and no
+   Moonraker `pinned_commit` to move; what ships is decided by `KLIPPER_PIN` in
+   `NebulaOS-firmware/manifests/dependencies.conf`, which is a firmware-side reviewed change.
 
 Steps 1–3 are automatable. Step 4 is not, and no amount of green tests substitutes for it.
 
