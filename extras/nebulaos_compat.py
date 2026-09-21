@@ -33,7 +33,15 @@
 # ---------------------------------------------------------------------------------------
 #
 # Checked here, because only extension code can:
-#   1. The installed Klipper commit matches the qualified one (or an explicitly allowed range).
+#   1. (Deliberately NOT a commit-identity check - there is none, and this line used to
+#      claim otherwise. NebulaOS-firmware owns the exact upstream Klipper commit as
+#      KLIPPER_PIN in manifests/dependencies.conf, and this extension set is qualified
+#      against that pinned host API. Compatibility is verified here by SYMBOL instead,
+#      in item 4 below, which is what actually breaks: a matching commit hash cannot
+#      tell you the API you need is present, and a differing one cannot tell you it is
+#      absent. The retired klipper.qualified_commit / klipper.allow_unqualified
+#      manifest keys implemented the other model; the firmware build hard-fails if
+#      either reappears.)
 #   2. The manifest itself is present, parseable, and of a schema version this code understands.
 #   3. Every module the manifest declares has a real source file present in this repository.
 #   4. Every Klipper symbol this extension set depends on actually exists on the installed
@@ -253,9 +261,13 @@ def check_required_symbols(manifest):
         raise CompatibilityError(
             "the installed Klipper does not provide the API this NebulaOS extension set was "
             "built against:\n%s\n"
-            "This is API drift, not a configuration mistake. Install the qualified Klipper "
-            "commit (see the manifest's klipper.qualified_commit), or update the extension "
-            "set to one qualified against this Klipper." % ('\n'.join(problems),))
+            "This is API drift, not a configuration mistake. The host Klipper commit is owned "
+            "by the firmware image as KLIPPER_PIN in NebulaOS-firmware's "
+            "manifests/dependencies.conf, and this extension set is qualified against that "
+            "pinned host API. Install a host Klipper and an extension set that were qualified "
+            "together: either restore the KLIPPER_PIN this extension set expects, or advance "
+            "the extension set to one qualified against the Klipper actually installed."
+            % ('\n'.join(problems),))
 
 
 def check_composition_integrity(manifest, klipper_dir, repo_root):
