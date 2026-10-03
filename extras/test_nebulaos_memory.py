@@ -86,5 +86,33 @@ class ChildResetTest(unittest.TestCase):
             self.assertEqual(int(f.read()), mine)
 
 
+class MlockTest(unittest.TestCase):
+    def setUp(self):
+        nebulaos_memory._FORK_HOOK_INSTALLED = True   # no hook in these tests
+
+    def test_onfault_passes_flags_7(self):
+        with mock.patch.object(nebulaos_memory, "_mlockall", return_value=(0, 0)) as ml:
+            m = nebulaos_memory.NebulaOSMemory(FakeConfig({"mlock": "onfault"}))
+        ml.assert_called_once_with(7)
+        st = m.get_status(0)
+        self.assertEqual((st["mlock_flags"], st["mlock_rc"], st["mlock_errno"]), (7, 0, 0))
+
+    def test_off_makes_no_call(self):
+        with mock.patch.object(nebulaos_memory, "_mlockall") as ml:
+            m = nebulaos_memory.NebulaOSMemory(FakeConfig({"mlock": "off"}))
+            nebulaos_memory.NebulaOSMemory(FakeConfig())
+        ml.assert_not_called()
+        self.assertNotIn("mlock_rc", m.get_status(0))
+
+    def test_failure_is_reported_not_raised(self):
+        with mock.patch.object(nebulaos_memory, "_mlockall", return_value=(-1, 12)):
+            m = nebulaos_memory.NebulaOSMemory(FakeConfig({"mlock": "onfault"}))
+        self.assertEqual((m.get_status(0)["mlock_rc"], m.get_status(0)["mlock_errno"]), (-1, 12))
+
+    def test_mlockall_never_raises(self):
+        with mock.patch.dict("sys.modules", {"cffi": None}):
+            self.assertEqual(nebulaos_memory._mlockall(7), (-1, -1))
+
+
 if __name__ == "__main__":
     unittest.main()
