@@ -516,8 +516,12 @@ class _FakeConfig(object):
     def get(self, option, default=None):
         return self._values.get(option, default)
 
-    def getfloat(self, option, default=None, above=None, minval=None):
+    def getfloat(self, option, default=None, above=None, minval=None,
+                 maxval=None):
         return float(self._values.get(option, default))
+
+    def getboolean(self, option, default=None):
+        return bool(self._values.get(option, default))
 
 
 class _FakeStatusObject(object):
@@ -540,6 +544,22 @@ class _FakeMcu(object):
         return self.current_estimated_print_time
 
 
+class _FakeKinematics(object):
+    def __init__(self, z_max=250.0):
+        self.z_max = z_max
+
+    def get_status(self, eventtime=None):
+        return {'axis_maximum': [230.0, 230.0, self.z_max, 0.0]}
+
+
+class _FakeConfigfile(object):
+    def __init__(self, raw):
+        self.raw = raw
+
+    def get_status(self, eventtime=None):
+        return {'config': self.raw}
+
+
 class _FakeToolhead(_FakeStatusObject):
     """register_lookahead_callback() here does NOT fire immediately (a
     real, empty-queue Klipper toolhead would) - tests fire callbacks
@@ -548,6 +568,10 @@ class _FakeToolhead(_FakeStatusObject):
     def __init__(self, status):
         super(_FakeToolhead, self).__init__(status)
         self.pending_callbacks = []
+        self.kinematics = _FakeKinematics()
+
+    def get_kinematics(self):
+        return self.kinematics
 
     def register_lookahead_callback(self, callback):
         self.pending_callbacks.append(callback)
@@ -584,7 +608,9 @@ class ExtensionStateMachineTests(unittest.TestCase):
                 'sdcard_dirname': self.tmpdir})(self.vsd_status),
             'exclude_object': _FakeStatusObject(
                 {'objects': [], 'excluded_objects': []}),
-            'bed_mesh': _FakeStatusObject({'profile_name': ''}),
+            'bed_mesh': _FakeStatusObject({'profile_name': '',
+                                           'profiles': {'default': {}}}),
+            'configfile': _FakeConfigfile({'probe': {'z_offset': '1.2'}}),
             'extruder': _FakeStatusObject({'target': 0.0,
                                            'pressure_advance': 0.04,
                                            'smooth_time': 0.04}),
@@ -956,6 +982,110 @@ class GuiReadinessTests(ExtensionStateMachineTests):
         self._tick_and_settle(1.0)
         os.unlink(self.eeprom_path)
         self.ext.get_status(0)  # must not raise
+
+
+class ConfigIdentityAndPhysicalResumeTests(ExtensionStateMachineTests):
+    """Schema 2: printer.cfg identity + the opt-in physical resume."""
+
+    def _checkpoint_then_power_loss(self, physical=False):
+        self.objects['extruder']._status = {'target': 210.0,
+                                            'pressure_advance': 0.04,
+                                            'smooth_time': 0.04}
+        self.objects['heater_bed']._status = {'target': 60.0}
+        self._tick_and_settle(1.0)
+        self.print_stats_status['state'] = 'standby'
+        self.objects['gcode'] = _FakeGCode()
+        if physical:
+            self.config._values['physical_resume'] = True
+        self.ext = plr.NebulaOSPowerLossRecovery(self.config)
+        self.ext._handle_ready()
+
+    def test_sidecar_records_identity_and_toolhead(self):
+        self._tick_and_settle(1.0)
+        rec = self._eeprom_record()
+        side = plr.read_sidecar(plr.sidecar_path_for_generation(
+            self.sidecar_dir, rec.generation))
+        self.assertEqual(side['schema_version'], 2)
+        self.assertEqual(side['identity']['config_sha256'],
+                         plr.config_identity({'probe': {'z_offset': '1.2'}}))
+        self.assertEqual(side['toolhead']['position'], [1.0, 2.0, 10.0, 0.0])
+
+    def test_config_change_refuses_resume(self):
+        self._checkpoint_then_power_loss()
+        self.objects['configfile'].raw = {'probe': {'z_offset': '0.9'}}
+        with self.assertRaises(Exception) as cm:
+            self.ext.cmd_NEBULAOS_PLR_RESUME(_FakeGCmd({'ALLOW_UNSAFE': 1}))
+        self.assertIn('configuration changed', str(cm.exception))
+        self.assertEqual(self.objects['gcode'].run_lines, [])
+
+    def test_schema1_record_is_incompatible(self):
+        self._tick_and_settle(1.0)
+        rec = self._eeprom_record()
+        path = plr.sidecar_path_for_generation(self.sidecar_dir, rec.generation)
+        side = plr.read_sidecar(path)
+        side['schema_version'] = 1
+        plr.atomic_write_json(path + '.tmp', path, side)
+        self.print_stats_status['state'] = 'standby'
+        ext = plr.NebulaOSPowerLossRecovery(self.config)
+        ext._handle_ready()
+        self.assertEqual(ext.get_status(0)['state'], plr.STATE_RECOVERY_INCOMPATIBLE)
+
+    def test_physical_disabled_by_default(self):
+        self._checkpoint_then_power_loss()
+        self.assertEqual(self.ext.get_status(0)['resume_mode'], 'state_restore_only')
+        with self.assertRaises(Exception) as cm:
+            self.ext.cmd_NEBULAOS_PLR_RESUME(_FakeGCmd({'ALLOW_UNSAFE': 1, 'PHYSICAL': 1}))
+        self.assertIn('disabled', str(cm.exception))
+        self.assertEqual(self.objects['gcode'].run_lines, [])
+
+    def test_physical_requires_allow_unsafe(self):
+        self._checkpoint_then_power_loss(physical=True)
+        with self.assertRaises(Exception):
+            self.ext.cmd_NEBULAOS_PLR_RESUME(_FakeGCmd({'PHYSICAL': 1}))
+        self.assertEqual(self.objects['gcode'].run_lines, [])
+
+    def test_physical_sequence_order(self):
+        self._checkpoint_then_power_loss(physical=True)
+        self.assertEqual(self.ext.get_status(0)['resume_mode'], 'physical')
+        self.ext.cmd_NEBULAOS_PLR_RESUME(_FakeGCmd({'ALLOW_UNSAFE': 1, 'PHYSICAL': 1}))
+        lines = self.objects['gcode'].run_lines
+        idx = lambda prefix: next(i for i, l in enumerate(lines) if l.startswith(prefix))
+        self.assertLess(idx('M190 S60'), idx('SET_KINEMATIC_POSITION'))
+        self.assertEqual(lines[idx('SET_KINEMATIC_POSITION')],
+                         'SET_KINEMATIC_POSITION Z=10.0000 SET_HOMED=z')
+        self.assertLess(idx('SET_KINEMATIC_POSITION'), idx('G1 Z5.000'))
+        self.assertLess(idx('G1 Z5.000'), idx('G28 X Y'))
+        self.assertLess(idx('G28 X Y'), idx('M109 S210'))
+        self.assertLess(idx('M109 S210'), idx('G1 E8.000'))
+        self.assertLess(idx('SET_GCODE_OFFSET'), idx('G1 X1.0000 Y2.0000'))
+        self.assertLess(idx('G1 E8.000'), idx('G1 X1.0000 Y2.0000'))
+        self.assertLess(idx('G1 X1.0000 Y2.0000'), idx('G1 Z10.0000'))
+        self.assertLess(idx('G1 Z10.0000'), idx('G92 E5'))
+        self.assertEqual(lines[-1], 'M24')
+        self.assertEqual(sum(1 for l in lines if l.startswith('G28')), 1)
+        self.assertNotIn('G28', [l for l in lines if l.startswith('G28 Z')])
+        self.assertEqual([l for l in lines if l.startswith('M104')], ['M104 S210'])
+        # The print M24 starts keeps the record it resumed.
+        self.print_stats_status['state'] = 'printing'
+        self.ext._tick(50.0)
+        self.assertIsNotNone(self._eeprom_record())
+
+    def test_physical_refusals(self):
+        state = _full_sidecar_state()
+        state['toolhead'] = {'position': [1.0, 2.0, 10.0, 0.0]}
+        state['thermal'] = {'extruder_target': 200.0, 'bed_target': 60.0}
+        with self.assertRaises(plr.PhysicalResumeRefused):
+            plr.build_physical_resume_lines(state, 5.0, 8.0, 10.5, ['default'])  # no room
+        with self.assertRaises(plr.PhysicalResumeRefused):
+            plr.build_physical_resume_lines(state, 5.0, 8.0, 250.0, ['other'])   # mesh not saved
+        cold = dict(state, thermal={'extruder_target': 0.0, 'bed_target': 60.0})
+        with self.assertRaises(plr.PhysicalResumeRefused):
+            plr.build_physical_resume_lines(cold, 5.0, 8.0, 250.0, ['default'])
+        nopos = dict(state, toolhead={'position': None})
+        with self.assertRaises(plr.PhysicalResumeRefused):
+            plr.build_physical_resume_lines(nopos, 5.0, 8.0, 250.0, ['default'])
+        lifted = plr.build_physical_resume_lines(state, 5.0, 8.0, 14.0, ['default'])
+        self.assertIn('G1 Z3.000 F600', lifted)  # lift clamped to the travel left
 
 
 class LightRecoveryCheckTests(unittest.TestCase):

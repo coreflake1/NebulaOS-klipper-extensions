@@ -37,7 +37,14 @@ DEFAULT_CHECKPOINT_INTERVAL = 5.0
 DEFAULT_POLL_INTERVAL = 0.75
 DEFAULT_MIN_Z_FOR_START = 0.6
 
-SCHEMA_VERSION = 1
+# Schema 2 (2026-10-09): adds "identity" (printer configuration hash) and
+# "toolhead" (kinematic position) - both needed by the physical resume. A
+# schema-1 record from an older build is reported incompatible, never
+# resumed.
+SCHEMA_VERSION = 2
+
+DEFAULT_RESUME_Z_LIFT = 5.0
+DEFAULT_PRIME_LENGTH = 8.0
 
 SIDECAR_FILENAMES = ("state-a.json", "state-b.json")
 
@@ -95,11 +102,22 @@ def coord_to_list(coord):
     return [coord.x, coord.y, coord.z, coord.e]
 
 
+def config_identity(raw_config):
+    """SHA-256 over Klipper's parsed raw configuration (configfile status
+    'config': every section and option as loaded, includes and the
+    SAVE_CONFIG block included). Any change to printer.cfg that Klipper
+    actually reads - Z offset, mesh, rotation distance, kinematics - changes
+    it."""
+    payload = json.dumps(raw_config or {}, sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode('utf-8')).hexdigest()
+
+
 def build_sidecar_state(generation, file_info, file_position,
                          gcode_move_status, toolhead_status,
                          extruder_status, bed_mesh_status,
                          exclude_object_status, fan_status,
-                         firmware_retraction_status=None):
+                         firmware_retraction_status=None,
+                         config_sha256=None):
     """Pure assembly of the "Sidecar V1 State" schema from already-fetched
     get_status() dicts (or plain equivalents in tests). Never touches
     gcode_move.base_position or any other private attribute - everything
@@ -120,6 +138,13 @@ def build_sidecar_state(generation, file_info, file_position,
             "speed_factor": gcode_move_status["speed_factor"],
             "extrude_factor": gcode_move_status["extrude_factor"],
             "homing_origin": coord_to_list(gcode_move_status["homing_origin"]),
+        },
+        "toolhead": {
+            "position": (coord_to_list(toolhead_status["position"])
+                         if toolhead_status.get("position") is not None else None),
+        },
+        "identity": {
+            "config_sha256": config_sha256,
         },
         "motion": {
             "max_velocity": toolhead_status["max_velocity"],
@@ -214,7 +239,7 @@ class IntegrityFailure(Exception):
 
 def validate_recovery(eeprom_record, sidecar_state, current_file_path,
                        current_file_size, current_file_sha256,
-                       allow_unsafe):
+                       allow_unsafe, current_config_sha256=None):
     """Runs the full validation chain from the mission's File Identity and
     Physical Position Policy sections, in order, and returns the validated
     sidecar_state dict on success.
@@ -249,6 +274,11 @@ def validate_recovery(eeprom_record, sidecar_state, current_file_path,
             or saved_sha256 != current_file_sha256):
         raise IntegrityFailure(
             "file identity mismatch (path/size/sha256 changed since checkpoint)")
+    recorded_config = (sidecar_state.get("identity") or {}).get("config_sha256")
+    if recorded_config != current_config_sha256:
+        raise IntegrityFailure(
+            "printer configuration changed since the checkpoint (Z offset, "
+            "mesh, kinematics or other printer.cfg settings may differ)")
 
     # Every integrity gate above is unconditional. Only the physical
     # position-safety gate below is subject to allow_unsafe, and it is
@@ -374,6 +404,84 @@ def build_resume_gcode_lines(state):
     return lines
 
 
+class PhysicalResumeRefused(Exception):
+    def __init__(self, reason):
+        super(PhysicalResumeRefused, self).__init__(reason)
+        self.reason = reason
+
+
+def build_physical_resume_lines(state, z_lift, prime_length, z_max,
+                                saved_mesh_profiles):
+    """The physical resume (opt-in, [nebulaos_power_loss_recovery]
+    physical_resume: True; NOT hardware-qualified until the supervised
+    power-cut test). Same idea as Creality's stock resume - home X/Y only,
+    trust that Z did not move while unpowered - with these differences:
+    the bed is heated first (keeps the part attached), Z is declared at its
+    recorded kinematic height and LIFTED before any XY move (stock moves XY
+    at print height), the nozzle is heated and primed at the X/Y endstop
+    park position off the bed, and the configuration identity was already
+    proven equal by validate_recovery().
+
+    Ordering constraint from upstream safe_z_home: G28 with Z unhomed resets
+    Z to 0 and clears its homing - so Z is declared homed at its recorded
+    height (SET_KINEMATIC_POSITION ... SET_HOMED=z) BEFORE G28 X Y; with Z
+    homed above z_hop, safe_z_home leaves Z alone.
+
+    Returns the full G-code list, ending with M24. Raises
+    PhysicalResumeRefused when it cannot be done safely."""
+    toolhead_pos = (state.get("toolhead") or {}).get("position")
+    if not toolhead_pos:
+        raise PhysicalResumeRefused("no recorded toolhead position")
+    kin_z = float(toolhead_pos[2])
+    if kin_z <= 0:
+        raise PhysicalResumeRefused("recorded Z height is not above the bed")
+    lift = min(float(z_lift), float(z_max) - kin_z - 1.0)
+    if lift < 1.0:
+        raise PhysicalResumeRefused(
+            "no room to lift above the part (Z %.2f of %.2f)" % (kin_z, z_max))
+    mesh = (state.get("bed_mesh") or {}).get("profile_name")
+    if mesh and mesh not in (saved_mesh_profiles or ()):
+        raise PhysicalResumeRefused(
+            "bed mesh '%s' was not saved; it cannot be reloaded" % mesh)
+    thermal = state["thermal"]
+    bed = thermal.get("bed_target", 0.0)
+    hotend = thermal.get("extruder_target", 0.0)
+    if hotend <= 0:
+        raise PhysicalResumeRefused("no recorded nozzle temperature")
+    gcode_state = state["gcode"]
+    gx, gy, gz, ge = gcode_state["gcode_position"]
+
+    lines = []
+    if bed > 0:
+        lines.append("M140 S%g" % bed)
+    lines.append("M104 S%g" % hotend)
+    if bed > 0:
+        lines.append("M190 S%g" % bed)
+    lines.append("SET_KINEMATIC_POSITION Z=%.4f SET_HOMED=z" % kin_z)
+    lines.append("G91")
+    lines.append("G1 Z%.3f F600" % lift)
+    lines.append("G90")
+    lines.append("G28 X Y")
+    lines.append("M109 S%g" % hotend)
+    # State restore without the parts the procedure sets itself (heaters
+    # done above; coordinate modes and E are set after the moves).
+    skip = ("G90", "G91", "M82", "M83", "M104 ", "M140 ", "G92 E")
+    for line in build_resume_gcode_lines(state):
+        if line in skip or line.startswith(skip):
+            continue
+        lines.append(line)
+    lines.append("M83")
+    lines.append("G1 E%.3f F300" % float(prime_length))
+    lines.append("G90")
+    lines.append("G1 X%.4f Y%.4f F3000" % (gx, gy))
+    lines.append("G1 Z%.4f F600" % gz)
+    lines.append("G92 E%g" % ge)
+    lines.append("G90" if gcode_state["absolute_coordinates"] else "G91")
+    lines.append("M82" if gcode_state["absolute_extrude"] else "M83")
+    lines.append("M24")
+    return lines
+
+
 # ---------------------------------------------------------------------------
 # Klipper glue.
 # ---------------------------------------------------------------------------
@@ -421,11 +529,20 @@ class NebulaOSPowerLossRecovery:
             'poll_interval', DEFAULT_POLL_INTERVAL, above=0.)
         self.min_z_for_start = config.getfloat(
             'min_z_for_start', DEFAULT_MIN_Z_FOR_START, minval=0.)
+        # Physical resume (home X/Y, trust Z, lift, reheat, prime, return,
+        # M24) is OFF until it has passed a supervised power-cut test print
+        # on this machine. Off: NEBULAOS_PLR_RESUME restores state only.
+        self.physical_resume = config.getboolean('physical_resume', False)
+        self.resume_z_lift = config.getfloat(
+            'resume_z_lift', DEFAULT_RESUME_Z_LIFT, minval=1., maxval=20.)
+        self.prime_length = config.getfloat(
+            'prime_length', DEFAULT_PRIME_LENGTH, minval=0., maxval=50.)
 
         self.executor = None
         self.timer_handler = None
 
         self._session_file_info = None  # {"path","size","sha256"} once known
+        self._session_config_sha256 = None
         self._last_checkpoint_time = 0.0
         self._checkpoint_in_flight = False
         self._resume_in_progress = False
@@ -523,6 +640,13 @@ class NebulaOSPowerLossRecovery:
 
     def _open_eeprom(self):
         return open(self.eeprom_path, 'r+b')
+
+    def _config_sha256(self):
+        configfile = self.printer.lookup_object('configfile', None)
+        if configfile is None:
+            return None
+        status = configfile.get_status(self.reactor.monotonic())
+        return config_identity(status.get('config'))
 
     def _io(self, fn, *args):
         """Runs blocking EEPROM/sidecar/hash I/O on the aio_executor thread.
@@ -719,6 +843,7 @@ class NebulaOSPowerLossRecovery:
             "size": size,
             "sha256": sha256,
         }
+        self._session_config_sha256 = self._config_sha256()
         self._have_active_session = True
         self._status_state = STATE_RECORDING
         self._recovery_info = {
@@ -865,7 +990,7 @@ class NebulaOSPowerLossRecovery:
                 candidate.gm_status, candidate.th_status,
                 candidate.extruder_status, candidate.bed_mesh_status,
                 candidate.exclude_object_status, candidate.fan_status,
-                candidate.fr_status)
+                candidate.fr_status, config_sha256=self._session_config_sha256)
 
             final_path = sidecar_path_for_generation(self.sidecar_dir,
                                                       next_generation)
@@ -962,41 +1087,73 @@ class NebulaOSPowerLossRecovery:
 
     def cmd_NEBULAOS_PLR_RESUME(self, gcmd):
         allow_unsafe = bool(gcmd.get_int('ALLOW_UNSAFE', 0, minval=0, maxval=1))
+        physical = bool(gcmd.get_int('PHYSICAL', 0, minval=0, maxval=1))
 
-        state = self.print_stats.get_status(
-            self.reactor.monotonic()).get('state')
+        now = self.reactor.monotonic()
+        state = self.print_stats.get_status(now).get('state')
         if state not in RESUME_ALLOWED_PRINT_STATES:
             raise gcmd.error(
                 "NebulaOS PLR: resume refused while a print is %s" % state)
+        if physical and not self.physical_resume:
+            raise gcmd.error(
+                "NebulaOS PLR: physical resume is disabled ([nebulaos_power_loss_"
+                "recovery] physical_resume: False) until it has passed a "
+                "supervised power-cut test on this printer")
 
         record, sidecar, current = self._io(self._load_resume_inputs_blocking)
         try:
             validated = validate_recovery(
                 record, sidecar, current[0], current[1], current[2],
-                allow_unsafe)
+                allow_unsafe, current_config_sha256=self._config_sha256())
         except PositionUnsafe as exc:
             raise gcmd.error(str(exc))
         except IntegrityFailure as exc:
             self._refresh_recovery_status()
             raise gcmd.error("NebulaOS PLR: recovery refused: %s" % exc)
 
+        if physical:
+            kin = self.toolhead.get_kinematics().get_status(now)
+            z_max = kin.get('axis_maximum')[2] if kin.get('axis_maximum') else 0.
+            profiles = ((self.bed_mesh.get_status(now).get('profiles') or {})
+                        if self.bed_mesh is not None else {})
+            try:
+                lines = build_physical_resume_lines(
+                    validated, self.resume_z_lift, self.prime_length, z_max,
+                    list(profiles))
+            except PhysicalResumeRefused as exc:
+                raise gcmd.error("NebulaOS PLR: physical resume refused: %s"
+                                 % exc.reason)
+        else:
+            lines = build_resume_gcode_lines(validated)
+
+        # Armed before the lines run: a physical resume ends with M24, and the
+        # print it starts must keep this record (see _check_new_print).
+        self._resume_armed = (validated["generation"],
+                              validated["file"]["path"])
         self._resume_in_progress = True
         try:
-            for line in build_resume_gcode_lines(validated):
+            for line in lines:
                 self.gcode.run_script_from_command(line)
+        except Exception:
+            self._resume_armed = None
+            raise
         finally:
             self._resume_in_progress = False
 
-        self._resume_armed = (validated["generation"],
-                              validated["file"]["path"])
-        self._last_action = "resume_prepared"
+        self._last_action = "resumed_physical" if physical else "resume_prepared"
         self._refresh_recovery_status()
         self._recovery_info["checked"] = "full"
-        gcmd.respond_info(
-            "NebulaOS PLR: resume state restored (generation=%d). "
-            "No motion was performed and M24 was NOT issued - verify the "
-            "physical position is safe, then resume printing manually."
-            % validated["generation"])
+        if physical:
+            gcmd.respond_info(
+                "NebulaOS PLR: physical resume done (generation=%d): X/Y "
+                "homed, Z taken as recorded, primed, printing resumed."
+                % validated["generation"])
+        else:
+            gcmd.respond_info(
+                "NebulaOS PLR: resume state restored (generation=%d). "
+                "No motion was performed and M24 was NOT issued - verify the "
+                "physical position is safe, then resume printing manually."
+                % validated["generation"])
 
     def cmd_NEBULAOS_PLR_DISCARD(self, gcmd):
         self._tombstone_session("manual_discard")
@@ -1010,13 +1167,14 @@ class NebulaOSPowerLossRecovery:
         return relative_path
 
     def get_status(self, eventtime):
-        # Cached values only - no I/O. "position_safe" stays False until a
-        # hardware-qualified physical-resume procedure exists: a resume only
-        # restores state, it never establishes where the toolhead is.
+        # Cached values only - no I/O. "position_safe" stays False: even the
+        # physical resume ASSUMES Z held while unpowered; it never measures
+        # it. "resume_mode" says which resume NEBULAOS_PLR_RESUME offers.
         return {
             "state": self._status_state,
             "position_safe": False,
-            "resume_mode": "state_restore_only",
+            "resume_mode": ("physical" if self.physical_resume
+                            else "state_restore_only"),
             "recovery": dict(self._recovery_info),
             "last_action": self._last_action,
             "last_error": self._last_error,
