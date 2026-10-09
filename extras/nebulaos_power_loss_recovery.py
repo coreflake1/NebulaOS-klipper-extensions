@@ -43,6 +43,19 @@ SIDECAR_FILENAMES = ("state-a.json", "state-b.json")
 
 _HASH_CHUNK_SIZE = 1024 * 1024
 
+# Structured status for front-ends (get_status()["state"]). A front-end
+# presents these; it never reads the EEPROM or the sidecar files itself.
+STATE_NONE = "NONE"
+STATE_RECORDING = "RECORDING"
+STATE_RECOVERY_AVAILABLE = "RECOVERY_AVAILABLE"
+STATE_RECOVERY_INCOMPATIBLE = "RECOVERY_INCOMPATIBLE"
+STATE_RESUME_PREPARED = "RESUME_PREPARED"
+STATE_ERROR = "ERROR"
+
+# print_stats states in which NEBULAOS_PLR_RESUME may run: nothing is
+# printing or paused, i.e. the state Klipper is in after a power loss.
+RESUME_ALLOWED_PRINT_STATES = ("standby", "complete", "cancelled", "error")
+
 
 # ---------------------------------------------------------------------------
 # Pure logic - no Klipper objects, no I/O side effects beyond what's passed
@@ -256,6 +269,30 @@ class PositionUnsafe(Exception):
         self.reason = reason
 
 
+def light_recovery_check(eeprom_record, sidecar_state, resolved_file_path):
+    """The cheap, boot-time half of validate_recovery(): everything except
+    hashing the gcode file, which can take seconds on this SoC and is
+    therefore left to NEBULAOS_PLR_RESUME. Returns (state, reason) where
+    state is STATE_NONE, STATE_RECOVERY_AVAILABLE or
+    STATE_RECOVERY_INCOMPATIBLE. Pure: the caller does all I/O."""
+    if eeprom_record is None:
+        return STATE_NONE, ""
+    if sidecar_state is None:
+        return STATE_RECOVERY_INCOMPATIBLE, "sidecar missing or unreadable"
+    if sidecar_state.get("schema_version") != SCHEMA_VERSION:
+        return STATE_RECOVERY_INCOMPATIBLE, "sidecar schema_version mismatch"
+    if sidecar_state.get("generation") != eeprom_record.generation:
+        return STATE_RECOVERY_INCOMPATIBLE, "stale sidecar generation"
+    file_info = sidecar_state.get("file") or {}
+    if not file_info.get("path"):
+        return STATE_RECOVERY_INCOMPATIBLE, "no recorded gcode file path"
+    if not resolved_file_path or not os.path.isfile(resolved_file_path):
+        return STATE_RECOVERY_INCOMPATIBLE, "gcode file missing"
+    if os.path.getsize(resolved_file_path) != file_info.get("size"):
+        return STATE_RECOVERY_INCOMPATIBLE, "gcode file size changed"
+    return STATE_RECOVERY_AVAILABLE, ""
+
+
 def build_resume_gcode_lines(state):
     """Builds the standard-command restoration sequence from the mission's
     "Public Klipper Resume Path" section. Pure string assembly - no gcode
@@ -394,6 +431,20 @@ class NebulaOSPowerLossRecovery:
         self._resume_in_progress = False
         self._have_active_session = False
         self._pending_candidate = None  # a Candidate not yet proven durable
+        # Set on the first 'printing' tick of a print (see _check_new_print);
+        # cleared once the print is over.
+        self._print_start_checked = False
+        # (generation, relative gcode path) restored by NEBULAOS_PLR_RESUME
+        # and waiting for the operator's M24 - the one record a starting
+        # print must not tombstone.
+        self._resume_armed = None
+
+        # Structured status, cached: get_status() is polled by Moonraker
+        # subscribers and must never do I/O.
+        self._status_state = STATE_NONE
+        self._recovery_info = {}
+        self._last_action = ""
+        self._last_error = ""
 
         self.printer.register_event_handler("klippy:ready", self._handle_ready)
         self.printer.register_event_handler("virtual_sdcard:reset_file",
@@ -439,6 +490,13 @@ class NebulaOSPowerLossRecovery:
                     "sidecar_dir %r: %s" % (self.sidecar_dir, exc))
 
         self._ensure_eeprom_accessible()
+        # Startup, nothing is moving yet: one direct EEPROM scan is fine
+        # here. Every later EEPROM/sidecar access goes through the executor.
+        try:
+            self._refresh_recovery_status_blocking()
+        except Exception as exc:
+            logging.exception("nebulaos_power_loss_recovery: status read failed")
+            self._set_error("status read failed: %s" % exc)
 
         self.timer_handler = self.reactor.register_timer(
             self._timer_event, self.reactor.NOW)
@@ -466,6 +524,68 @@ class NebulaOSPowerLossRecovery:
     def _open_eeprom(self):
         return open(self.eeprom_path, 'r+b')
 
+    def _io(self, fn, *args):
+        """Runs blocking EEPROM/sidecar/hash I/O on the aio_executor thread.
+        Executor.submit() parks only the calling greenlet; the reactor keeps
+        running, so an I2C scan or a SHA-256 over a large gcode file can never
+        starve the move queue (a stall longer than Klipper's look-ahead ends
+        in "Timer too close")."""
+        return self.executor.submit(fn, *args)
+
+    # -- recovery status ----------------------------------------------------
+
+    def _read_record_blocking(self):
+        with self._open_eeprom() as eeprom:
+            return journal.read_recovery_state(eeprom)
+
+    def _refresh_recovery_status_blocking(self):
+        """Re-derives the cached front-end status from the EEPROM and the
+        sidecar (light check, no hashing). Blocking: call through _io()
+        except at klippy:ready."""
+        record = self._read_record_blocking()
+        if self._have_active_session:
+            self._status_state = STATE_RECORDING
+            return
+        sidecar = None
+        resolved = None
+        if record is not None:
+            sidecar = read_sidecar(sidecar_path_for_generation(
+                self.sidecar_dir, record.generation))
+            path = ((sidecar or {}).get("file") or {}).get("path")
+            if path:
+                resolved = self._resolve_sdcard_path(path)
+        state, reason = light_recovery_check(record, sidecar, resolved)
+        if state == STATE_NONE:
+            self._recovery_info = {}
+        else:
+            file_info = (sidecar or {}).get("file") or {}
+            size = file_info.get("size") or 0
+            self._recovery_info = {
+                "generation": record.generation,
+                "file": file_info.get("path", ""),
+                "file_size": size,
+                "file_position": record.file_position,
+                "progress": (float(record.file_position) / size
+                             if size else 0.0),
+                "checked": "light",
+                "reason": reason,
+            }
+        if (state == STATE_RECOVERY_AVAILABLE and self._resume_armed is not None
+                and self._resume_armed[0] == record.generation):
+            state = STATE_RESUME_PREPARED
+        self._status_state = state
+
+    def _refresh_recovery_status(self):
+        try:
+            self._io(self._refresh_recovery_status_blocking)
+        except Exception as exc:
+            logging.exception("nebulaos_power_loss_recovery: status refresh failed")
+            self._set_error("status refresh failed: %s" % exc)
+
+    def _set_error(self, message):
+        self._last_error = message
+        self._status_state = STATE_ERROR
+
     # -- periodic state machine --------------------------------------------
 
     def _timer_event(self, eventtime):
@@ -489,15 +609,54 @@ class NebulaOSPowerLossRecovery:
             self._maybe_promote_candidate(eventtime)
 
         if state == 'printing':
+            if not self._print_start_checked:
+                self._check_new_print(eventtime)
             self._tick_printing(eventtime, ps_status)
         elif state in ('complete', 'cancelled'):
             self._pending_candidate = None
+            self._print_start_checked = False
             if self._have_active_session:
                 self._tombstone_session("print_%s" % state)
         elif state == 'error':
             self._pending_candidate = None
+            self._print_start_checked = False
+        elif state == 'standby':
+            self._print_start_checked = False
         # paused / standby: preserve the latest durable checkpoint and any
         # still-pending candidate, take no new candidate.
+
+    def _check_new_print(self, eventtime):
+        """First 'printing' tick of a print. A durable record that belongs to
+        an EARLIER print must not survive into this one: the first checkpoint
+        of the new print only lands after Z > min_z_for_start and completed
+        motion, and a power loss during homing/meshing/purging/the first
+        layer would otherwise leave the old print's record looking valid
+        (its own file is unchanged, so every identity check passes). The one
+        exception is the record NEBULAOS_PLR_RESUME just restored, when the
+        operator's M24 continues exactly that file."""
+        self._print_start_checked = True
+        if self._have_active_session:
+            return
+        armed = self._resume_armed
+        self._resume_armed = None
+        if armed is not None:
+            vsd_status = self.virtual_sdcard.get_status(eventtime)
+            current = self._relative_sdcard_path(
+                vsd_status.get('file_path') or "")
+            if current == armed[1]:
+                self._last_action = "resumed"
+                return
+        try:
+            record = self._io(self._read_record_blocking)
+        except Exception as exc:
+            logging.exception("nebulaos_power_loss_recovery: EEPROM read failed")
+            self._set_error("EEPROM read failed: %s" % exc)
+            return
+        if record is not None:
+            logging.info("nebulaos_power_loss_recovery: new print started, "
+                         "invalidating the previous print's record "
+                         "(generation %d)", record.generation)
+            self._tombstone_session("superseded_by_new_print")
 
     def _tick_printing(self, eventtime, ps_status):
         vsd_status = self.virtual_sdcard.get_status(eventtime)
@@ -540,11 +699,20 @@ class NebulaOSPowerLossRecovery:
             return
         try:
             size = os.path.getsize(file_path)
-            sha256 = hash_file(file_path)
+            # Mid-print by definition (Z > min_z_for_start): hashing a large
+            # file here on the reactor would stall the move queue.
+            sha256 = self._io(hash_file, file_path)
         except OSError:
             logging.exception(
                 "nebulaos_power_loss_recovery: could not hash %r, "
                 "not starting a PLR session", file_path)
+            return
+        # The reactor kept running while the hash was computed: the print may
+        # have ended or switched files meanwhile.
+        now = self.reactor.monotonic()
+        if (self.print_stats.get_status(now).get('state') != 'printing'
+                or self.virtual_sdcard.get_status(now).get('file_path')
+                != file_path):
             return
         self._session_file_info = {
             "path": self._relative_sdcard_path(file_path),
@@ -552,6 +720,15 @@ class NebulaOSPowerLossRecovery:
             "sha256": sha256,
         }
         self._have_active_session = True
+        self._status_state = STATE_RECORDING
+        self._recovery_info = {
+            "file": self._session_file_info["path"],
+            "file_size": size,
+            "file_position": 0,
+            "progress": 0.0,
+            "checked": "full",
+            "reason": "",
+        }
         # Force the very first candidate to be taken immediately, regardless
         # of how large `eventtime` (reactor uptime, not wall-clock) already
         # is at session-start time.
@@ -652,12 +829,23 @@ class NebulaOSPowerLossRecovery:
             return
         self._checkpoint_in_flight = True
         try:
-            self.executor.submit(self._perform_checkpoint_blocking, candidate)
+            record = self._io(self._perform_checkpoint_blocking, candidate)
             self._last_checkpoint_time = eventtime
             self._pending_candidate = None
-        except Exception:
+            self._last_action = "checkpoint"
+            self._last_error = ""
+            if self._have_active_session and record is not None:
+                size = candidate.file_info.get("size") or 0
+                self._recovery_info.update({
+                    "generation": record.generation,
+                    "file_position": record.file_position,
+                    "progress": (float(record.file_position) / size
+                                 if size else 0.0),
+                })
+        except Exception as exc:
             logging.exception(
                 "nebulaos_power_loss_recovery: checkpoint failed")
+            self._last_error = "checkpoint failed: %s" % exc
         finally:
             self._checkpoint_in_flight = False
 
@@ -687,18 +875,25 @@ class NebulaOSPowerLossRecovery:
             # so a crash between the two never leaves the EEPROM pointing
             # at a generation whose sidecar was never actually written.
             atomic_write_json(tmp_path, final_path, state)
-            journal.commit_checkpoint(eeprom, candidate.file_position)
+            return journal.commit_checkpoint(eeprom, candidate.file_position)
+
+    def _tombstone_blocking(self):
+        with self._open_eeprom() as eeprom:
+            journal.commit_tombstone(eeprom)
 
     def _tombstone_session(self, reason):
         try:
-            with self._open_eeprom() as eeprom:
-                journal.commit_tombstone(eeprom)
-        except Exception:
+            self._io(self._tombstone_blocking)
+            self._last_action = "tombstone:%s" % reason
+        except Exception as exc:
             logging.exception(
                 "nebulaos_power_loss_recovery: tombstone (%s) failed", reason)
+            self._last_error = "tombstone (%s) failed: %s" % (reason, exc)
         self._have_active_session = False
         self._session_file_info = None
         self._pending_candidate = None
+        self._resume_armed = None
+        self._refresh_recovery_status()
 
     def _handle_reset_file(self):
         if self._resume_in_progress:
@@ -706,6 +901,12 @@ class NebulaOSPowerLossRecovery:
             # expected, not a foreign file change. Never invalidate our own
             # recovery transaction because of it.
             return
+        if self._resume_armed is not None:
+            # A different file (or the same one, re-selected from scratch)
+            # replaced the restored state: the prepared resume is void and
+            # the next print start must invalidate the record.
+            self._resume_armed = None
+            self._refresh_recovery_status()
         if self._have_active_session:
             logging.info(
                 "nebulaos_power_loss_recovery: virtual_sdcard file changed "
@@ -717,8 +918,7 @@ class NebulaOSPowerLossRecovery:
 
     def cmd_NEBULAOS_PLR_STATUS(self, gcmd):
         try:
-            with self._open_eeprom() as eeprom:
-                record = journal.read_recovery_state(eeprom)
+            record = self._io(self._read_record_blocking)
         except (IOError, OSError) as exc:
             gcmd.respond_info("NebulaOS PLR: EEPROM read failed: %s" % exc)
             return
@@ -727,7 +927,7 @@ class NebulaOSPowerLossRecovery:
             return
         sidecar_path = sidecar_path_for_generation(self.sidecar_dir,
                                                     record.generation)
-        sidecar = read_sidecar(sidecar_path)
+        sidecar = self._io(read_sidecar, sidecar_path)
         if sidecar is None:
             gcmd.respond_info(
                 "NebulaOS PLR: EEPROM generation %d present but sidecar %s "
@@ -741,39 +941,43 @@ class NebulaOSPowerLossRecovery:
             % (record.generation, record.file_position,
                sidecar.get("file", {}).get("path")))
 
+    def _load_resume_inputs_blocking(self):
+        """EEPROM record, its sidecar, and the current identity (path, size,
+        sha256) of the file the sidecar names - everything validate_recovery()
+        needs. Blocking (hashes the whole file): run through _io()."""
+        record = self._read_record_blocking()
+        sidecar = None
+        current = (None, None, None)
+        if record is not None:
+            sidecar = read_sidecar(sidecar_path_for_generation(
+                self.sidecar_dir, record.generation))
+        if sidecar is not None:
+            candidate_path = (sidecar.get("file") or {}).get("path")
+            if candidate_path:
+                resolved = self._resolve_sdcard_path(candidate_path)
+                if resolved and os.path.isfile(resolved):
+                    current = (candidate_path, os.path.getsize(resolved),
+                               hash_file(resolved))
+        return record, sidecar, current
+
     def cmd_NEBULAOS_PLR_RESUME(self, gcmd):
         allow_unsafe = bool(gcmd.get_int('ALLOW_UNSAFE', 0, minval=0, maxval=1))
 
-        with self._open_eeprom() as eeprom:
-            record = journal.read_recovery_state(eeprom)
+        state = self.print_stats.get_status(
+            self.reactor.monotonic()).get('state')
+        if state not in RESUME_ALLOWED_PRINT_STATES:
+            raise gcmd.error(
+                "NebulaOS PLR: resume refused while a print is %s" % state)
 
-        current_file_info = None
-        if record is not None:
-            sidecar_path = sidecar_path_for_generation(self.sidecar_dir,
-                                                        record.generation)
-            sidecar = read_sidecar(sidecar_path)
-        else:
-            sidecar = None
-
+        record, sidecar, current = self._io(self._load_resume_inputs_blocking)
         try:
-            current_path = None
-            current_size = None
-            current_sha256 = None
-            if sidecar is not None:
-                file_info = sidecar.get("file") or {}
-                candidate_path = file_info.get("path")
-                if candidate_path:
-                    resolved = self._resolve_sdcard_path(candidate_path)
-                    if resolved and os.path.isfile(resolved):
-                        current_path = candidate_path
-                        current_size = os.path.getsize(resolved)
-                        current_sha256 = hash_file(resolved)
             validated = validate_recovery(
-                record, sidecar, current_path, current_size, current_sha256,
+                record, sidecar, current[0], current[1], current[2],
                 allow_unsafe)
         except PositionUnsafe as exc:
             raise gcmd.error(str(exc))
         except IntegrityFailure as exc:
+            self._refresh_recovery_status()
             raise gcmd.error("NebulaOS PLR: recovery refused: %s" % exc)
 
         self._resume_in_progress = True
@@ -783,6 +987,11 @@ class NebulaOSPowerLossRecovery:
         finally:
             self._resume_in_progress = False
 
+        self._resume_armed = (validated["generation"],
+                              validated["file"]["path"])
+        self._last_action = "resume_prepared"
+        self._refresh_recovery_status()
+        self._recovery_info["checked"] = "full"
         gcmd.respond_info(
             "NebulaOS PLR: resume state restored (generation=%d). "
             "No motion was performed and M24 was NOT issued - verify the "
@@ -791,6 +1000,7 @@ class NebulaOSPowerLossRecovery:
 
     def cmd_NEBULAOS_PLR_DISCARD(self, gcmd):
         self._tombstone_session("manual_discard")
+        self._last_action = "discarded"
         gcmd.respond_info("NebulaOS PLR: checkpoint discarded (tombstoned)")
 
     def _resolve_sdcard_path(self, relative_path):
@@ -800,7 +1010,16 @@ class NebulaOSPowerLossRecovery:
         return relative_path
 
     def get_status(self, eventtime):
+        # Cached values only - no I/O. "position_safe" stays False until a
+        # hardware-qualified physical-resume procedure exists: a resume only
+        # restores state, it never establishes where the toolhead is.
         return {
+            "state": self._status_state,
+            "position_safe": False,
+            "resume_mode": "state_restore_only",
+            "recovery": dict(self._recovery_info),
+            "last_action": self._last_action,
+            "last_error": self._last_error,
             "active_session": self._have_active_session,
             "resume_in_progress": self._resume_in_progress,
             "candidate_pending": self._pending_candidate is not None,

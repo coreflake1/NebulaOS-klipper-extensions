@@ -733,6 +733,7 @@ class ExtensionStateMachineTests(unittest.TestCase):
 
     def test_resume_refuses_without_allow_unsafe(self):
         self._tick_and_settle(1.0)
+        self.print_stats_status['state'] = 'standby'  # after power loss
         gcmd = _FakeGCmd({'ALLOW_UNSAFE': 0})
         with self.assertRaises(Exception):
             self.ext.cmd_NEBULAOS_PLR_RESUME(gcmd)
@@ -740,6 +741,7 @@ class ExtensionStateMachineTests(unittest.TestCase):
 
     def test_resume_one_time_allow_unsafe_succeeds_and_restores_state(self):
         self._tick_and_settle(1.0)
+        self.print_stats_status['state'] = 'standby'  # after power loss
         gcmd = _FakeGCmd({'ALLOW_UNSAFE': 1})
         self.ext.cmd_NEBULAOS_PLR_RESUME(gcmd)
         lines = self.objects['gcode'].run_lines
@@ -749,6 +751,7 @@ class ExtensionStateMachineTests(unittest.TestCase):
 
     def test_resume_allow_unsafe_cannot_bypass_integrity_failure(self):
         self._tick_and_settle(1.0)
+        self.print_stats_status['state'] = 'standby'  # after power loss
         # Corrupt the on-disk gcode file so its hash no longer matches what
         # was recorded at session start.
         with open(self.vsd_status['file_path'], 'ab') as handle:
@@ -768,6 +771,230 @@ class ExtensionStateMachineTests(unittest.TestCase):
         gcmd = _FakeGCmd()
         self.ext.cmd_NEBULAOS_PLR_STATUS(gcmd)
         self.assertTrue(any('no recovery available' in m for m in gcmd.messages))
+
+
+class GuiReadinessTests(ExtensionStateMachineTests):
+    """PLR-1..PLR-7 (GUI/service readiness mission, 2026-10-09)."""
+
+    def _power_loss_reboot(self):
+        """A fresh Klippy after power loss: same EEPROM/sidecar/file, print
+        state standby, new extension instance."""
+        self.print_stats_status['state'] = 'standby'
+        self.objects['gcode'] = _FakeGCode()
+        self.ext = plr.NebulaOSPowerLossRecovery(self.config)
+        self.ext._handle_ready()
+
+    def _record_executor_calls(self):
+        calls = []
+        real = self.ext.executor
+
+        class _Recording(object):
+            def submit(self_inner, fn, *args, **kwargs):
+                calls.append(getattr(fn, '__name__', repr(fn)))
+                return real.submit(fn, *args, **kwargs)
+        self.ext.executor = _Recording()
+        return calls
+
+    def test_session_hash_runs_on_executor_not_reactor(self):
+        calls = self._record_executor_calls()
+        original = plr.hash_file
+        reactor_hashes = []
+
+        def guarded_hash(path, *a, **k):
+            # Every hash must arrive through the executor, never called
+            # directly from the timer path.
+            reactor_hashes.append(calls[-1] if calls else None)
+            return original(path, *a, **k)
+        plr.hash_file = guarded_hash
+        try:
+            self._tick_and_settle(1.0)
+        finally:
+            plr.hash_file = original
+        self.assertTrue(self.ext._have_active_session)
+        self.assertIn('guarded_hash', calls)
+        self.assertEqual(reactor_hashes, ['guarded_hash'])
+
+    def test_eeprom_io_in_timer_paths_goes_through_executor(self):
+        calls = self._record_executor_calls()
+        self._tick_and_settle(1.0)
+        self.print_stats_status['state'] = 'complete'
+        self._tick_and_settle(2.0)
+        self.assertIn('_perform_checkpoint_blocking', calls)
+        self.assertIn('_tombstone_blocking', calls)
+
+    def test_session_not_started_if_print_ended_during_hash(self):
+        original = plr.hash_file
+
+        def hash_then_cancel(path, *a, **k):
+            self.print_stats_status['state'] = 'cancelled'
+            return original(path, *a, **k)
+        plr.hash_file = hash_then_cancel
+        try:
+            self.ext._tick(1.0)
+        finally:
+            plr.hash_file = original
+        self.assertFalse(self.ext._have_active_session)
+
+    def test_new_print_tombstones_previous_prints_record(self):
+        self._tick_and_settle(1.0)
+        self.assertIsNotNone(self._eeprom_record())
+        self._power_loss_reboot()
+        self.assertEqual(self.ext.get_status(0)['state'],
+                         plr.STATE_RECOVERY_AVAILABLE)
+        # New print starts; still homing/purging (Z low, no session yet).
+        self.objects['toolhead']._status = _toolhead_status(z=0.2)
+        self.print_stats_status['state'] = 'printing'
+        self.ext._tick(1.0)
+        self.assertFalse(self.ext._have_active_session)
+        self.assertIsNone(self._eeprom_record())
+        self.assertTrue(self._eeprom_scan().is_tombstone)
+        self.assertEqual(self.ext.get_status(0)['state'], plr.STATE_NONE)
+
+    def test_new_print_check_runs_once_per_print(self):
+        self.objects['toolhead']._status = _toolhead_status(z=0.2)
+        calls = self._record_executor_calls()
+        for t in (1.0, 2.0, 3.0):
+            self.ext._tick(t)
+        self.assertEqual(calls.count('_read_record_blocking'), 1)
+
+    def test_resumed_print_keeps_its_record(self):
+        self._tick_and_settle(1.0)
+        generation = self._eeprom_record().generation
+        self._power_loss_reboot()
+        self.ext.cmd_NEBULAOS_PLR_RESUME(_FakeGCmd({'ALLOW_UNSAFE': 1}))
+        self.assertEqual(self.ext.get_status(0)['state'],
+                         plr.STATE_RESUME_PREPARED)
+        # Operator's M24: printing again, same file.
+        self.print_stats_status['state'] = 'printing'
+        self.objects['toolhead']._status = _toolhead_status(z=0.2)
+        self.ext._tick(1.0)
+        record = self._eeprom_record()
+        self.assertIsNotNone(record)
+        self.assertEqual(record.generation, generation)
+        self.assertEqual(self.ext.get_status(0)['last_action'], 'resumed')
+
+    def test_prepared_resume_voided_by_other_file(self):
+        self._tick_and_settle(1.0)
+        self._power_loss_reboot()
+        self.ext.cmd_NEBULAOS_PLR_RESUME(_FakeGCmd({'ALLOW_UNSAFE': 1}))
+        # SDCARD_PRINT_FILE of another file (not our own M23).
+        self.printer.send_event("virtual_sdcard:reset_file")
+        self.print_stats_status['state'] = 'printing'
+        self.objects['toolhead']._status = _toolhead_status(z=0.2)
+        self.ext._tick(1.0)
+        self.assertIsNone(self._eeprom_record())
+
+    def test_resume_refused_while_printing_or_paused(self):
+        self._tick_and_settle(1.0)
+        for state in ('printing', 'paused'):
+            self.print_stats_status['state'] = state
+            with self.assertRaises(Exception):
+                self.ext.cmd_NEBULAOS_PLR_RESUME(_FakeGCmd({'ALLOW_UNSAFE': 1}))
+        self.assertEqual(self.objects['gcode'].run_lines, [])
+
+    def test_status_none_on_blank_eeprom(self):
+        st = self.ext.get_status(0)
+        self.assertEqual(st['state'], plr.STATE_NONE)
+        self.assertFalse(st['position_safe'])
+        self.assertEqual(st['resume_mode'], 'state_restore_only')
+        self.assertEqual(st['recovery'], {})
+
+    def test_status_recording_then_available_after_power_loss(self):
+        self.vsd_status['file_position'] = 13
+        self._tick_and_settle(1.0)
+        st = self.ext.get_status(0)
+        self.assertEqual(st['state'], plr.STATE_RECORDING)
+        self.assertEqual(st['recovery']['file_position'], 13)
+        self._power_loss_reboot()
+        st = self.ext.get_status(0)
+        self.assertEqual(st['state'], plr.STATE_RECOVERY_AVAILABLE)
+        self.assertEqual(st['recovery']['file'], 'print.gcode')
+        self.assertEqual(st['recovery']['checked'], 'light')
+        self.assertAlmostEqual(st['recovery']['progress'],
+                               13.0 / os.path.getsize(self.vsd_status['file_path']))
+
+    def test_status_incompatible_when_file_size_changed(self):
+        self._tick_and_settle(1.0)
+        with open(self.vsd_status['file_path'], 'ab') as handle:
+            handle.write(b'; edited')
+        self._power_loss_reboot()
+        st = self.ext.get_status(0)
+        self.assertEqual(st['state'], plr.STATE_RECOVERY_INCOMPATIBLE)
+        self.assertIn('size', st['recovery']['reason'])
+
+    def test_status_incompatible_when_file_missing(self):
+        self._tick_and_settle(1.0)
+        os.unlink(self.vsd_status['file_path'])
+        self._power_loss_reboot()
+        self.assertEqual(self.ext.get_status(0)['state'],
+                         plr.STATE_RECOVERY_INCOMPATIBLE)
+
+    def test_status_after_discard(self):
+        self._tick_and_settle(1.0)
+        self._power_loss_reboot()
+        self.ext.cmd_NEBULAOS_PLR_DISCARD(_FakeGCmd())
+        st = self.ext.get_status(0)
+        self.assertEqual(st['state'], plr.STATE_NONE)
+        self.assertEqual(st['last_action'], 'discarded')
+
+    def test_status_error_when_eeprom_unreadable_at_ready(self):
+        os.unlink(self.eeprom_path)
+        ext = plr.NebulaOSPowerLossRecovery(self.config)
+        with self.assertRaises(Exception):
+            ext._handle_ready()  # config error, as before: never silent
+
+    def test_checkpoint_failure_surfaces_last_error(self):
+        def boom(candidate):
+            raise IOError("simulated I2C failure")
+        self.ext._perform_checkpoint_blocking = boom
+        self._tick_and_settle(1.0)
+        self.assertIn('simulated I2C failure',
+                      self.ext.get_status(0)['last_error'])
+        self.assertIsNotNone(self.ext._pending_candidate)  # retried later
+
+    def test_get_status_does_no_io(self):
+        self._tick_and_settle(1.0)
+        os.unlink(self.eeprom_path)
+        self.ext.get_status(0)  # must not raise
+
+
+class LightRecoveryCheckTests(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmpdir, 'f.gcode')
+        with open(self.path, 'wb') as handle:
+            handle.write(b'x' * 100)
+        self.record = journal.Record(1, 1, journal.FLAG_VALID, 4, 50)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _sidecar(self, **over):
+        state = _full_sidecar_state(generation=4)
+        state['file'] = {'path': 'f.gcode', 'size': 100, 'sha256': 'a' * 64}
+        state.update(over)
+        return state
+
+    def test_none(self):
+        self.assertEqual(plr.light_recovery_check(None, None, None)[0],
+                         plr.STATE_NONE)
+
+    def test_available(self):
+        self.assertEqual(plr.light_recovery_check(
+            self.record, self._sidecar(), self.path),
+            (plr.STATE_RECOVERY_AVAILABLE, ""))
+
+    def test_incompatible_cases(self):
+        cases = [
+            (None, None),
+            (self._sidecar(schema_version=99), self.path),
+            (self._sidecar(generation=3), self.path),
+            (self._sidecar(), os.path.join(self.tmpdir, 'missing')),
+        ]
+        for sidecar, path in cases:
+            self.assertEqual(plr.light_recovery_check(
+                self.record, sidecar, path)[0],
+                plr.STATE_RECOVERY_INCOMPATIBLE)
 
 
 class CandidatePromotionTests(ExtensionStateMachineTests):
