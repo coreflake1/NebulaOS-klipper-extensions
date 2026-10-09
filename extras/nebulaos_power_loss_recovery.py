@@ -424,8 +424,12 @@ def build_physical_resume_lines(state, z_lift, prime_length, z_max,
 
     Ordering constraint from upstream safe_z_home: G28 with Z unhomed resets
     Z to 0 and clears its homing - so Z is declared homed at its recorded
-    height (SET_KINEMATIC_POSITION ... SET_HOMED=z) BEFORE G28 X Y; with Z
-    homed above z_hop, safe_z_home leaves Z alone.
+    height BEFORE G28 X Y; with Z homed above z_hop, safe_z_home leaves Z
+    alone. Z is declared through this extra's internal _NEBULAOS_PLR_SET_Z
+    (toolhead.set_position(..., homing_axes="z"), what force_move's
+    SET_KINEMATIC_POSITION does): upstream registers SET_KINEMATIC_POSITION
+    only with [force_move] enable_force_move, which NebulaOS does not enable
+    for everyone.
 
     Returns the full G-code list, ending with M24. Raises
     PhysicalResumeRefused when it cannot be done safely."""
@@ -457,7 +461,7 @@ def build_physical_resume_lines(state, z_lift, prime_length, z_max,
     lines.append("M104 S%g" % hotend)
     if bed > 0:
         lines.append("M190 S%g" % bed)
-    lines.append("SET_KINEMATIC_POSITION Z=%.4f SET_HOMED=z" % kin_z)
+    lines.append("_NEBULAOS_PLR_SET_Z Z=%.4f" % kin_z)
     lines.append("G91")
     lines.append("G1 Z%.3f F600" % lift)
     lines.append("G90")
@@ -576,6 +580,9 @@ class NebulaOSPowerLossRecovery:
         self.gcode.register_command(
             "NEBULAOS_PLR_DISCARD", self.cmd_NEBULAOS_PLR_DISCARD,
             desc="Discard any NebulaOS power-loss-recovery checkpoint")
+        self.gcode.register_command(
+            "_NEBULAOS_PLR_SET_Z", self.cmd_NEBULAOS_PLR_SET_Z,
+            desc="Internal to NEBULAOS_PLR_RESUME PHYSICAL=1")
 
     # -- setup -------------------------------------------------------------
 
@@ -1154,6 +1161,18 @@ class NebulaOSPowerLossRecovery:
                 "No motion was performed and M24 was NOT issued - verify the "
                 "physical position is safe, then resume printing manually."
                 % validated["generation"])
+
+    def cmd_NEBULAOS_PLR_SET_Z(self, gcmd):
+        """Declares Z homed at the recorded height. Only valid inside a
+        physical resume - never a general-purpose way to fake homing."""
+        if not self._resume_in_progress:
+            raise gcmd.error("_NEBULAOS_PLR_SET_Z is internal to "
+                             "NEBULAOS_PLR_RESUME PHYSICAL=1")
+        z = gcmd.get_float('Z', above=0.)
+        self.toolhead.get_last_move_time()
+        pos = self.toolhead.get_position()
+        pos[2] = z
+        self.toolhead.set_position(pos, homing_axes="z")
 
     def cmd_NEBULAOS_PLR_DISCARD(self, gcmd):
         self._tombstone_session("manual_discard")

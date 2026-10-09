@@ -442,6 +442,9 @@ class _FakeGCmd(object):
     def get_int(self, name, default, minval=None, maxval=None):
         return int(self._params.get(name, default))
 
+    def get_float(self, name, default=None, above=None, minval=None, maxval=None):
+        return float(self._params.get(name, default))
+
     def respond_info(self, msg, log=True):
         self.messages.append(msg)
 
@@ -1050,10 +1053,10 @@ class ConfigIdentityAndPhysicalResumeTests(ExtensionStateMachineTests):
         self.ext.cmd_NEBULAOS_PLR_RESUME(_FakeGCmd({'ALLOW_UNSAFE': 1, 'PHYSICAL': 1}))
         lines = self.objects['gcode'].run_lines
         idx = lambda prefix: next(i for i, l in enumerate(lines) if l.startswith(prefix))
-        self.assertLess(idx('M190 S60'), idx('SET_KINEMATIC_POSITION'))
-        self.assertEqual(lines[idx('SET_KINEMATIC_POSITION')],
-                         'SET_KINEMATIC_POSITION Z=10.0000 SET_HOMED=z')
-        self.assertLess(idx('SET_KINEMATIC_POSITION'), idx('G1 Z5.000'))
+        self.assertLess(idx('M190 S60'), idx('_NEBULAOS_PLR_SET_Z'))
+        self.assertEqual(lines[idx('_NEBULAOS_PLR_SET_Z')], '_NEBULAOS_PLR_SET_Z Z=10.0000')
+        self.assertLess(idx('_NEBULAOS_PLR_SET_Z'), idx('G1 Z5.000'))
+        self.assertFalse(any(l.startswith('SET_KINEMATIC_POSITION') for l in lines))
         self.assertLess(idx('G1 Z5.000'), idx('G28 X Y'))
         self.assertLess(idx('G28 X Y'), idx('M109 S210'))
         self.assertLess(idx('M109 S210'), idx('G1 E8.000'))
@@ -1069,6 +1072,18 @@ class ConfigIdentityAndPhysicalResumeTests(ExtensionStateMachineTests):
         self.print_stats_status['state'] = 'printing'
         self.ext._tick(50.0)
         self.assertIsNotNone(self._eeprom_record())
+
+    def test_set_z_is_internal_and_homes_z_only(self):
+        with self.assertRaises(Exception):
+            self.ext.cmd_NEBULAOS_PLR_SET_Z(_FakeGCmd({'Z': 10.0}))
+        calls = []
+        th = self.objects['toolhead']
+        th.get_last_move_time = lambda: 0.0
+        th.get_position = lambda: [1.0, 2.0, 0.0, 0.0]
+        th.set_position = lambda pos, homing_axes=(): calls.append((pos, homing_axes))
+        self.ext._resume_in_progress = True
+        self.ext.cmd_NEBULAOS_PLR_SET_Z(_FakeGCmd({'Z': 10.0}))
+        self.assertEqual(calls, [([1.0, 2.0, 10.0, 0.0], "z")])
 
     def test_physical_refusals(self):
         state = _full_sidecar_state()
