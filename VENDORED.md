@@ -23,13 +23,15 @@ table, are authoritative for the file they appear in.
 | `extras/guppy_module_loader.py` | ballaswag, © 2024 | `ballaswag/guppyscreen` | **absent upstream — added**; **no longer shipped** (removed from `extras/`, absent from `nebulaos-extensions.json`) | header only |
 | `extras/tmcstatus.py` | ballaswag, © 2024 | `ballaswag/guppyscreen` | **absent upstream — added** | header, plus a `klippy:connect` deferral fix |
 | `extras/nebulaos_temperature_mcu.py` | Kevin O'Connor © 2020-2024 (base), NebulaOS © 2026 (GD32 curves) | `Klipper3d/klipper` | derived, both credited | subclass + three GD32 calibration curves |
+| `extras/autotune_tmc.py`, `extras/motor_constants.py`, `extras/motor_database.cfg` | Andrew McGregor and contributors, © 2023-2026 | `andrewmcgr/klipper_tmc_autotune` @ `b6c7cfa98c2ef880812d5279a9117cbe67d6d4d5` | **absent upstream — added** | header only (code unmodified). Upstream, not OpenKE's `evgarthub/klipper_tmc_autotune_k1` fork: that fork only back-ports `TMCtstepHelper` for Creality's old stock Klipper, and NebulaOS runs current upstream Klipper. KE stock motors identical in both: `creality-42-34` (X/Y), `creality-42-40` (Z). Loaded only when an `[autotune_tmc <stepper>]` section exists (decision D8, 2026-10-10) |
 | `extras/bl24c16f.py` | Eric Callahan, © 2020 | community Klipper extra, shipped by Creality in the KE's stock firmware | present upstream, preserved | none — byte-identical to the copy pulled from the printer's own stock rootfs partition |
 
 Two of the rows above, `guppy_config_helper.py` and `guppy_module_loader.py`, are **historical**:
 those files were removed from `extras/` and are not in `nebulaos-extensions.json`. Their
 attribution is kept here deliberately — an attribution record should not lose an author because
-the file stopped shipping. Five vendored community modules ship today: `tmcstatus`,
-`gcode_shell_command`, `virtual_pins`, `calibrate_shaper_config`, `bl24c16f`.
+the file stopped shipping. Six vendored community modules ship today: `tmcstatus`,
+`gcode_shell_command`, `virtual_pins`, `calibrate_shaper_config`, `bl24c16f`, and TMC
+autotune (`autotune_tmc` + `motor_constants` + `motor_database.cfg`).
 
 Everything else in `extras/` — `z_compensate`, the nozzle-contact/Z-offset/calibration set,
 power-loss recovery, `nebulaos_version`, `nebulaos_compat`, and the test suite — is NebulaOS's
