@@ -77,9 +77,32 @@ class FakeTimer:
     NEVER = -1.0
 
 
+class FakeGCode:
+    def __init__(self):
+        self.commands = {}
+
+    def register_command(self, name, cb, desc=None):
+        self.commands[name] = cb
+
+
+class FakeGCmd:
+    def __init__(self, params=None):
+        self._params = params or {}
+        self.responses = []
+
+    def get_int(self, name, default=None, minval=None, maxval=None):
+        if name not in self._params:
+            return default
+        return int(self._params[name])
+
+    def respond_info(self, msg):
+        self.responses.append(msg)
+
+
 class FakePrinter:
     def __init__(self):
         self._objects = {}
+        self._gcode = FakeGCode()
         self._handlers = {}
         self._reactor = FakeTimer()
 
@@ -87,6 +110,8 @@ class FakePrinter:
         self._handlers.setdefault(name, []).append(cb)
 
     def lookup_object(self, name):
+        if name == 'gcode':
+            return self._gcode
         return self._objects[name]
 
     def get_reactor(self):
@@ -98,9 +123,13 @@ class FakePrinter:
 
 
 class FakeConfig:
-    def __init__(self, printer, prefix_sections=None):
+    def __init__(self, printer, prefix_sections=None, options=None):
         self._printer = printer
         self._prefix_sections = prefix_sections or {}
+        self._options = options or {}
+
+    def getboolean(self, key, default=None):
+        return self._options.get(key, default)
 
     def get_printer(self):
         return self._printer
@@ -123,10 +152,74 @@ class FakeSection:
         return default
 
 
+class TestTMCStatusEnable(unittest.TestCase):
+    """TMCSTATUS ENABLE=0|1 (GuppyScreen's TMC panel toggle) and `enabled:`."""
+
+    def _make(self, options=None):
+        return TestTMCStatusReactorSafety._make_status(self, options=options)
+
+    def test_command_registered(self):
+        status, printer = self._make()
+        self.assertIn('TMCSTATUS', printer._gcode.commands)
+
+    def test_enabled_by_default_refreshes_on_connect(self):
+        status, printer = self._make()
+        printer.fire("klippy:connect")
+        self.assertIsNotNone(status._refresh_timer)
+        self.assertEqual(len(status.get_status(0)), 3)
+
+    def test_enabled_false_starts_paused(self):
+        status, printer = self._make(options={'enabled': False})
+        printer.fire("klippy:connect")
+        self.assertIsNone(status._refresh_timer)
+        self.assertEqual(status.get_status(0), {})
+        reads = sum(d.mcu_tmc.read_count for d in printer._objects.values())
+        self.assertEqual(reads, 0)
+
+    def test_pause_clears_status_and_stops_timer(self):
+        status, printer = self._make()
+        printer.fire("klippy:connect")
+        handle = status._refresh_timer
+        gcmd = FakeGCmd({'ENABLE': 0})
+        status.cmd_TMCSTATUS(gcmd)
+        self.assertIsNone(status._refresh_timer)
+        self.assertIn(handle, printer.get_reactor().cancelled)
+        self.assertEqual(status.get_status(0), {})
+        self.assertIn("paused", gcmd.responses[0])
+
+    def test_resume_refreshes_and_restarts(self):
+        status, printer = self._make(options={'enabled': False})
+        printer.fire("klippy:connect")
+        status.cmd_TMCSTATUS(FakeGCmd({'ENABLE': 1}))
+        self.assertIsNotNone(status._refresh_timer)
+        self.assertEqual(len(status.get_status(0)), 3)
+
+    def test_resume_twice_registers_one_timer(self):
+        status, printer = self._make()
+        printer.fire("klippy:connect")
+        before = len(printer.get_reactor().callbacks)
+        status.cmd_TMCSTATUS(FakeGCmd({'ENABLE': 1}))
+        self.assertEqual(len(printer.get_reactor().callbacks), before)
+
+    def test_enable_before_connect_only_sets_state(self):
+        status, printer = self._make(options={'enabled': False})
+        status.cmd_TMCSTATUS(FakeGCmd({'ENABLE': 1}))
+        self.assertIsNone(status._refresh_timer)
+        printer.fire("klippy:connect")
+        self.assertIsNotNone(status._refresh_timer)
+
+    def test_no_resume_after_shutdown(self):
+        status, printer = self._make()
+        printer.fire("klippy:connect")
+        printer.fire("klippy:shutdown")
+        status.cmd_TMCSTATUS(FakeGCmd({'ENABLE': 1}))
+        self.assertIsNone(status._refresh_timer)
+
+
 class TestTMCStatusReactorSafety(unittest.TestCase):
     """The fix must ensure get_status() never calls mcu_tmc.get_register()."""
 
-    def _make_status(self, drivers=None, fail_reads=False):
+    def _make_status(self, drivers=None, fail_reads=False, options=None):
         from . import tmcstatus
 
         printer = FakePrinter()
@@ -146,7 +239,7 @@ class TestTMCStatusReactorSafety(unittest.TestCase):
         for prefix, sec in sections:
             prefix_map.setdefault(prefix, []).append(sec)
 
-        config = FakeConfig(printer, prefix_map)
+        config = FakeConfig(printer, prefix_map, options)
         status = tmcstatus.TMCStatus(config)
         return status, printer
 

@@ -26,6 +26,11 @@
 #      Fix: a reactor timer refreshes TMC registers periodically in a safe context, and
 #      get_status() returns only the cached data. No reactor interaction on the status path.
 #
+#   3. (2026-10, GUI readiness) TMCSTATUS ENABLE=0|1 pauses/resumes the refresh at runtime
+#      (status becomes {} while paused) and `enabled:` sets the start state (default True).
+#      GuppyScreen's TMC panel toggle used _GUPPY_LOAD_MODULE / _GUPPY_UNLOAD_MODULE, which
+#      rewrite printer.cfg through a shell macro NebulaOS does not ship.
+#
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging
 
@@ -42,6 +47,8 @@ class TMCStatus:
         self._cache = {}
         self._refresh_timer = None
         self._shutdown = False
+        self._connected = False
+        self.enabled = config.getboolean('enabled', True)
 
         for driver in TRINAMIC_DRIVERS:
             for n in config.get_prefix_sections(driver):
@@ -53,13 +60,46 @@ class TMCStatus:
                                              self.handle_connect)
         self.printer.register_event_handler("klippy:shutdown",
                                              self._handle_shutdown)
+        gcode = self.printer.lookup_object('gcode')
+        gcode.register_command('TMCSTATUS', self.cmd_TMCSTATUS,
+                               desc=self.cmd_TMCSTATUS_help)
 
     def handle_connect(self):
         for s in self.configured_steppers:
             self.tmcs[s] = self.printer.lookup_object(s)
+        self._connected = True
+        if self.enabled:
+            self._start()
+
+    def _start(self):
+        if self._refresh_timer is not None or self._shutdown:
+            return
         self._refresh_cache()
         self._refresh_timer = self.reactor.register_timer(
             self._timer_refresh, self.reactor.monotonic() + REFRESH_INTERVAL)
+
+    def _stop(self):
+        if self._refresh_timer is not None:
+            self.reactor.unregister_timer(self._refresh_timer)
+            self._refresh_timer = None
+        self._cache = {}
+
+    cmd_TMCSTATUS_help = ("Pause (ENABLE=0) or resume (ENABLE=1) the periodic TMC "
+                          "driver status refresh; without ENABLE reports the state")
+
+    def cmd_TMCSTATUS(self, gcmd):
+        enable = gcmd.get_int('ENABLE', None, minval=0, maxval=1)
+        if enable is not None:
+            self.enabled = bool(enable)
+            if not self._connected:
+                pass
+            elif self.enabled:
+                self._start()
+            else:
+                self._stop()
+        gcmd.respond_info("tmcstatus: %s (%d drivers)"
+                          % ("enabled" if self.enabled else "paused",
+                             len(self.configured_steppers)))
 
     def _handle_shutdown(self):
         self._shutdown = True
