@@ -614,6 +614,7 @@ class ExtensionStateMachineTests(unittest.TestCase):
             'bed_mesh': _FakeStatusObject({'profile_name': '',
                                            'profiles': {'default': {}}}),
             'configfile': _FakeConfigfile({'probe': {'z_offset': '1.2'}}),
+            'nebulaos_version': _FakeStatusObject({'firmware_sha': 'fw-A'}),
             'extruder': _FakeStatusObject({'target': 0.0,
                                            'pressure_advance': 0.04,
                                            'smooth_time': 0.04}),
@@ -1008,7 +1009,8 @@ class ConfigIdentityAndPhysicalResumeTests(ExtensionStateMachineTests):
         rec = self._eeprom_record()
         side = plr.read_sidecar(plr.sidecar_path_for_generation(
             self.sidecar_dir, rec.generation))
-        self.assertEqual(side['schema_version'], 2)
+        self.assertEqual(side['schema_version'], 3)
+        self.assertEqual(side['identity']['firmware_sha'], 'fw-A')
         self.assertEqual(side['identity']['config_sha256'],
                          plr.config_identity({'probe': {'z_offset': '1.2'}}))
         self.assertEqual(side['toolhead']['position'], [1.0, 2.0, 10.0, 0.0])
@@ -1020,6 +1022,35 @@ class ConfigIdentityAndPhysicalResumeTests(ExtensionStateMachineTests):
             self.ext.cmd_NEBULAOS_PLR_RESUME(_FakeGCmd({'ALLOW_UNSAFE': 1}))
         self.assertIn('configuration changed', str(cm.exception))
         self.assertEqual(self.objects['gcode'].run_lines, [])
+
+    # D6 (2026-10-10): a record is never resumed under different firmware.
+    def test_firmware_change_refuses_resume(self):
+        self._checkpoint_then_power_loss()
+        self.objects['nebulaos_version']._status = {'firmware_sha': 'fw-B'}
+        with self.assertRaises(Exception) as cm:
+            self.ext.cmd_NEBULAOS_PLR_RESUME(_FakeGCmd({'ALLOW_UNSAFE': 1}))
+        self.assertIn('firmware changed', str(cm.exception))
+        self.assertEqual(self.objects['gcode'].run_lines, [])
+
+    def test_firmware_change_shows_incompatible_with_reason(self):
+        self._tick_and_settle(1.0)
+        self.print_stats_status['state'] = 'standby'
+        self.objects['nebulaos_version']._status = {'firmware_sha': 'fw-B'}
+        ext = plr.NebulaOSPowerLossRecovery(self.config)
+        ext._handle_ready()
+        st = ext.get_status(0)
+        self.assertEqual(st['state'], plr.STATE_RECOVERY_INCOMPATIBLE)
+        self.assertIn('firmware changed', st['recovery']['reason'])
+
+    def test_same_firmware_still_resumable(self):
+        self._checkpoint_then_power_loss()
+        self.assertEqual(self.ext.get_status(0)['state'], plr.STATE_RECOVERY_AVAILABLE)
+        self.ext.cmd_NEBULAOS_PLR_RESUME(_FakeGCmd({'ALLOW_UNSAFE': 1}))
+        self.assertTrue(self.objects['gcode'].run_lines)
+
+    def test_no_age_limit(self):
+        # D6: only the firmware identity is checked, never the record's age.
+        self.assertFalse(any('age' in n for n in dir(plr) if n.isupper()))
 
     def test_schema1_record_is_incompatible(self):
         self._tick_and_settle(1.0)

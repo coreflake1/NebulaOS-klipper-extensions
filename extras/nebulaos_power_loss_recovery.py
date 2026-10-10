@@ -41,7 +41,10 @@ DEFAULT_MIN_Z_FOR_START = 0.6
 # "toolhead" (kinematic position) - both needed by the physical resume. A
 # schema-1 record from an older build is reported incompatible, never
 # resumed.
-SCHEMA_VERSION = 2
+# Schema 3 (2026-10-10, decision D6): adds identity.firmware_sha (the NebulaOS
+# image the record was written under, from [nebulaos_version]). A record is
+# never resumed under different firmware; there is no age limit.
+SCHEMA_VERSION = 3
 
 DEFAULT_RESUME_Z_LIFT = 5.0
 DEFAULT_PRIME_LENGTH = 8.0
@@ -117,7 +120,7 @@ def build_sidecar_state(generation, file_info, file_position,
                          extruder_status, bed_mesh_status,
                          exclude_object_status, fan_status,
                          firmware_retraction_status=None,
-                         config_sha256=None):
+                         config_sha256=None, firmware_sha=None):
     """Pure assembly of the "Sidecar V1 State" schema from already-fetched
     get_status() dicts (or plain equivalents in tests). Never touches
     gcode_move.base_position or any other private attribute - everything
@@ -145,6 +148,7 @@ def build_sidecar_state(generation, file_info, file_position,
         },
         "identity": {
             "config_sha256": config_sha256,
+            "firmware_sha": firmware_sha,
         },
         "motion": {
             "max_velocity": toolhead_status["max_velocity"],
@@ -239,7 +243,8 @@ class IntegrityFailure(Exception):
 
 def validate_recovery(eeprom_record, sidecar_state, current_file_path,
                        current_file_size, current_file_sha256,
-                       allow_unsafe, current_config_sha256=None):
+                       allow_unsafe, current_config_sha256=None,
+                       current_firmware_sha=None):
     """Runs the full validation chain from the mission's File Identity and
     Physical Position Policy sections, in order, and returns the validated
     sidecar_state dict on success.
@@ -279,6 +284,11 @@ def validate_recovery(eeprom_record, sidecar_state, current_file_path,
         raise IntegrityFailure(
             "printer configuration changed since the checkpoint (Z offset, "
             "mesh, kinematics or other printer.cfg settings may differ)")
+    recorded_firmware = (sidecar_state.get("identity") or {}).get("firmware_sha")
+    if recorded_firmware != current_firmware_sha:
+        raise IntegrityFailure(
+            "NebulaOS firmware changed since the checkpoint (recorded %s, "
+            "running %s)" % (recorded_firmware, current_firmware_sha))
 
     # Every integrity gate above is unconditional. Only the physical
     # position-safety gate below is subject to allow_unsafe, and it is
@@ -299,7 +309,8 @@ class PositionUnsafe(Exception):
         self.reason = reason
 
 
-def light_recovery_check(eeprom_record, sidecar_state, resolved_file_path):
+def light_recovery_check(eeprom_record, sidecar_state, resolved_file_path,
+                         current_firmware_sha=None):
     """The cheap, boot-time half of validate_recovery(): everything except
     hashing the gcode file, which can take seconds on this SoC and is
     therefore left to NEBULAOS_PLR_RESUME. Returns (state, reason) where
@@ -320,6 +331,9 @@ def light_recovery_check(eeprom_record, sidecar_state, resolved_file_path):
         return STATE_RECOVERY_INCOMPATIBLE, "gcode file missing"
     if os.path.getsize(resolved_file_path) != file_info.get("size"):
         return STATE_RECOVERY_INCOMPATIBLE, "gcode file size changed"
+    if ((sidecar_state.get("identity") or {}).get("firmware_sha")
+            != current_firmware_sha):
+        return STATE_RECOVERY_INCOMPATIBLE, "NebulaOS firmware changed since the checkpoint"
     return STATE_RECOVERY_AVAILABLE, ""
 
 
@@ -547,6 +561,7 @@ class NebulaOSPowerLossRecovery:
 
         self._session_file_info = None  # {"path","size","sha256"} once known
         self._session_config_sha256 = None
+        self._session_firmware_sha = None
         self._last_checkpoint_time = 0.0
         self._checkpoint_in_flight = False
         self._resume_in_progress = False
@@ -655,6 +670,14 @@ class NebulaOSPowerLossRecovery:
         status = configfile.get_status(self.reactor.monotonic())
         return config_identity(status.get('config'))
 
+    def _firmware_sha(self):
+        """The running NebulaOS image (firmware_sha from [nebulaos_version],
+        read once at Klippy start). None without that object."""
+        version = self.printer.lookup_object('nebulaos_version', None)
+        if version is None:
+            return None
+        return version.get_status(self.reactor.monotonic()).get('firmware_sha')
+
     def _io(self, fn, *args):
         """Runs blocking EEPROM/sidecar/hash I/O on the aio_executor thread.
         Executor.submit() parks only the calling greenlet; the reactor keeps
@@ -685,7 +708,8 @@ class NebulaOSPowerLossRecovery:
             path = ((sidecar or {}).get("file") or {}).get("path")
             if path:
                 resolved = self._resolve_sdcard_path(path)
-        state, reason = light_recovery_check(record, sidecar, resolved)
+        state, reason = light_recovery_check(record, sidecar, resolved,
+                                             self._firmware_sha())
         if state == STATE_NONE:
             self._recovery_info = {}
         else:
@@ -851,6 +875,7 @@ class NebulaOSPowerLossRecovery:
             "sha256": sha256,
         }
         self._session_config_sha256 = self._config_sha256()
+        self._session_firmware_sha = self._firmware_sha()
         self._have_active_session = True
         self._status_state = STATE_RECORDING
         self._recovery_info = {
@@ -997,7 +1022,8 @@ class NebulaOSPowerLossRecovery:
                 candidate.gm_status, candidate.th_status,
                 candidate.extruder_status, candidate.bed_mesh_status,
                 candidate.exclude_object_status, candidate.fan_status,
-                candidate.fr_status, config_sha256=self._session_config_sha256)
+                candidate.fr_status, config_sha256=self._session_config_sha256,
+                firmware_sha=self._session_firmware_sha)
 
             final_path = sidecar_path_for_generation(self.sidecar_dir,
                                                       next_generation)
@@ -1111,7 +1137,8 @@ class NebulaOSPowerLossRecovery:
         try:
             validated = validate_recovery(
                 record, sidecar, current[0], current[1], current[2],
-                allow_unsafe, current_config_sha256=self._config_sha256())
+                allow_unsafe, current_config_sha256=self._config_sha256(),
+                current_firmware_sha=self._firmware_sha())
         except PositionUnsafe as exc:
             raise gcmd.error(str(exc))
         except IntegrityFailure as exc:
