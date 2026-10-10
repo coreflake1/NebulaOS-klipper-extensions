@@ -1762,6 +1762,18 @@ class EStepsExtrudeTest(unittest.TestCase):
                           ['M82', 'G92 E0', 'G1 E100.0000 F300'])
         self.assertEqual(coord.esteps_commanded_length, 100.)
 
+    def test_measurement_prompt_can_be_closed_for_on_screen_entry(self):
+        # D3: GuppyScreen's E-Steps panel takes the measurement itself; the
+        # prompt must offer a button that only closes the dialog.
+        printer, gcode, coord = self._started()
+        raw = []
+        gcode.respond_raw = raw.append
+        coord.cmd_esteps_calibrate(fake.FakeGCmd({'CONTINUE': '1'}))
+        self.assertIn('// action:prompt_button Enter measurement|'
+                      'RESPOND TYPE=command MSG=action:prompt_end', raw)
+        self.assertIn('// action:prompt_button Cancel|_NEBULAOS_ESTEPS_CANCEL', raw)
+        self.assertEqual(coord.esteps_state, 'awaiting_measurement')
+
     def test_records_old_rotation_distance_before_extruding(self):
         printer, gcode, coord = self._started(FakeExtruderObj(rotation_distance=7.5))
         coord.cmd_esteps_calibrate(fake.FakeGCmd({'CONTINUE': '1'}))

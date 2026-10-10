@@ -1136,9 +1136,13 @@ class NebulaOSCalibration:
             "E-Steps Calibration",
             ["Extruded %.0fmm (commanded)." % (self.esteps_commanded_length,),
              "Measure how far the mark actually moved.",
-             "Enter measurement via console:",
+             "Enter it on the printer screen (E-Steps panel) or in the console:",
              "NEBULAOS_ESTEPS_CALIBRATE MEASURED=<mm>"],
-            [("Cancel",
+            # Closes only the dialog (standard Klipper RESPOND), so a screen's
+            # own entry field is reachable; the run keeps waiting (D3).
+            [("Enter measurement",
+              "RESPOND TYPE=command MSG=action:prompt_end"),
+             ("Cancel",
               "_NEBULAOS_ESTEPS_CANCEL")])
 
     def _esteps_apply(self, gcmd, measured):
